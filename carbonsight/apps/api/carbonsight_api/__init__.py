@@ -1,0 +1,1 @@
+"""CarbonSight minimal FastAPI service."""

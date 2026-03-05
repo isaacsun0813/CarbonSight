@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carbonsight"
+version = "0.1.0"
+description = "CLI-first greenest cloud advisor and launcher using WattTime and SkyPilot"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "CarbonSight" }]
+dependencies = [
+    "pydantic>=2.0",
+    "httpx>=0.25",
+    "typer[all]>=0.9",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+cli = [
+    "typer[all]>=0.9",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+]
+api = [
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "sqlalchemy>=2.0",
+    "asyncpg>=0.29",
+]
+aws = [
+    "boto3>=1.28",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-vcr>=1.0",
+    "vcrpy>=4.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+carbonsight = "carbonsight_cli.main:app"
+
+[tool.setuptools.packages.find]
+where = ["packages/core", "apps/cli", "apps/api"]
+include = ["carbonsight_*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["packages/core", "apps/cli", "apps/api"]
+addopts = "-v"

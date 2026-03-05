@@ -1,0 +1,256 @@
+{
+  "regions": [
+    {
+      "provider": "aws",
+      "region_code": "us-east-1",
+      "display_name": "US East (N. Virginia)",
+      "country": "USA",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "ashburn-1", "provider": "aws", "region_code": "us-east-1", "lat": 38.9598, "lon": -77.5632, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "PJM_DC", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "us-east-2",
+      "display_name": "US East (Ohio)",
+      "country": "USA",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "columbus-1", "provider": "aws", "region_code": "us-east-2", "lat": 39.9612, "lon": -82.9988, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "PJM_EASTERN_OH", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "us-west-1",
+      "display_name": "US West (N. California)",
+      "country": "USA",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "sanjose-1", "provider": "aws", "region_code": "us-west-1", "lat": 37.3382, "lon": -121.8863, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "CAISO_NORTH", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "us-west-2",
+      "display_name": "US West (Oregon)",
+      "country": "USA",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "hillsboro-1", "provider": "aws", "region_code": "us-west-2", "lat": 45.5229, "lon": -122.9898, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "PACW", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "ca-central-1",
+      "display_name": "Canada (Central)",
+      "country": "Canada",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "montreal-1", "provider": "aws", "region_code": "ca-central-1", "lat": 45.5017, "lon": -73.5673, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "HQ", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "eu-west-1",
+      "display_name": "Europe (Ireland)",
+      "country": "Ireland",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "dublin-1", "provider": "aws", "region_code": "eu-west-1", "lat": 53.3498, "lon": -6.2603, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "IE", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "eu-west-2",
+      "display_name": "Europe (London)",
+      "country": "UK",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "london-1", "provider": "aws", "region_code": "eu-west-2", "lat": 51.5074, "lon": -0.1278, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "UK", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "eu-west-3",
+      "display_name": "Europe (Paris)",
+      "country": "France",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "paris-1", "provider": "aws", "region_code": "eu-west-3", "lat": 48.8566, "lon": 2.3522, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "FR", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "eu-central-1",
+      "display_name": "Europe (Frankfurt)",
+      "country": "Germany",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "frankfurt-1", "provider": "aws", "region_code": "eu-central-1", "lat": 50.1109, "lon": 8.6821, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "DE", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "eu-north-1",
+      "display_name": "Europe (Stockholm)",
+      "country": "Sweden",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "stockholm-1", "provider": "aws", "region_code": "eu-north-1", "lat": 59.3293, "lon": 18.0686, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "SE", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "eu-south-1",
+      "display_name": "Europe (Milan)",
+      "country": "Italy",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "milan-1", "provider": "aws", "region_code": "eu-south-1", "lat": 45.4654, "lon": 9.1859, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "IT", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "ap-northeast-1",
+      "display_name": "Asia Pacific (Tokyo)",
+      "country": "Japan",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "tokyo-1", "provider": "aws", "region_code": "ap-northeast-1", "lat": 35.6762, "lon": 139.6503, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "JP_TK", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 0.9, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "ap-northeast-2",
+      "display_name": "Asia Pacific (Seoul)",
+      "country": "South Korea",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "seoul-1", "provider": "aws", "region_code": "ap-northeast-2", "lat": 37.5665, "lon": 126.9780, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "KOR", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 0.9, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "ap-northeast-3",
+      "display_name": "Asia Pacific (Osaka)",
+      "country": "Japan",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "osaka-1", "provider": "aws", "region_code": "ap-northeast-3", "lat": 34.6937, "lon": 135.5022, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "JP_KN", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 0.9, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "ap-southeast-1",
+      "display_name": "Asia Pacific (Singapore)",
+      "country": "Singapore",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "singapore-1", "provider": "aws", "region_code": "ap-southeast-1", "lat": 1.3521, "lon": 103.8198, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "SGP", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.9, "s_wt_stability": 0.9, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "ap-southeast-2",
+      "display_name": "Asia Pacific (Sydney)",
+      "country": "Australia",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "sydney-1", "provider": "aws", "region_code": "ap-southeast-2", "lat": -33.8688, "lon": 151.2093, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "NEM_NSW", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 1.0, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "ap-south-1",
+      "display_name": "Asia Pacific (Mumbai)",
+      "country": "India",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "mumbai-1", "provider": "aws", "region_code": "ap-south-1", "lat": 19.0760, "lon": 72.8777, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "IND", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 0.8, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "ap-east-1",
+      "display_name": "Asia Pacific (Hong Kong)",
+      "country": "Hong Kong",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "hongkong-1", "provider": "aws", "region_code": "ap-east-1", "lat": 22.3193, "lon": 114.1694, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "HKG", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.9, "s_wt_stability": 0.9, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "sa-east-1",
+      "display_name": "South America (São Paulo)",
+      "country": "Brazil",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "saopaulo-1", "provider": "aws", "region_code": "sa-east-1", "lat": -23.5505, "lon": -46.6333, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "BRA", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 0.8, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "me-south-1",
+      "display_name": "Middle East (Bahrain)",
+      "country": "Bahrain",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "bahrain-1", "provider": "aws", "region_code": "me-south-1", "lat": 26.0667, "lon": 50.5577, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "BHR", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 0.8, "s_recency": 0.8
+    },
+    {
+      "provider": "aws",
+      "region_code": "af-south-1",
+      "display_name": "Africa (Cape Town)",
+      "country": "South Africa",
+      "source_url": "https://docs.aws.amazon.com/general/latest/gr/rande.html",
+      "sites": [
+        { "site_id": "capetown-1", "provider": "aws", "region_code": "af-south-1", "lat": -33.9249, "lon": 18.4241, "source_type": "official" }
+      ],
+      "wt_regions": [{ "wt_region": "ZAF", "weight": 1.0 }],
+      "s_source": 1.0, "s_geo": 0.8, "s_wt_stability": 0.8, "s_recency": 0.8
+    }
+  ]
+}

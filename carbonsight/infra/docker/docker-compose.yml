@@ -1,0 +1,31 @@
+# CarbonSight API + Postgres (MVP)
+# Run: docker-compose -f carbonsight/infra/docker/docker-compose.yml up -d
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: carbonsight
+      POSTGRES_PASSWORD: carbonsight
+      POSTGRES_DB: carbonsight
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../../infra/schemas.sql:/docker-entrypoint-initdb.d/01-schema.sql
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      WATTTIME_USERNAME: ${WATTTIME_USERNAME:-}
+      WATTTIME_PASSWORD: ${WATTTIME_PASSWORD:-}
+      DATABASE_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
+    depends_on:
+      - db
+
+volumes:
+  pgdata:

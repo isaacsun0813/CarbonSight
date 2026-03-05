@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+tests/e2e/cassettes/*.yaml
+!tests/e2e/cassettes/.gitkeep

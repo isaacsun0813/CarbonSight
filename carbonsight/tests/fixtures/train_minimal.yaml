@@ -1,0 +1,8 @@
+# Minimal SkyPilot-style job YAML for testing
+name: train-minimal
+resources:
+  cloud: aws
+  accelerators: A100:1
+  cpus: 8
+  memory: 32
+duration: 1h
