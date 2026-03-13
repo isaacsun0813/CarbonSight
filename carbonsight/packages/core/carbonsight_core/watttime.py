@@ -5,6 +5,7 @@ Design doc: /login (basic auth), token cache, /v3/my-access, /v3/region-from-loc
 """
 
 import time
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -122,6 +123,36 @@ class WattTimeClient:
             self._assert_moer_units(data)
             return data
 
+    def get_historical(
+        self,
+        region: str,
+        start: datetime,
+        end: datetime,
+        signal_type: str = "co2_moer",
+        client: httpx.Client | None = None,
+    ) -> list[dict[str, Any]]:
+        """GET /v3/historical for a time window.
+
+        Returns a list of ``{"point_time": str, "value": float}`` dicts with MOER
+        values in lbs CO₂ per MWh, ordered by ``point_time`` ascending.
+        """
+        with client or httpx.Client() as c:
+            r = self._request(
+                "GET",
+                "/v3/historical",
+                c,
+                params={
+                    "region": region,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "signal_type": signal_type,
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            self._assert_moer_units(data)
+            return data.get("data", [])
+
     def get_signal_index(
         self,
         region: str,
@@ -141,10 +172,16 @@ class WattTimeClient:
 
     def _assert_moer_units(self, data: dict[str, Any]) -> None:
         """Fail closed if MOER data does not have supported units for kg CO2."""
-        units = data.get("units") or (data.get("data", [{}]) and data["data"][0].get("units"))
-        if units and units != SUPPORTED_MOER_UNIT:
+        units: str | None = data.get("units")
+        if units is None and data.get("data"):
+            units = data["data"][0].get("units") if data["data"] else None
+        if units is None:
             raise WattTimeError(
-                f"Unsupported units for kg CO2: {units}. Required: {SUPPORTED_MOER_UNIT}. Refusing to compute."
+                "Missing 'units' field in WattTime response; cannot verify CO2 unit safety"
+            )
+        if units != SUPPORTED_MOER_UNIT:
+            raise WattTimeError(
+                f"Unsupported unit '{units}'; expected '{SUPPORTED_MOER_UNIT}'. Refusing to compute."
             )
 
     @staticmethod
