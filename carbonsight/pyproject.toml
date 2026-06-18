@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "carbonsight"
 version = "0.1.0"
-description = "CLI-first greenest cloud advisor and launcher using WattTime and SkyPilot"
+description = "Rank AWS regions by estimated training CO₂ (WattTime MOER) and optional SkyPilot launch"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

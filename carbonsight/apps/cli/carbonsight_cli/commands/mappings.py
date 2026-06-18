@@ -3,16 +3,13 @@
 from pathlib import Path
 
 import typer
-
 from carbonsight_core.config import Config
 from carbonsight_core.mapping.registry import Registry
+from carbonsight_core.paths import (
+    carbonsight_package_root_from_cli_command_file,
+    resolve_registry_json_file,
+)
 from carbonsight_core.watttime import WattTimeClient, WattTimeError
-
-
-def _default_registry_path() -> Path:
-    root = Path(__file__).resolve().parents[4]
-    return root / "packages" / "core" / "carbonsight_core" / "mapping" / "seed_registry.json"
-
 
 mappings_group = typer.Typer(help="Mapping registry and drift checks")
 
@@ -23,15 +20,10 @@ def validate(
 ) -> None:
     """Run drift checks (region-from-loc vs stored); print diff and confidence."""
     reg = Registry()
-    rpath = registry_path or _default_registry_path()
-    if not rpath.exists():
-        for candidate in [
-            Path.cwd() / "carbonsight" / "packages" / "core" / "carbonsight_core" / "mapping" / "seed_registry.json",
-            Path.cwd() / "packages" / "core" / "carbonsight_core" / "mapping" / "seed_registry.json",
-        ]:
-            if candidate.exists():
-                rpath = candidate
-                break
+    package_root = carbonsight_package_root_from_cli_command_file(Path(__file__))
+    rpath = resolve_registry_json_file(
+        registry_path, carbonsight_package_root=package_root, cwd=Path.cwd()
+    )
     if not rpath.exists():
         typer.echo("No registry found. Use --registry.", err=True)
         raise typer.Exit(1)

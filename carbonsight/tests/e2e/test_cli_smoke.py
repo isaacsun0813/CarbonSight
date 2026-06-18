@@ -26,7 +26,8 @@ def test_carbonsight_help() -> None:
             env=env,
         )
     assert result.returncode == 0, (result.stderr or result.stdout)
-    assert "advise" in (result.stdout or result.stderr) or "run" in (result.stdout or result.stderr)
+    out = result.stdout or result.stderr
+    assert "advise" in out and "train" in out and "run" in out
 
 
 def test_advise_parses_yaml() -> None:
@@ -47,5 +48,25 @@ def test_advise_parses_yaml() -> None:
         env=env,
         timeout=15,
     )
-    # 0 = success (with or without regions); empty credentials -> empty list and exit 0
-    assert result.returncode in (0, 1)
+    assert result.returncode == 0
+
+
+def test_train_script_without_watttime_returns_empty_json() -> None:
+    """train script.py builds YAML and runs advise; no creds -> []."""
+    root = Path(__file__).resolve().parents[2]
+    stub = root.parent / "examples" / "skypilot" / "train_stub.py"
+    if not stub.is_file():
+        return
+    env = {**__import__("os").environ, "PYTHONPATH": str(root / "packages" / "core") + ":" + str(root / "apps" / "cli")}
+    env.pop("WATTTIME_USERNAME", None)
+    env.pop("WATTTIME_PASSWORD", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "carbonsight_cli.main", "train", str(stub), "--json"],
+        capture_output=True,
+        text=True,
+        cwd=root,
+        env=env,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[]"

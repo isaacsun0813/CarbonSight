@@ -172,8 +172,8 @@ In each phase below, **Testing** describes only **E2E scenarios** and how they u
 
 **Goal:** Reproducible backtest with 1000 workloads, WattTime historical + AWS spot data, and metrics (savings, regret, rank accuracy).
 
-| Task | Details |
-|------|--------|
+| Task                              |     Details               |
+|-      -   -   -   -   -   |   -   -   -   -   -   -   -   -   |
 | **8.1** Data ingest | Scripts to build: watttime_moer.parquet (wt_region, point_time, value, units, data_point_period_seconds, model_date), aws_spot_prices.parquet (region, instance_type, timestamp, price_usd_per_hour). workloads_seed.json for reproducibility. |
 | **8.2** Simulation loop | For each of 1000 workloads: decision-time view (MOER forecast/nowcast + spot at t0), select region by score, compute oracle (best realized over [t0,t1]), compute regret and savings vs baseline. |
 | **8.3** Metrics and report | Primary: carbon savings %, cost savings %, regret distribution, rank accuracy (top-1, top-3). Secondary: confidence calibration, sensitivity to weights. Output artifacts (CSV/JSON + optional plots). |

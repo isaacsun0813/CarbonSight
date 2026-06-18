@@ -3,7 +3,6 @@
 import json
 
 import typer
-
 from carbonsight_core.backtest.runner import run_backtest
 
 backtest_group = typer.Typer(help="Backtesting harness")

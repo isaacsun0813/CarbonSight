@@ -6,7 +6,7 @@ MVP: synthetic MOER and cost series in-memory; no parquet required.
 
 import random
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from carbonsight_core.models import JobSpec
 
@@ -46,7 +46,7 @@ def _synthetic_price(region: str, t: datetime, seed: int) -> float:
 def _generate_workloads(n: int, days: int, seed: int) -> list[tuple[JobSpec, datetime]]:
     """Generate n synthetic workloads: JobSpec + start_time over the last `days` days."""
     r = random.Random(seed)
-    end = datetime.now(timezone.utc)
+    end = datetime.now(UTC)
     start = end - timedelta(days=days)
     workloads = []
     gpu_types = ["T4", "A100", "H100"]

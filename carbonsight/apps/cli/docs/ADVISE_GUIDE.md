@@ -13,14 +13,16 @@ YAML file → JobSpec (GPU, duration, etc.)
                 ↓
 Registry (region list + WattTime mappings)
                 ↓
-For each AWS region: estimate_option(job, region, WattTime) → EstimateResult
+AwsRegionRankingService(registry, WattTime).collect_estimates(job) → list[EstimateResult]
                 ↓
-Sort by CO₂ mean → output table or JSON
+AwsRegionRankingService.rank_greenest_first_then_cost_ceiling(..., max_cost_premium)
+                ↓
+Table or JSON
 ```
 
 - **JobSpec**: what you're running (GPU type/count, duration). Comes from the YAML.
 - **Registry**: list of cloud regions and their WattTime grid mappings. Loaded from JSON.
-- **estimate_option**: core function that calls WattTime API and returns one `EstimateResult` per region.
+- **`AwsRegionRankingService`**: shared orchestration (CLI + API); per region uses **`JobCarbonEstimator.estimate_region`** → one **`EstimateResult`** each. Module functions **`collect_aws_region_estimates`** / **`rank_greenest_first_then_cost_ceiling`** still delegate to the class for callers that prefer functions.
 - **EstimateResult**: one row (region, CO₂ mean/p10/p90, confidence).
 
 ---
@@ -33,7 +35,7 @@ Sort by CO₂ mean → output table or JSON
 - **`yaml.safe_load`**: Never use `yaml.load` without a Loader; `safe_load` avoids arbitrary code execution from untrusted YAML. **Best practice**: always `safe_load` for untrusted or external YAML.
 - **Typer**: CLI framework; options are declared with types and help text. **Best practice**: type hints on CLI options give validation and better help.
 
-### 3.2 `_job_spec_from_yaml(path)`
+### 3.2 `job_spec_from_sky_yaml(path)`
 
 **Purpose**: Turn a SkyPilot YAML into a single `JobSpec` object.
 
@@ -52,7 +54,7 @@ Sort by CO₂ mean → output table or JSON
 - **Return `JobSpec(...)`**  
   Pydantic model: validates types and constraints. **Best practice**: use a single canonical type (JobSpec) so the rest of the app doesn't depend on raw dicts.
 
-### 3.3 `_default_registry_path()`
+### 3.3 Registry path (`resolve_registry_json_file`, `paths` module)
 
 - **`Path(__file__).resolve().parents[4]`**  
   Goes from this file up to repo root (4 levels: commands → carbonsight_cli → cli → apps → carbonsight). **Best practice**: resolve paths from `__file__` so they work regardless of current working directory; comment why `parents[4]` so future readers understand.
@@ -68,17 +70,14 @@ Sort by CO₂ mean → output table or JSON
 - **Credentials check**  
   If WattTime env vars are missing, return early: `[]` for `--json`, else a human message. **Best practice**: don’t make API calls when you know they’ll fail; keep JSON output consistent (empty list) for scripts.
 
-- **Loop over regions**  
-  Only consider entries that have `wt_regions` and `provider == "aws"`. **Best practice**: filter once per entry; keep the loop simple; handle errors per region so one bad region doesn’t kill the whole run.
+- **Orchestration**  
+  **`AwsRegionRankingService.collect_estimates`** filters AWS entries with WattTime mappings, scores **`mapping_confidence`**, and uses **`JobCarbonEstimator`** for each row. **Best practice**: one service class shared by CLI and API.
 
-- **Confidence score**  
-  The formula `0.35*s_source + 0.25*s_geo + ...` is the same as in the registry. **Best practice**: DRY – import or reuse one implementation so the formula lives in a single place.
+- **Ranking / cost ceiling**  
+  **`AwsRegionRankingService.rank_greenest_first_then_cost_ceiling`** (static) applies `max_cost_premium` then sorts by CO₂ mean. **Best practice**: pure ranking logic stays easy to unit test.
 
-- **Exceptions**  
-  Catching `WattTimeError` then `Exception` lets you treat API errors explicitly; both are handled the same here. **Best practice**: catch specific exceptions when you care about the type; use `err=True` so warnings go to stderr and don’t pollute JSON on stdout.
-
-- **Sort**  
-  `results.sort(key=lambda r: r.expected_co2_kg_mean)` sorts in place (no new list). **Best practice**: in-place sort is memory-efficient; key is a single attribute so lambda is fine (or `operator.attrgetter("expected_co2_kg_mean")` if you prefer).
+- **Per-region errors**  
+  Optional `on_estimate_error` logs without aborting the whole run. **Best practice**: use `err=True` for stderr so JSON on stdout stays parseable.
 
 - **Output**  
   JSON: one `json.dumps` over a list of `model_dump(mode="json")`. Table: build once, print once. **Best practice**: lazy-import Rich only when not `--json` to keep JSON path fast and avoid pulling in Rich for scripted use; alternatively, top-level import is simpler and more conventional.
@@ -91,7 +90,7 @@ Sort by CO₂ mean → output table or JSON
 |------|--------|-----|
 | Duration | Read `data.get("duration")` once into `duration_raw` | Fewer dict lookups and string operations. |
 | Registry fallback | `next((c for c in candidates if c.exists()), None)` | One expression, no loop variable, stops at first hit. |
-| Confidence | Reuse `_confidence` from registry (or local helper) | Single source of truth; shorter loop body. |
+| Confidence | **`mapping_confidence`** from `registry` module | Single source of truth; shared with API. |
 | Accelerators | Optional: extract `_parse_accelerators(acc)` | Clearer and testable in isolation; same speed. |
 | Rich | Top-level import | Cleaner (PEP 8); negligible cost unless you often use `--json`. |
 | List build | Keep `results.append(res)` in loop | No need to preallocate; list growth is amortized O(1). |

@@ -1,10 +1,12 @@
 """
 Unit tests for cost estimation, carbon estimation, and --max-cost-premium filtering.
 
-All tests use moer_override so no live WattTime HTTP calls are made.
+`estimate_job_carbon_in_region` tests use ``moer_override`` (no HTTP).
+CLI ``advise`` integration tests need ``WATTTIME_USERNAME`` and ``WATTTIME_PASSWORD``.
 """
 
 import json
+import os
 import random
 import subprocess
 import sys
@@ -14,7 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from carbonsight_core.estimator.carbon_model import LB_TO_KG, compute_actual_co2, estimate_option
+from carbonsight_core.estimator.carbon_model import LB_TO_KG, compute_actual_co2, estimate_job_carbon_in_region
 from carbonsight_core.estimator.pricing import estimate_cost_usd
 from carbonsight_core.models import JobSpec
 from carbonsight_core.watttime import WattTimeError
@@ -83,41 +85,41 @@ class TestPricing:
 # Carbon estimation unit tests (moer_override bypasses HTTP)
 # ---------------------------------------------------------------------------
 
-class TestEstimateOption:
+class TestEstimateJobCarbonInRegion:
     def test_cost_is_populated(self) -> None:
         job = _make_job()
-        result = estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
+        result = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
         assert result.expected_cost_usd > 0
 
     def test_co2_mean_is_positive(self) -> None:
         job = _make_job()
-        result = estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
+        result = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
         assert result.expected_co2_kg_mean > 0
 
     def test_p10_le_mean_le_p90(self) -> None:
         job = _make_job()
-        result = estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
+        result = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
         assert result.expected_co2_kg_p10 <= result.expected_co2_kg_mean <= result.expected_co2_kg_p90
 
     def test_zero_moer_means_zero_co2(self) -> None:
         job = _make_job()
-        result = estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=0.0)
+        result = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=0.0)
         assert result.expected_co2_kg_mean == pytest.approx(0.0, abs=1e-9)
 
     def test_higher_moer_produces_higher_co2(self) -> None:
         job = _make_job()
-        low = estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=100.0)
-        high = estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=800.0)
+        low = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=100.0)
+        high = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=800.0)
         assert high.expected_co2_kg_mean > low.expected_co2_kg_mean
 
     def test_longer_job_produces_more_co2(self) -> None:
-        short = estimate_option(_make_job(duration_hours=1.0), "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
-        long_ = estimate_option(_make_job(duration_hours=10.0), "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
+        short = estimate_job_carbon_in_region(_make_job(duration_hours=1.0), "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
+        long_ = estimate_job_carbon_in_region(_make_job(duration_hours=10.0), "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
         assert long_.expected_co2_kg_mean > short.expected_co2_kg_mean
 
     def test_more_gpus_produce_more_co2_and_cost(self) -> None:
-        one = estimate_option(_make_job(gpu_count=1), "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
-        eight = estimate_option(_make_job(gpu_count=8), "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
+        one = estimate_job_carbon_in_region(_make_job(gpu_count=1), "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
+        eight = estimate_job_carbon_in_region(_make_job(gpu_count=8), "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
         assert eight.expected_co2_kg_mean > one.expected_co2_kg_mean
         assert eight.expected_cost_usd == pytest.approx(one.expected_cost_usd * 8, rel=0.01)
 
@@ -125,15 +127,15 @@ class TestEstimateOption:
         job = _make_job()
         rng_a = random.Random(42)
         rng_b = random.Random(42)
-        a = estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0, rng=rng_a)
-        b = estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0, rng=rng_b)
+        a = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0, rng=rng_a)
+        b = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0, rng=rng_b)
         assert a.expected_co2_kg_mean == b.expected_co2_kg_mean
 
     def test_wt_never_called_when_moer_override_set(self) -> None:
         wt = _mock_wt()
         job = _make_job()
         # Would raise AssertionError if wt.get_forecast() is called
-        estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, wt, moer_override=400.0)
+        estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, wt, moer_override=400.0)
         wt.get_forecast.assert_not_called()
 
     def test_co2_math_is_correct(self) -> None:
@@ -143,7 +145,7 @@ class TestEstimateOption:
         # min A100 power ~250W, max ~400W, PUE ~1.1-1.5 → facility ~275-600W
         # For 1 hour: 0.000275-0.0006 MWh × 400 lb/MWh × 0.453 kg/lb → 0.05-0.11 kg
         job = _make_job()
-        result = estimate_option(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
+        result = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
         assert 0.01 < result.expected_co2_kg_mean < 2.0  # sanity bounds
 
 
@@ -151,8 +153,15 @@ class TestEstimateOption:
 # CLI integration: --max-cost-premium filtering
 # ---------------------------------------------------------------------------
 
+needs_watttime_creds = pytest.mark.skipif(
+    not (os.environ.get("WATTTIME_USERNAME") and os.environ.get("WATTTIME_PASSWORD")),
+    reason="Set WATTTIME_USERNAME and WATTTIME_PASSWORD for live advise subprocess tests",
+)
+
+
+@needs_watttime_creds
 class TestMaxCostPremiumCLI:
-    """Run advise --json via subprocess; no live WattTime (uses env fallback MOER)."""
+    """Run ``carbonsight advise --json`` in a subprocess (real WattTime forecast calls)."""
 
     @pytest.fixture(autouse=True)
     def _paths(self, repo_root: Path) -> None:

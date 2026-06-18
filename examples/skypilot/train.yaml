@@ -1,0 +1,18 @@
+# Example SkyPilot task — swap train_stub.py for your real training script.
+name: carbonsight-example-train
+
+resources:
+  cloud: aws
+  accelerators: A100:1
+  cpus: 8
+  memory: 32
+
+# Job length for carbon/cost estimate (advise uses this)
+duration: 2h
+
+# Optional: fix GPU utilization in [0,1] for a tighter power estimate (e.g. from nvidia-smi)
+# carbonsight:
+#   gpu_utilization: 0.75
+
+run: |
+  python train_stub.py

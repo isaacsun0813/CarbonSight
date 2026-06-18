@@ -8,7 +8,6 @@ Confidence: 0.35*S_source + 0.25*S_geo + 0.25*S_wt_stability + 0.15*S_recency
 
 import json
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -60,12 +59,12 @@ class MappingResult(BaseModel):
     label: str  # High | Medium | Low
 
 
-def _confidence(s_source: float, s_geo: float, s_wt_stability: float, s_recency: float) -> float:
-    """Overall confidence per design: 0.35*S_source + 0.25*S_geo + 0.25*S_wt_stability + 0.15*S_recency."""
+def mapping_confidence(s_source: float, s_geo: float, s_wt_stability: float, s_recency: float) -> float:
+    """Overall mapping confidence: 0.35*S_source + 0.25*S_geo + 0.25*S_wt_stability + 0.15*S_recency."""
     return 0.35 * s_source + 0.25 * s_geo + 0.25 * s_wt_stability + 0.15 * s_recency
 
 
-def _confidence_label(c: float) -> str:
+def mapping_confidence_label(c: float) -> str:
     """High >= 0.85, Medium 0.60-0.84, Low < 0.60."""
     if c >= 0.85:
         return "High"
@@ -113,13 +112,13 @@ class Registry:
         entry = self._regions.get(key)
         if not entry:
             return None
-        conf = _confidence(entry.s_source, entry.s_geo, entry.s_wt_stability, entry.s_recency)
+        conf = mapping_confidence(entry.s_source, entry.s_geo, entry.s_wt_stability, entry.s_recency)
         return MappingResult(
             cloud=entry.provider,
             cloud_region=entry.region_code,
             watttime_regions=entry.wt_regions or [],
             confidence=conf,
-            label=_confidence_label(conf),
+            label=mapping_confidence_label(conf),
         )
 
     def all_regions(self) -> list[CloudRegionEntry]:

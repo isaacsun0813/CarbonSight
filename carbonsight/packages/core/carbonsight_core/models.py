@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class JobSpec(BaseModel):
@@ -18,6 +18,20 @@ class JobSpec(BaseModel):
     data_out_gb: float = Field(0.0, ge=0)
     start_time_utc: datetime | None = None  # None => "now"
     constraints: dict[str, Any] = Field(default_factory=dict)
+    gpu_utilization: float | None = Field(
+        default=None,
+        description=(
+            "Observed GPU utilization in [0, 1] (e.g. from nvidia-smi). "
+            "When set, GPU draw uses this value instead of sampling utilization."
+        ),
+    )
+
+    @field_validator("gpu_utilization")
+    @classmethod
+    def _clamp_gpu_utilization(cls, v: float | None) -> float | None:
+        if v is None:
+            return None
+        return max(0.0, min(1.0, v))
 
 
 class EstimateResult(BaseModel):

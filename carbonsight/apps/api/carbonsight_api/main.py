@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from carbonsight_api.routes import mappings, recommendations, regions, runs
 
+
 # Registry path for API (same layout as CLI)
 def _registry_path() -> Path:
     root = Path(__file__).resolve().parents[3]

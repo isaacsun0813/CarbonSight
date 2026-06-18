@@ -75,10 +75,17 @@ def sample_pue(rng: random.Random | None = None) -> float:
             return u
 
 
+def _sample_u_gpu(job: JobSpec, rng: random.Random) -> float:
+    """GPU utilization factor for the power curve; fixed when telemetry is present."""
+    if job.gpu_utilization is not None:
+        return job.gpu_utilization
+    return rng.uniform(0.6, 0.9)
+
+
 def sample_power_params(job: JobSpec, rng: random.Random | None = None) -> PowerParams:
-    """Sample u_gpu, PUE and return P_IT and PUE."""
+    """Sample u_gpu (unless fixed by JobSpec.gpu_utilization), PUE, u_cpu; return P_IT and PUE."""
     rng = rng or random
-    u_gpu = rng.uniform(0.6, 0.9)
+    u_gpu = _sample_u_gpu(job, rng)
     u_cpu = rng.uniform(0.4, 0.6)
     p_it = power_it_w(job, u_gpu, u_cpu)
     pue = sample_pue(rng)

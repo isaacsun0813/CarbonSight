@@ -5,7 +5,7 @@ Cache per (account, region, quota_code) for ~15 minutes.
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 # Optional boto3; only used when AWS preflight is enabled

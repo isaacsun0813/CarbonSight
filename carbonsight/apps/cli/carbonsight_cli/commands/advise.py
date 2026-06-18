@@ -6,21 +6,22 @@ from typing import Any
 
 import typer
 import yaml
+from carbonsight_core.config import Config
+from carbonsight_core.mapping.registry import Registry
+from carbonsight_core.models import JobSpec
+from carbonsight_core.paths import (
+    carbonsight_package_root_from_cli_command_file,
+    resolve_registry_json_file,
+)
+from carbonsight_core.region_ranking import AwsRegionRankingService
+from carbonsight_core.telemetry.nvidia_smi import sample_mean_gpu_utilization_from_nvidia_smi
+from carbonsight_core.watttime import WattTimeClient
 from rich.console import Console
 from rich.table import Table
 
-from carbonsight_core.config import Config
-from carbonsight_core.estimator.carbon_model import estimate_option
-from carbonsight_core.mapping.registry import Registry, _confidence
-from carbonsight_core.models import EstimateResult, JobSpec
-from carbonsight_core.watttime import WattTimeClient, WattTimeError
 
-# Default registry: from this file up 4 levels to carbonsight repo root
-_REGISTRY_REL_PATH = ("packages", "core", "carbonsight_core", "mapping", "seed_registry.json")
-
-
-def _parse_accelerators(acc: str) -> tuple[str, int]:
-    """Parse SkyPilot accelerators string to (gpu_type, gpu_count). Supports 'A100:1' and '1x A100'."""
+def parse_sky_accelerators_string(acc: str) -> tuple[str, int]:
+    """SkyPilot accelerators → (gpu_type, gpu_count). Supports 'A100:1' and '1x A100'."""
     gpu_count, gpu_type = 1, "A100"
     if not acc:
         return gpu_type, gpu_count
@@ -43,8 +44,8 @@ def _parse_accelerators(acc: str) -> tuple[str, int]:
     return gpu_type, gpu_count
 
 
-def _parse_duration_hours(raw: Any) -> float:
-    """Parse duration from YAML (e.g. '1h', '30m') to hours. Default 1.0."""
+def parse_duration_hours(raw: Any) -> float:
+    """YAML duration '1h' / '30m' → hours. Default 1.0."""
     if raw is None:
         return 1.0
     s = str(raw).strip().lower()
@@ -56,26 +57,152 @@ def _parse_duration_hours(raw: Any) -> float:
     return num if num > 0 else 1.0
 
 
-def _job_spec_from_yaml(path: Path) -> JobSpec:
-    """Parse SkyPilot-style YAML into JobSpec (gpu_type, gpu_count, duration, etc.)."""
+def job_spec_from_sky_yaml(path: Path) -> JobSpec:
+    """SkyPilot-style YAML → JobSpec.
+
+    Optional ``carbonsight: { gpu_utilization: 0.75 }`` fixes GPU utilization for the power model
+    (same effect as ``--gpu-util`` / ``--nvidia-smi`` on the CLI).
+    """
     data: dict = yaml.safe_load(path.read_text()) or {}
     resources = data.get("resources") or {}
     acc = resources.get("accelerators") or ""
-    gpu_type, gpu_count = _parse_accelerators(acc if isinstance(acc, str) else "")
-    duration = _parse_duration_hours(data.get("duration"))
+    gpu_type, gpu_count = parse_sky_accelerators_string(acc if isinstance(acc, str) else "")
+    duration = parse_duration_hours(data.get("duration"))
+    gpu_utilization: float | None = None
+    cs = data.get("carbonsight")
+    if isinstance(cs, dict) and cs.get("gpu_utilization") is not None:
+        try:
+            gpu_utilization = float(cs["gpu_utilization"])
+        except (TypeError, ValueError):
+            gpu_utilization = None
     return JobSpec(
         gpu_type=gpu_type,
         gpu_count=gpu_count,
         duration_hours=duration,
         cpu_count=resources.get("cpus"),
         mem_gib=resources.get("memory"),
+        gpu_utilization=gpu_utilization,
     )
 
 
-def _default_registry_path() -> Path:
-    """Repo root is 4 levels up from this file (commands -> carbonsight_cli -> cli -> apps -> carbonsight)."""
-    root = Path(__file__).resolve().parents[4]
-    return root.joinpath(*_REGISTRY_REL_PATH)
+def apply_gpu_telemetry_cli(
+    job: JobSpec,
+    *,
+    gpu_util: float | None,
+    nvidia_smi: bool,
+) -> tuple[JobSpec, bool]:
+    """Apply CLI GPU telemetry. Returns ``(job, nvidia_smi_failed)``.
+
+    Precedence: ``--gpu-util`` overrides everything; else ``--nvidia-smi`` samples this host;
+    else YAML ``carbonsight.gpu_utilization`` on ``job`` is kept.
+    """
+    if gpu_util is not None:
+        return job.model_copy(update={"gpu_utilization": gpu_util}), False
+    if nvidia_smi:
+        u = sample_mean_gpu_utilization_from_nvidia_smi()
+        if u is None:
+            return job, True
+        return job.model_copy(update={"gpu_utilization": u}), False
+    return job, False
+
+
+def run_advise(
+    yaml_path: Path,
+    *,
+    explain: bool = False,
+    json_out: bool = False,
+    registry_path: Path | None = None,
+    max_cost_premium: float = 0.20,
+    gpu_util: float | None = None,
+    nvidia_smi: bool = False,
+) -> None:
+    """Shared implementation for ``advise`` and ``train``."""
+    if not yaml_path.exists():
+        typer.echo(f"Error: file not found: {yaml_path}", err=True)
+        raise typer.Exit(1)
+
+    if gpu_util is not None and not (0.0 <= gpu_util <= 1.0):
+        typer.echo("Error: --gpu-util must be between 0 and 1.", err=True)
+        raise typer.Exit(1)
+
+    job = job_spec_from_sky_yaml(yaml_path)
+    job, nvidia_failed = apply_gpu_telemetry_cli(job, gpu_util=gpu_util, nvidia_smi=nvidia_smi)
+    if nvidia_failed:
+        typer.echo(
+            "Warning: --nvidia-smi could not read utilization (no GPU driver here?). "
+            "Using default sampled GPU power.",
+            err=True,
+        )
+    package_root = carbonsight_package_root_from_cli_command_file(Path(__file__))
+    rpath = resolve_registry_json_file(registry_path, carbonsight_package_root=package_root, cwd=Path.cwd())
+    if not rpath.exists():
+        typer.echo("No registry found. Use --registry or add seed_registry.json.", err=True)
+        raise typer.Exit(1)
+
+    reg = Registry()
+    reg.load_json(rpath)
+
+    config = Config.from_env()
+    if not config.watttime_username or not config.watttime_password:
+        if json_out:
+            typer.echo("[]")
+        else:
+            typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD to get recommendations.")
+        return
+
+    watt_time = WattTimeClient(config)
+    ranking = AwsRegionRankingService(reg, watt_time)
+
+    def _warn_estimate(region_code: str, err: BaseException) -> None:
+        typer.echo(f"Warning: {region_code}: {err}", err=True)
+
+    all_estimates = ranking.collect_estimates(job, on_estimate_error=_warn_estimate)
+
+    if not all_estimates:
+        if json_out:
+            typer.echo("[]")
+        else:
+            typer.echo("No regions returned (check WattTime credentials and registry).")
+        return
+
+    visible, min_cost, cost_ceiling = AwsRegionRankingService.rank_greenest_first_then_cost_ceiling(
+        all_estimates, max_cost_premium
+    )
+
+    if json_out:
+        typer.echo(json.dumps([r.model_dump(mode="json") for r in visible], indent=2))
+        return
+
+    premium_pct = int(max_cost_premium * 100)
+    table = Table(title=f"Greenest regions within {premium_pct}% of cheapest (${min_cost:.2f})")
+    table.add_column("Region", style="cyan")
+    table.add_column("CO2 (kg)", justify="right")
+    table.add_column("CO2 p10-p90", justify="right")
+    table.add_column("Cost (USD)", justify="right")
+    table.add_column("vs cheapest", justify="right")
+    table.add_column("Confidence", justify="right")
+    for row in visible:
+        premium = (row.expected_cost_usd - min_cost) / min_cost * 100 if min_cost else 0.0
+        table.add_row(
+            f"{row.cloud}/{row.cloud_region}",
+            f"{row.expected_co2_kg_mean:.2f}",
+            f"{row.expected_co2_kg_p10:.1f}-{row.expected_co2_kg_p90:.1f}",
+            f"${row.expected_cost_usd:.2f}",
+            f"+{premium:.0f}%",
+            f"{row.mapping_confidence:.2f}",
+        )
+    Console().print(table)
+
+    hidden = len(all_estimates) - len(visible)
+    if hidden:
+        typer.echo(
+            f"  {hidden} region(s) hidden — too expensive vs cheapest. Use --max-cost-premium to widen."
+        )
+    if explain:
+        typer.echo(
+            f"  Green rank: CO2 emissions (live WattTime data). "
+            f"Cost ceiling: ${cost_ceiling:.2f} (+{premium_pct}% above cheapest)."
+        )
 
 
 def advise(
@@ -91,107 +218,27 @@ def advise(
             "Use 0.0 to see only the cheapest option; use 1.0 to always pick the greenest regardless of price."
         ),
     ),
+    gpu_util: float | None = typer.Option(
+        None,
+        "--gpu-util",
+        help="Observed GPU utilization in [0, 1] (overrides YAML carbonsight.gpu_utilization).",
+    ),
+    nvidia_smi: bool = typer.Option(
+        False,
+        "--nvidia-smi",
+        help="Sample GPU utilization from nvidia-smi on this machine (overrides YAML when successful).",
+    ),
 ) -> None:
     """Print regions ranked greenest-first, filtered to those within your cost tolerance."""
-    if not yaml_path.exists():
-        typer.echo(f"Error: file not found: {yaml_path}", err=True)
-        raise typer.Exit(1)
-
-    job = _job_spec_from_yaml(yaml_path)
-    reg = Registry()
-    rpath = registry_path or _default_registry_path()
-    if not rpath.exists():
-        cwd = Path.cwd()
-        fallbacks = (
-            cwd.joinpath("carbonsight", *_REGISTRY_REL_PATH),
-            cwd.joinpath(*_REGISTRY_REL_PATH),
-        )
-        rpath = next((p for p in fallbacks if p.exists()), rpath)
-    if rpath.exists():
-        reg.load_json(rpath)
-    else:
-        typer.echo("No registry found. Use --registry or add seed_registry.json.", err=True)
-        raise typer.Exit(1)
-
-    config = Config.from_env()
-    if not config.watttime_username or not config.watttime_password:
-        if json_out:
-            typer.echo("[]")
-        else:
-            typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD to get recommendations.")
-        return
-
-    wt = WattTimeClient(config)
-    results: list[EstimateResult] = []
-
-    for entry in reg.all_regions():
-        if entry.wt_regions and entry.provider.lower() == "aws":
-            try:
-                conf = _confidence(
-                    entry.s_source, entry.s_geo, entry.s_wt_stability, entry.s_recency
-                )
-                res = estimate_option(
-                    job,
-                    entry.provider,
-                    entry.region_code,
-                    entry.wt_regions,
-                    conf,
-                    wt,
-                )
-                results.append(res)
-            except WattTimeError as e:
-                typer.echo(f"Warning: {entry.region_code}: {e}", err=True)
-            except Exception as e:
-                typer.echo(f"Warning: {entry.region_code}: {e}", err=True)
-
-    if not results:
-        if json_out:
-            typer.echo("[]")
-        else:
-            typer.echo("No regions returned (check WattTime credentials and registry).")
-        return
-
-    # Sort all results by CO2 — green is always the primary objective.
-    results.sort(key=lambda r: r.expected_co2_kg_mean)
-
-    # Cost-premium filter: hide regions that cost more than (1 + max_cost_premium) × cheapest.
-    # This keeps carbon as the ranking criterion while making cost a hard constraint.
-    min_cost = min(r.expected_cost_usd for r in results)
-    cost_ceiling = min_cost * (1 + max_cost_premium)
-    affordable = [r for r in results if r.expected_cost_usd <= cost_ceiling]
-
-    # Always show at least the single greenest region even if it blows the budget.
-    visible = affordable if affordable else results[:1]
-
-    if json_out:
-        typer.echo(json.dumps([r.model_dump(mode="json") for r in visible], indent=2))
-        return
-
-    premium_pct = int(max_cost_premium * 100)
-    table = Table(title=f"Greenest regions within {premium_pct}% of cheapest (${min_cost:.2f})")
-    table.add_column("Region", style="cyan")
-    table.add_column("CO2 (kg)", justify="right")
-    table.add_column("CO2 p10-p90", justify="right")
-    table.add_column("Cost (USD)", justify="right")
-    table.add_column("vs cheapest", justify="right")
-    table.add_column("Confidence", justify="right")
-    for r in visible:
-        premium = (r.expected_cost_usd - min_cost) / min_cost * 100
-        table.add_row(
-            f"{r.cloud}/{r.cloud_region}",
-            f"{r.expected_co2_kg_mean:.2f}",
-            f"{r.expected_co2_kg_p10:.1f}-{r.expected_co2_kg_p90:.1f}",
-            f"${r.expected_cost_usd:.2f}",
-            f"+{premium:.0f}%",
-            f"{r.mapping_confidence:.2f}",
-        )
-    Console().print(table)
-
-    hidden = len(results) - len(visible)
-    if hidden:
-        typer.echo(f"  {hidden} region(s) hidden — too expensive vs cheapest. Use --max-cost-premium to widen.")
-    if explain:
-        typer.echo(f"  Green rank: CO2 emissions (live WattTime data). Cost ceiling: ${cost_ceiling:.2f} (+{premium_pct}% above cheapest).")
+    run_advise(
+        yaml_path,
+        explain=explain,
+        json_out=json_out,
+        registry_path=registry_path,
+        max_cost_premium=max_cost_premium,
+        gpu_util=gpu_util,
+        nvidia_smi=nvidia_smi,
+    )
 
 
 if __name__ == "__main__":
