@@ -104,6 +104,34 @@ def train_cmd(
         help="GPU utilization in [0, 1] for the power model.",
     ),
     nvidia_smi: bool = typer.Option(False, "--nvidia-smi", help="Sample GPU utilization from nvidia-smi"),
+    spot: bool = typer.Option(
+        True,
+        "--spot/--no-spot",
+        help="Use spot instances for cost estimates and YAML patch (default: on).",
+    ),
+    max_delay: str = typer.Option(
+        "0h",
+        "--max-delay",
+        help="Max hours to delay start for greener carbon (e.g. 6h). 0h = run immediately.",
+    ),
+    db_path: Path | None = typer.Option(
+        None, "--db", help="SQLite DB path for run tracking (default: ~/.carbonsight/runs.db).",
+    ),
+    checkpoint: bool = typer.Option(
+        True,
+        "--checkpoint/--no-checkpoint",
+        help="Enable checkpoint resilience for spot training (default: on).",
+    ),
+    checkpoint_bucket: str | None = typer.Option(
+        None,
+        "--checkpoint-bucket",
+        help="S3 bucket URI for checkpoint storage (default: auto-managed SkyPilot Storage).",
+    ),
+    checkpoint_interval: int = typer.Option(
+        500,
+        "--checkpoint-interval",
+        help="Save checkpoint every N training steps.",
+    ),
 ) -> None:
     """Estimate carbon/cost for training ``script`` without writing a YAML by hand.
 
@@ -137,6 +165,13 @@ def train_cmd(
                 registry_path=registry_path,
                 gpu_util=gpu_util,
                 nvidia_smi=nvidia_smi,
+                use_spot=spot,
+                max_delay=max_delay,
+                db_path=db_path,
+                checkpoint=checkpoint,
+                checkpoint_bucket=checkpoint_bucket,
+                checkpoint_interval=checkpoint_interval,
+                script_path=script,
             )
         else:
             run_advise(

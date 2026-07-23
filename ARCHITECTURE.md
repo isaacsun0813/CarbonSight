@@ -75,6 +75,25 @@ Implementation: `commands/run.py`.
 
 ---
 
+## Checkpoint resilience for spot training
+
+When `--spot` (default ON) and `--checkpoint` (default ON), CarbonSight wraps the training command with automatic checkpoint saving and resume. The flow:
+
+1. **Framework detection** (`checkpoint.py`): `ast.parse` scans the user's script for imports — `transformers` → HuggingFace, `lightning`/`pytorch_lightning` → Lightning, `torch` → raw PyTorch.
+2. **SkyPilot Storage mount**: persistent cloud storage (auto-managed S3 bucket via SkyPilot's Storage abstraction) is mounted at `/ckpt`. Survives preemption and re-provisioning.
+3. **Shim wrapper** (`checkpoint_shim.py`): standalone script uploaded to the remote instance via `file_mounts`. It:
+   - Scans `/ckpt` for existing checkpoints and injects `--resume_from_checkpoint` (HF) or `--ckpt_path` (Lightning) on resume
+   - Injects framework-specific save args on first run (`--output_dir /ckpt --save_strategy steps --save_steps 500` for HF)
+   - Registers a SIGTERM handler that sends SIGINT to the child process (frameworks handle SIGINT for graceful checkpoint save)
+   - Waits up to 110s for graceful shutdown before terminating
+4. **Managed spot** (`sky jobs launch`): auto-enabled when spot + checkpoint are both on. SkyPilot re-provisions and re-runs after preemption; the shim finds the latest checkpoint and resumes.
+
+The shim is Python 3.8+ compatible with zero external dependencies (it runs on whatever the remote instance has).
+
+Implementation: `carbonsight/packages/core/carbonsight_core/checkpoint.py` (core), `checkpoint_shim.py` (remote shim).
+
+---
+
 ## Other entrypoints (short)
 
 - **`train`** — convenience wrapper: script path → temp YAML → advise or run (see above).
@@ -108,7 +127,7 @@ Implementation: `commands/run.py`.
 
 We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per region estimate — we learned the hard way not to put that inside the loop). Sort the 1000 kg outcomes → **mean**, **p10**, **p90**. That range is the honest answer to “we don’t know your exact utilization.”
 
-**Cost** is separate: base $/GPU/hr × regional multiplier × count × hours. It’s for **relative** ranking vs other regions, not a quote from AWS billing.
+**Cost** is separate: base $/GPU/hr × regional multiplier × count × hours. With `--spot` (default ON), cost is multiplied by `SPOT_PRICE_FRACTION` (0.35). It’s for **relative** ranking vs other regions, not a quote from AWS billing.
 
 **Post-run:** historical MOER gets a **time-weighted** average across the window (WattTime points are ~5 min apart; we clip partial intervals at the edges). Power side still uses MC with a **fixed seed** so the number doesn’t jitter run to run — the **grid** part is what’s “real” there.
 
@@ -129,9 +148,13 @@ We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per re
 |-------------------|------|
 | CO₂ math, Monte Carlo, post-run | `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py` |
 | Watt curves, PUE sampling | `.../estimator/power_model.py` |
-| $ estimates | `.../estimator/pricing.py` |
+| $ estimates, spot pricing | `.../estimator/pricing.py` |
 | Region → grid JSON | `.../mapping/seed_registry.json` |
 | WattTime client / auth / retries | `.../watttime.py` |
+| Time-shift scheduling | `.../scheduler.py` |
+| Persistent run ledger (SQLite) | `.../tracking.py` |
+| Checkpoint core (framework detect, YAML patch) | `.../checkpoint.py` |
+| Checkpoint shim (remote SIGTERM wrapper) | `.../checkpoint_shim.py` |
 | CLI commands | `carbonsight/apps/cli/carbonsight_cli/commands/` |
 | API routes | `carbonsight/apps/api/carbonsight_api/routes/` |
 
