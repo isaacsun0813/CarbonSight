@@ -236,6 +236,9 @@ def _cli_help(root: Path, *args: str) -> subprocess.CompletedProcess:
     env = {
         **__import__("os").environ,
         "PYTHONPATH": f"{root / 'packages' / 'core'}:{root / 'apps' / 'cli'}:{root / 'apps' / 'api'}",
+        # Pin a wide terminal so Rich help output doesn't wrap option names
+        # (keeps these assertions deterministic in CI, where COLUMNS is unset -> 80).
+        "COLUMNS": "200",
     }
     return subprocess.run(
         [sys.executable, "-m", "carbonsight_cli.main", *args],
