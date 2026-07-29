@@ -100,6 +100,7 @@ class JobCarbonEstimator:
         *,
         moer_override: float | None = None,
         rng: random.Random | None = None,
+        use_spot: bool = False,
     ) -> EstimateResult:
         """
         Monte Carlo carbon + cost estimate for one cloud region (forecast MOER, sampled power).
@@ -132,7 +133,7 @@ class JobCarbonEstimator:
         p10 = samples_kg[int(0.10 * n)] if n else 0.0
         p90 = samples_kg[int(0.90 * n)] if n else 0.0
 
-        cost_usd = estimate_cost_usd(job.gpu_type, job.gpu_count, job.duration_hours, cloud_region)
+        cost_usd = estimate_cost_usd(job.gpu_type, job.gpu_count, job.duration_hours, cloud_region, use_spot=use_spot)
 
         return EstimateResult(
             cloud=cloud,
@@ -224,6 +225,7 @@ def estimate_job_carbon_in_region(
     *,
     moer_override: float | None = None,
     rng: random.Random | None = None,
+    use_spot: bool = False,
 ) -> EstimateResult:
     """Backward-compatible wrapper around :class:`JobCarbonEstimator`."""
     return JobCarbonEstimator(watt_time).estimate_region(
@@ -234,6 +236,7 @@ def estimate_job_carbon_in_region(
         mapping_confidence,
         moer_override=moer_override,
         rng=rng,
+        use_spot=use_spot,
     )
 
 

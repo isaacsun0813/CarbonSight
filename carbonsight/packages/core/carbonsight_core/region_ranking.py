@@ -34,6 +34,7 @@ class AwsRegionRankingService:
         self,
         job: JobSpec,
         *,
+        use_spot: bool = False,
         on_quota_skip: Callable[[str, str], None] | None = None,
         on_estimate_error: Callable[[str, BaseException], None] | None = None,
     ) -> list[EstimateResult]:
@@ -65,6 +66,7 @@ class AwsRegionRankingService:
                         entry.region_code,
                         entry.wt_regions,
                         conf,
+                        use_spot=use_spot,
                     )
                 )
             except WattTimeError as err:

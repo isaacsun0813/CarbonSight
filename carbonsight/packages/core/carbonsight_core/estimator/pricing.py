@@ -53,14 +53,21 @@ _REGION_MULTIPLIER: dict[str, float] = {
 }
 _DEFAULT_MULTIPLIER = 1.20  # conservative fallback for unknown regions
 
+SPOT_PRICE_FRACTION = 0.35
+
 
 def estimate_cost_usd(
     gpu_type: str,
     gpu_count: int,
     duration_hours: float,
     cloud_region: str,
+    *,
+    use_spot: bool = False,
 ) -> float:
-    """Return estimated on-demand cost in USD for the job in the given region."""
+    """Return estimated cost in USD for the job in the given region."""
     base = _GPU_BASE_PRICE_USD_PER_HR.get(gpu_type.upper(), _DEFAULT_GPU_PRICE)
     multiplier = _REGION_MULTIPLIER.get(cloud_region, _DEFAULT_MULTIPLIER)
-    return base * multiplier * gpu_count * duration_hours
+    cost = base * multiplier * gpu_count * duration_hours
+    if use_spot:
+        cost *= SPOT_PRICE_FRACTION
+    return cost
