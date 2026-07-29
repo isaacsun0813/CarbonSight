@@ -13,7 +13,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from typer.main import get_command
 
+from carbonsight_cli.main import app
 from carbonsight_core.estimator.carbon_model import estimate_job_carbon_in_region
 from carbonsight_core.estimator.pricing import SPOT_PRICE_FRACTION, estimate_cost_usd
 from carbonsight_core.models import JobSpec
@@ -251,12 +253,27 @@ def repo() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _command_option_names(command_name: str) -> set[str]:
+    """Option flag strings (including --no-* forms) exposed by a top-level CLI command.
+
+    Introspects the registered Click command instead of parsing Rich-rendered
+    --help text: help wraps option names by terminal width and renders differently
+    across typer/rich versions, which made these substring assertions flaky in CI.
+    """
+    command = get_command(app).commands[command_name]
+    names: set[str] = set()
+    for param in command.params:
+        names.update(getattr(param, "opts", []) or [])
+        names.update(getattr(param, "secondary_opts", []) or [])
+    return names
+
+
 class TestCliWiring:
-    def test_run_exposes_spot_and_max_delay(self, repo: Path) -> None:
-        out = _cli_help(repo, "run", "--help")
-        assert out.returncode == 0, out.stderr
-        assert "--spot" in out.stdout
-        assert "--max-delay" in out.stdout
+    def test_run_exposes_spot_and_max_delay(self) -> None:
+        opts = _command_option_names("run")
+        assert "--spot" in opts
+        assert "--no-spot" in opts
+        assert "--max-delay" in opts
 
     def test_history_and_report_commands_exist(self, repo: Path) -> None:
         top = _cli_help(repo, "--help")
