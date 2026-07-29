@@ -1,7 +1,6 @@
 """Framework detection, checkpoint config, and SkyPilot YAML patching for spot resilience."""
 
 import ast
-import re
 import shlex
 from dataclasses import dataclass, field
 from enum import Enum
