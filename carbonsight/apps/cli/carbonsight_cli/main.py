@@ -2,7 +2,16 @@
 
 import typer
 
-from carbonsight_cli.commands import advise, backtest, dashboard, history, mappings, report, run, train
+from carbonsight_cli.commands import (
+    advise,
+    backtest,
+    dashboard,
+    history,
+    mappings,
+    report,
+    run,
+    train,
+)
 
 app = typer.Typer(name="carbonsight", help="Greenest cloud advisor and launcher (WattTime + SkyPilot)")
 

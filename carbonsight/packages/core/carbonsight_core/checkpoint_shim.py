@@ -12,7 +12,6 @@ import signal
 import subprocess
 import sys
 
-
 CKPT_DIR = os.environ.get("CARBONSIGHT_CKPT_DIR", "/ckpt")
 FRAMEWORK = os.environ.get("CARBONSIGHT_FRAMEWORK", "unknown")
 SAVE_STEPS = os.environ.get("CARBONSIGHT_SAVE_STEPS", "500")

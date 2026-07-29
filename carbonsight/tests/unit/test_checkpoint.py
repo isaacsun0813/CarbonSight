@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 import yaml
+from typer.main import get_command
 
+from carbonsight_cli.main import app
 from carbonsight_core.checkpoint import (
     DEFAULT_CKPT_MOUNT,
     DEFAULT_SAVE_INTERVAL,
@@ -347,19 +349,19 @@ class TestShimLocalPath:
 # CLI wiring smoke (--help only, no HTTP)
 # ---------------------------------------------------------------------------
 
-import subprocess
-import sys
+def _command_option_names(command_name: str) -> set[str]:
+    """Option flag strings (including --no-* forms) exposed by a top-level CLI command.
 
-
-def _cli_help(root: Path, *args: str) -> subprocess.CompletedProcess:
-    env = {
-        **os.environ,
-        "PYTHONPATH": f"{root / 'packages' / 'core'}:{root / 'apps' / 'cli'}:{root / 'apps' / 'api'}",
-    }
-    return subprocess.run(
-        [sys.executable, "-m", "carbonsight_cli.main", *args],
-        capture_output=True, text=True, cwd=root, env=env, timeout=30,
-    )
+    Introspects the registered Click command instead of parsing Rich-rendered
+    --help text: help wraps option names by terminal width and renders differently
+    across typer/rich versions, which made these substring assertions flaky in CI.
+    """
+    command = get_command(app).commands[command_name]
+    names: set[str] = set()
+    for param in command.params:
+        names.update(getattr(param, "opts", []) or [])
+        names.update(getattr(param, "secondary_opts", []) or [])
+    return names
 
 
 @pytest.fixture(scope="module")
@@ -368,16 +370,16 @@ def repo() -> Path:
 
 
 class TestCheckpointCliWiring:
-    def test_run_exposes_checkpoint_options(self, repo: Path) -> None:
-        out = _cli_help(repo, "run", "--help")
-        assert out.returncode == 0, out.stderr
-        assert "--checkpoint" in out.stdout
-        assert "--checkpoint-bucket" in out.stdout
-        assert "--checkpoint-interval" in out.stdout
+    def test_run_exposes_checkpoint_options(self) -> None:
+        opts = _command_option_names("run")
+        assert "--checkpoint" in opts
+        assert "--no-checkpoint" in opts
+        assert "--checkpoint-bucket" in opts
+        assert "--checkpoint-interval" in opts
 
-    def test_train_exposes_checkpoint_options(self, repo: Path) -> None:
-        out = _cli_help(repo, "train", "--help")
-        assert out.returncode == 0, out.stderr
-        assert "--checkpoint" in out.stdout
-        assert "--checkpoint-bucket" in out.stdout
-        assert "--checkpoint-interval" in out.stdout
+    def test_train_exposes_checkpoint_options(self) -> None:
+        opts = _command_option_names("train")
+        assert "--checkpoint" in opts
+        assert "--no-checkpoint" in opts
+        assert "--checkpoint-bucket" in opts
+        assert "--checkpoint-interval" in opts

@@ -10,6 +10,15 @@ from pathlib import Path
 
 import typer
 import yaml
+from carbonsight_core.checkpoint import (
+    Framework,
+    apply_checkpoint_patch_to_yaml,
+    build_checkpoint_config,
+    build_checkpoint_yaml_patch,
+    detect_framework,
+    extract_script_path_from_run_command,
+    shim_local_path,
+)
 from carbonsight_core.config import Config
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
 from carbonsight_core.estimator.pricing import estimate_cost_usd
@@ -22,20 +31,11 @@ from carbonsight_core.preflight.quota import QuotaChecker
 from carbonsight_core.region_ranking import AwsRegionRankingService
 from carbonsight_core.scheduler import pick_lowest_carbon_start
 from carbonsight_core.tracking import RunLedger, RunRecord
-from carbonsight_core.checkpoint import (
-    Framework,
-    apply_checkpoint_patch_to_yaml,
-    build_checkpoint_config,
-    build_checkpoint_yaml_patch,
-    detect_framework,
-    extract_script_path_from_run_command,
-    shim_local_path,
-)
 from carbonsight_core.watttime import WattTimeClient, WattTimeError
 
 from carbonsight_cli.commands.advise import (
-    job_spec_from_sky_yaml,
     apply_gpu_telemetry_cli,
+    job_spec_from_sky_yaml,
     parse_duration_hours,
 )
 
