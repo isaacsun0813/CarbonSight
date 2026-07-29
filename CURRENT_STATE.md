@@ -51,6 +51,10 @@ Relevant code:
 
 Key behavior from the code:
 
+- **Spot pricing**: `--spot` (default ON) estimates cost at 35% of on-demand and sets `resources.use_spot: true` in the patched YAML. Use `--no-spot` for on-demand pricing.
+- **Carbon-aware scheduling**: `--max-delay 6h` scans the forecast for the lowest-carbon start time within the delay window and prints a recommendation. Default `0h` (run immediately).
+- **Checkpoint resilience**: `--checkpoint` (default ON) wraps the training command with automatic checkpoint saving and resume. Detects the ML framework (HuggingFace, Lightning, PyTorch) via AST analysis, mounts persistent SkyPilot Storage at `/ckpt`, and injects a shim that handles SIGTERM → SIGINT for graceful saves on preemption. Auto-enables `--managed` (SkyPilot managed spot) when spot + checkpoint are both on. Customizable with `--checkpoint-bucket` (explicit S3 URI) and `--checkpoint-interval` (steps, default 500). Disable with `--no-checkpoint`.
+- **Run tracking**: each run is persisted to a SQLite ledger (`~/.carbonsight/runs.db` by default, overridable with `--db` or `CARBONSIGHT_DB`). Baseline is `us-east-1` on-demand/spot (matching `--spot`).
 - **Dry run**: `--dry-run` prints patched YAML and exits
 - **No exec**: `--no-exec` prints patched YAML and exits (after choosing region)
 - **AWS quota preflight**: enabled by default; can be skipped with `--skip-preflight`
@@ -61,6 +65,8 @@ Relevant code:
 - CLI implementation: `carbonsight/apps/cli/carbonsight_cli/commands/run.py`
 - Quota checker: `carbonsight/packages/core/carbonsight_core/preflight/quota.py`
 - Actual-run carbon: `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py`
+- Scheduler: `carbonsight/packages/core/carbonsight_core/scheduler.py`
+- Run ledger: `carbonsight/packages/core/carbonsight_core/tracking.py`
 
 ### 3) Generate a SkyPilot YAML from a Python script (`carbonsight train`)
 
@@ -115,17 +121,30 @@ Relevant code:
 - App wiring: `carbonsight/apps/api/carbonsight_api/main.py`
 - Routes: `carbonsight/apps/api/carbonsight_api/routes/`
 
+### 6) View run history (`carbonsight history`)
+
+Lists all recorded runs from the SQLite ledger: ID, date, region, GPU, duration, spot flag, estimated CO₂ and cost.
+
+### 7) Cumulative savings report (`carbonsight report`)
+
+Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and percentage savings.
+
 ## What it does *not* do yet (important limitations)
 
-- **No persistent DB**: API runs are stored in memory only (`_runs_store`), not Postgres.
+- **No persistent DB for API**: API runs are stored in memory only (`_runs_store`), not Postgres. CLI runs are persisted in SQLite.
 - **No mapping auto-revalidation**: API `/mappings/revalidate` doesn’t actually revalidate; CLI `mappings validate` does live checks.
 - **Not compliance-grade accounting**: this is an operational estimate from marginal emissions + a simplified power model.
+- **Scheduling is advisory**: `--max-delay` recommends a start time but does not actually wait before launching.
 
 ## “Where to look in code”
 
 - **CLI entrypoint**: `carbonsight/apps/cli/carbonsight_cli/main.py`
 - **Core orchestration**: `carbonsight/packages/core/carbonsight_core/region_ranking.py`
 - **Estimator**: `carbonsight/packages/core/carbonsight_core/estimator/`
+- **Scheduler**: `carbonsight/packages/core/carbonsight_core/scheduler.py`
+- **Run ledger**: `carbonsight/packages/core/carbonsight_core/tracking.py`
+- **Checkpoint core**: `carbonsight/packages/core/carbonsight_core/checkpoint.py`
+- **Checkpoint shim**: `carbonsight/packages/core/carbonsight_core/checkpoint_shim.py`
 - **Mapping registry**: `carbonsight/packages/core/carbonsight_core/mapping/registry.py`
 - **WattTime client**: `carbonsight/packages/core/carbonsight_core/watttime.py`
 
