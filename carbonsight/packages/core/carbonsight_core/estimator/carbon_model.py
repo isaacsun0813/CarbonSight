@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from carbonsight_core.estimator.power_model import sample_power_params
-from carbonsight_core.estimator.pricing import estimate_cost_usd
+from carbonsight_core.estimator.pricing import estimate_cost_usd, estimate_job_cost
 from carbonsight_core.models import ActualRunResult, EstimateResult, JobSpec
 from carbonsight_core.watttime import SUPPORTED_MOER_UNIT, WattTimeClient, WattTimeError
 
@@ -133,18 +133,20 @@ class JobCarbonEstimator:
         p10 = samples_kg[int(0.10 * n)] if n else 0.0
         p90 = samples_kg[int(0.90 * n)] if n else 0.0
 
-        cost_usd = estimate_cost_usd(job.gpu_type, job.gpu_count, job.duration_hours, cloud_region, use_spot=use_spot)
+        cost = estimate_job_cost(
+            job.gpu_type, job.gpu_count, job.duration_hours, cloud_region, use_spot=use_spot,
+        )
 
         return EstimateResult(
             cloud=cloud,
             cloud_region=cloud_region,
             watttime_regions=watttime_regions,
-            expected_cost_usd=cost_usd,
+            expected_cost_usd=cost.usd,
             expected_co2_kg_mean=mean_kg,
             expected_co2_kg_p10=p10,
             expected_co2_kg_p90=p90,
             mapping_confidence=mapping_confidence,
-            notes=[],
+            notes=list(cost.notes),
         )
 
     def compute_actual_run(

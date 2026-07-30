@@ -21,7 +21,7 @@ from carbonsight_core.checkpoint import (
 )
 from carbonsight_core.config import Config
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
-from carbonsight_core.estimator.pricing import estimate_cost_usd
+from carbonsight_core.estimator.pricing import configure_pricing, estimate_cost_usd
 from carbonsight_core.mapping.registry import Registry
 from carbonsight_core.paths import (
     carbonsight_package_root_from_cli_command_file,
@@ -37,6 +37,7 @@ from carbonsight_cli.commands.advise import (
     apply_gpu_telemetry_cli,
     job_spec_from_sky_yaml,
     parse_duration_hours,
+    resolve_live_aws_pricing,
 )
 
 BASELINE_REGION = "us-east-1"
@@ -102,6 +103,8 @@ def run_launch(
     checkpoint_bucket: str | None = None,
     checkpoint_interval: int = 500,
     script_path: Path | None = None,
+    live_pricing: bool = False,
+    static_pricing: bool = False,
 ) -> None:
     """Shared implementation for ``run`` and ``train``."""
     if not yaml_path.exists():
@@ -130,6 +133,12 @@ def run_launch(
     reg.load_json(rpath)
 
     config = Config.from_env()
+    configure_pricing(
+        config,
+        live_aws_pricing=resolve_live_aws_pricing(
+            config, live_pricing=live_pricing, static_pricing=static_pricing,
+        ),
+    )
     if not config.watttime_username or not config.watttime_password:
         typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD.", err=True)
         raise typer.Exit(1)
@@ -365,6 +374,16 @@ def run_cmd(
         "--checkpoint-interval",
         help="Save checkpoint every N training steps.",
     ),
+    live_pricing: bool = typer.Option(
+        False,
+        "--live-pricing",
+        help="Use live AWS EC2 spot prices for cost estimates (when --spot).",
+    ),
+    static_pricing: bool = typer.Option(
+        False,
+        "--static-pricing",
+        help="Force static cost tables instead of live AWS pricing.",
+    ),
 ) -> None:
     """Pick the greenest affordable region, patch YAML, and launch via SkyPilot."""
     run_launch(
@@ -384,4 +403,6 @@ def run_cmd(
         checkpoint=checkpoint,
         checkpoint_bucket=checkpoint_bucket,
         checkpoint_interval=checkpoint_interval,
+        live_pricing=live_pricing,
+        static_pricing=static_pricing,
     )
