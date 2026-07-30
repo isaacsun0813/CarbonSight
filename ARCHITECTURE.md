@@ -127,7 +127,7 @@ Implementation: `carbonsight/packages/core/carbonsight_core/checkpoint.py` (core
 
 We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per region estimate — we learned the hard way not to put that inside the loop). Sort the 1000 kg outcomes → **mean**, **p10**, **p90**. That range is the honest answer to “we don’t know your exact utilization.”
 
-**Cost** is separate: base $/GPU/hr × regional multiplier × count × hours. With `--spot` (default ON), cost is multiplied by `SPOT_PRICE_FRACTION` (0.35). It’s for **relative** ranking vs other regions, not a quote from AWS billing.
+**Cost** is separate: base $/GPU/hr × regional multiplier × count × hours. With `--spot` (default ON), cost uses either **live EC2 spot history** (when `CARBONSIGHT_LIVE_AWS_PRICING=1` or `--live-pricing`) via `describe_spot_price_history` (min across AZs, cached), or static on-demand × `SPOT_PRICE_FRACTION` (0.35) as fallback. On-demand static tables remain the default when live pricing is off. Requires IAM `ec2:DescribeSpotPriceHistory` for live spot. It’s for **relative** ranking vs other regions, not a quote from AWS billing.
 
 **Post-run:** historical MOER gets a **time-weighted** average across the window (WattTime points are ~5 min apart; we clip partial intervals at the edges). Power side still uses MC with a **fixed seed** so the number doesn’t jitter run to run — the **grid** part is what’s “real” there.
 
@@ -136,7 +136,7 @@ We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per re
 ## Where this is weak (I’m not going to pretend)
 
 - **Watts are modeled** unless we pipe in `nvidia-smi` or similar. MOER can be right and kg CO₂ can still be off if utilization is weird.
-- **Pricing** is a spreadsheet brain, not the Pricing API.
+- **Pricing** is static on-demand tables by default; optional live spot via EC2 API (on-demand Pricing API not wired yet).
 - **Registry** is human-maintained; wrong WattTime v3 code → wrong grid. `mappings validate` exists for a reason.
 - **Post-run timing** is subprocess wall time, not guaranteed cluster semantics for every SkyPilot mode.
 
@@ -148,7 +148,7 @@ We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per re
 |-------------------|------|
 | CO₂ math, Monte Carlo, post-run | `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py` |
 | Watt curves, PUE sampling | `.../estimator/power_model.py` |
-| $ estimates, spot pricing | `.../estimator/pricing.py` |
+| $ estimates, spot pricing | `.../estimator/pricing.py`, `.../estimator/aws_spot_pricing.py`, `.../estimator/gpu_catalog.py` |
 | Region → grid JSON | `.../mapping/seed_registry.json` |
 | WattTime client / auth / retries | `.../watttime.py` |
 | Time-shift scheduling | `.../scheduler.py` |

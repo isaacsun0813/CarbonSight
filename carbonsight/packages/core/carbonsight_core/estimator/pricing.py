@@ -1,14 +1,18 @@
 """
 AWS on-demand GPU instance pricing (per GPU per hour, USD).
 
-Sources:
+Static tables are the default. When live AWS pricing is enabled, spot costs use
+EC2 describe_spot_price_history with static fallback on errors.
+
+Sources (static):
   - https://aws.amazon.com/ec2/pricing/on-demand/ (sampled Feb 2026)
   - Base prices are for us-east-1; regional multipliers scale them.
-
-Design: keep this as a plain lookup dict so it's easy to update without
-touching estimation logic. gpu_type keys match JobSpec.gpu_type values
-(e.g. "A100", "H100", "V100", "T4", "A10G").
 """
+
+from dataclasses import dataclass, field
+
+from carbonsight_core.config import Config
+from carbonsight_core.estimator.aws_spot_pricing import SpotPriceProvider
 
 # Base price per GPU per hour (us-east-1 on-demand)
 # Instance reference:
@@ -27,7 +31,6 @@ _GPU_BASE_PRICE_USD_PER_HR: dict[str, float] = {
 _DEFAULT_GPU_PRICE = 4.10  # fallback if gpu_type not in table
 
 # Regional price multiplier relative to us-east-1.
-# Europe and APAC carry a premium; emerging market regions (af, me, sa) are higher still.
 _REGION_MULTIPLIER: dict[str, float] = {
     "us-east-1":      1.00,
     "us-east-2":      1.00,
@@ -55,6 +58,85 @@ _DEFAULT_MULTIPLIER = 1.20  # conservative fallback for unknown regions
 
 SPOT_PRICE_FRACTION = 0.35
 
+_live_aws_pricing: bool = False
+_spot_provider: SpotPriceProvider | None = None
+
+
+@dataclass
+class CostEstimate:
+    """Job cost in USD with optional provenance notes."""
+
+    usd: float
+    notes: list[str] = field(default_factory=list)
+
+
+def configure_pricing(
+    config: Config | None = None,
+    *,
+    live_aws_pricing: bool | None = None,
+) -> None:
+    """Set module-level live pricing flag and spot provider (call from CLI before ranking)."""
+    global _live_aws_pricing, _spot_provider
+    cfg = config or Config.from_env()
+    if live_aws_pricing is not None:
+        _live_aws_pricing = live_aws_pricing
+    else:
+        _live_aws_pricing = cfg.live_aws_pricing
+    _spot_provider = SpotPriceProvider(cfg) if _live_aws_pricing else None
+
+
+def reset_pricing_state() -> None:
+    """Reset module state (for tests)."""
+    global _live_aws_pricing, _spot_provider
+    _live_aws_pricing = False
+    _spot_provider = None
+
+
+def _static_on_demand_per_gpu_hour(gpu_type: str, cloud_region: str) -> float:
+    base = _GPU_BASE_PRICE_USD_PER_HR.get(gpu_type.upper(), _DEFAULT_GPU_PRICE)
+    multiplier = _REGION_MULTIPLIER.get(cloud_region, _DEFAULT_MULTIPLIER)
+    return base * multiplier
+
+
+def estimate_job_cost(
+    gpu_type: str,
+    gpu_count: int,
+    duration_hours: float,
+    cloud_region: str,
+    *,
+    use_spot: bool = False,
+) -> CostEstimate:
+    """Return estimated job cost with provenance notes."""
+    if not use_spot:
+        usd = _static_on_demand_per_gpu_hour(gpu_type, cloud_region) * gpu_count * duration_hours
+        return CostEstimate(usd=usd)
+
+    if _live_aws_pricing and _spot_provider is not None:
+        spot_per_gpu_hr = _spot_provider.spot_price_per_gpu_hour(gpu_type, cloud_region)
+        if spot_per_gpu_hr is not None:
+            return CostEstimate(
+                usd=spot_per_gpu_hr * gpu_count * duration_hours,
+                notes=["cost:live_spot"],
+            )
+        return CostEstimate(
+            usd=_static_spot_job_cost(gpu_type, gpu_count, duration_hours, cloud_region),
+            notes=["cost:static_spot_fallback"],
+        )
+
+    return CostEstimate(
+        usd=_static_spot_job_cost(gpu_type, gpu_count, duration_hours, cloud_region),
+    )
+
+
+def _static_spot_job_cost(
+    gpu_type: str,
+    gpu_count: int,
+    duration_hours: float,
+    cloud_region: str,
+) -> float:
+    on_demand = _static_on_demand_per_gpu_hour(gpu_type, cloud_region) * gpu_count * duration_hours
+    return on_demand * SPOT_PRICE_FRACTION
+
 
 def estimate_cost_usd(
     gpu_type: str,
@@ -65,9 +147,6 @@ def estimate_cost_usd(
     use_spot: bool = False,
 ) -> float:
     """Return estimated cost in USD for the job in the given region."""
-    base = _GPU_BASE_PRICE_USD_PER_HR.get(gpu_type.upper(), _DEFAULT_GPU_PRICE)
-    multiplier = _REGION_MULTIPLIER.get(cloud_region, _DEFAULT_MULTIPLIER)
-    cost = base * multiplier * gpu_count * duration_hours
-    if use_spot:
-        cost *= SPOT_PRICE_FRACTION
-    return cost
+    return estimate_job_cost(
+        gpu_type, gpu_count, duration_hours, cloud_region, use_spot=use_spot,
+    ).usd
