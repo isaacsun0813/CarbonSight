@@ -2,14 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy project root (carbonsight monorepo)
+# Copy project root (carbonsight monorepo) - includes worker for central cache fetcher
 COPY packages/core /app/packages/core
 COPY apps/api /app/apps/api
+COPY apps/worker /app/apps/worker
 COPY pyproject.toml /app/
 
 RUN pip install --no-cache-dir -e ".[api]" && \
-    pip install uvicorn[standard]
+    pip install uvicorn[standard] "psycopg[binary]" psycopg2-binary
 
-ENV PYTHONPATH=/app/packages/core:/app/apps/api
+ENV PYTHONPATH=/app/packages/core:/app/apps/api:/app
+# /app on PYTHONPATH allows `apps.worker.fetch_watttime` import as well as core
 
 CMD ["uvicorn", "carbonsight_api.main:app", "--host", "0.0.0.0", "--port", "8000"]

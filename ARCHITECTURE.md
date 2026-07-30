@@ -1,173 +1,150 @@
-# CarbonSight — notes on how this thing actually works
+# CarbonSight — how it works (condensed v3)
 
-I’m writing this for Future Me (and anyone else on the repo) so I don’t have to re-derive the whole pipeline every time I touch the code. If I change the estimator, CLI, or folder layout, I should update this file too.
-
----
-
-## What this project is trying to do
-
-Cloud ML training burns electricity. That electricity comes from a **regional grid**, and grids are not equal — some hours you’re mostly wind/solar/hydro, some hours you’re leaning on gas or coal. CarbonSight’s job is basically: **given a job spec (GPU type, how long you think it’ll run, etc.), rank AWS regions by estimated CO₂** and optionally **patch a SkyPilot YAML and launch**.
-
-It is **not** carbon removal, offsets, or a certified LCA. It’s a **rough operational estimate** for electricity at the facility, using WattTime’s **MOER** data plus our own **power model**. Good enough to compare regions and reason about tradeoffs; not something I’d put in a compliance report without more work.
+**Goal:** pick lower-carbon AND cheaper AWS spot region under deadline. Combines WattTime MOER (lb/MWh), power model, spot $/GPU/hr, spot lifetime, migration cost. Evolved from 1D green ranking to SkyNomad-style `U = V·η - C_total - E/L̄`.
 
 ---
 
-## Where stuff lives
-
-All the real Python is under **`carbonsight/`** (that’s where `pyproject.toml` is).
+## Layout
 
 ```
 carbonsight/
-  apps/cli/carbonsight_cli/     # Typer: advise, run, mappings, backtest
-  apps/api/carbonsight_api/     # FastAPI if we want HTTP
-  packages/core/carbonsight_core/   # This is the brain — WattTime, registry, math
-  tests/
-  infra/                        # SQL schemas; Postgres not fully wired yet
+  packages/core/carbonsight_core/
+    watttime/         client + central cache
+    providers/        carbon + spot abstractions (single-credential design)
+    estimator/        power + carbon math + pricing (pricing owned by other branch)
+    spot/             SkyNomad: availability, lifetime, progress, utility, policy
+    mapping/          seed_registry.json → wt_regions mixture
+    scheduler.py      v1 lowest-carbon start
+  apps/cli/commands/  advise (1D), schedule (2D joint), run, backtest, mappings
+  apps/api/routes/    recommendations, regions, carbon (central proxy)
+  apps/worker/        fetch_watttime.py single writer
+  infra/              schemas.sql grid_signal_cache, docker-compose db+api+worker
 ```
 
-Rule I use: if it’s **domain logic** (how CO₂ is computed, how WattTime is called), it goes in **`carbonsight_core`**. If it’s **parsing flags, printing tables, or HTTP**, it’s **`cli`** or **`api`**. Keeps the core testable without spinning up a server.
+Rule: domain logic in `carbonsight_core`, CLI/API call it.
 
 ---
 
-## Mental model: what talks to what
+## WattTime single-credential central cache (P0)
 
-You give it a **YAML** (SkyPilot-style) and **WattTime credentials**. We also load **`seed_registry.json`** — that’s the hand-maintained map from “AWS `eu-west-1`” to “which WattTime grid code(s)” and weights if it’s a mixture.
+**Why one cred is enough:** forecast is same for all users. Old: N users × R regions API calls → 429. New: 30 WT regions × 1/15min = 120/h << 3000/5min limit.
 
-Flow that’s in my head:
+**Flow:**
+```
+WattTime API ← ONE cred (server env WATTTIME_USERNAME)
+  ↑  POST /v2/login token 25min [client.py:36], 401 re-login once 429 exp backoff [client.py:75]
+  worker fetch_watttime.py dedupes ~30 regions [fetch_watttime.py:44], get_forecast horizon 72h [fetch_watttime.py:140], upsert ON CONFLICT grid_signal_cache [fetch_watttime.py:62]
+  ↓
+Postgres grid_signal_cache (schema in infra/schemas.sql) + ForecastCache in-memory TTL 15min [cache.py:71]
+  ↓
+API GET /v1/carbon/forecast?wt_region= [carbon.py:180] tries cache → DB [carbon.py:61] → live → empty not 500; /forecast/window [carbon.py:240] time-weighted [t,t+L̄]
+  ↓
+CLI CARBONSIGHT_API_URL=http://api:8001 → ApiCarbonProvider [carbon.py:113] httpx GET central, local weighting, NO WattTime env; else WattTimeCarbonProvider [carbon.py:74] direct+cache; else Synthetic 400 lb [carbon.py:193]; factory prefers API_URL > WTT creds > synthetic [carbon.py:250]
+  POST /v1/recommendations now returns 17 rows without creds via synthetic fallback (TestClient proves) [recommendations.py:49-76]
+```
 
-- **Registry** answers: *which grid(s) does this datacenter sit on?*
-- **WattTime** answers: *how dirty is a marginal MWh on that grid right now (forecast) or in the past (historical)?*
-- **Power model** answers: *how many watts is this job probably drawing?* (we don’t know utilization, so we randomize — more on that below)
-- **carbon_model** multiplies energy × MOER, converts units, runs Monte Carlo for a range
+Config: `config.py:21` adds `CARBONSIGHT_API_URL`, `CACHE_TTL_MIN`, `CARBON_PRICE_USD_PER_TON`.
 
-Optional: **boto** checks AWS quotas before `run` so we don’t recommend a region you can’t launch in. **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
-
----
-
-## `advise` — what I’d tell someone who’s never read the code
-
-1. Parse the YAML into a **`JobSpec`** (GPU, count, duration, cpus, memory).
-2. Load the registry JSON.
-3. Build an **`AwsRegionRankingService`** (registry + **`WattTimeClient`**). For each AWS region with a WattTime mapping it computes **`mapping_confidence`**, then **`JobCarbonEstimator.estimate_region`** → predicted kg CO₂ + rough USD cost. CLI and API both use the same service class.
-4. Sort by **lowest CO₂ first** (greenest at top).
-5. Apply **`--max-cost-premium`** — default is 0.2, meaning “only show me regions that aren’t more than ~20% pricier than the cheapest option in our table.” Stops the table from being dominated by ultra-green but absurdly expensive regions unless I widen the premium.
-6. Print the Rich table or `--json`.
-
-Implementation: `carbonsight/apps/cli/carbonsight_cli/commands/advise.py`.
-
----
-
-## `train` — same as advise/run, but YAML is generated from a script path
-
-**`carbonsight train train.py`** builds a **temporary SkyPilot YAML** (default resources + `run: python path/to/train.py` relative to cwd), then runs the same **`run_advise`** path as **`advise`**. With **`--launch`**, it uses **`run_launch`** like **`run`**. No change to the estimator—only how the job spec is authored.
-
-Implementation: `carbonsight/apps/cli/carbonsight_cli/commands/train.py`.
-
----
-
-## `run` — same ranking, then actually launch
-
-Same loop as advise, plus optional **quota check** per region. Pick the **greenest** row that still passes the cost filter, **inject `cloud` and `region` into the YAML**, write a temp file, call SkyPilot.
-
-If the subprocess exits 0, we try **post-run actual CO₂** via **`JobCarbonEstimator.compute_actual_run`**: pull **historical** MOER for the job window from WattTime, time-weight it, compare to the pre-run estimate. The module-level **`compute_actual_co2`** remains a thin wrapper for tests and scripts. Start/end times are **wall clock around the local SkyPilot process** — MVP scope.
-
-Implementation: `commands/run.py`.
-
----
-
-## Checkpoint resilience for spot training
-
-When `--spot` (default ON) and `--checkpoint` (default ON), CarbonSight wraps the training command with automatic checkpoint saving and resume. The flow:
-
-1. **Framework detection** (`checkpoint.py`): `ast.parse` scans the user's script for imports — `transformers` → HuggingFace, `lightning`/`pytorch_lightning` → Lightning, `torch` → raw PyTorch.
-2. **SkyPilot Storage mount**: persistent cloud storage (auto-managed S3 bucket via SkyPilot's Storage abstraction) is mounted at `/ckpt`. Survives preemption and re-provisioning.
-3. **Shim wrapper** (`checkpoint_shim.py`): standalone script uploaded to the remote instance via `file_mounts`. It:
-   - Scans `/ckpt` for existing checkpoints and injects `--resume_from_checkpoint` (HF) or `--ckpt_path` (Lightning) on resume
-   - Injects framework-specific save args on first run (`--output_dir /ckpt --save_strategy steps --save_steps 500` for HF)
-   - Registers a SIGTERM handler that sends SIGINT to the child process (frameworks handle SIGINT for graceful checkpoint save)
-   - Waits up to 110s for graceful shutdown before terminating
-4. **Managed spot** (`sky jobs launch`): auto-enabled when spot + checkpoint are both on. SkyPilot re-provisions and re-runs after preemption; the shim finds the latest checkpoint and resumes.
-
-The shim is Python 3.8+ compatible with zero external dependencies (it runs on whatever the remote instance has).
-
-Implementation: `carbonsight/packages/core/carbonsight_core/checkpoint.py` (core), `checkpoint_shim.py` (remote shim).
-
----
-
-## Other entrypoints (short)
-
-- **`train`** — convenience wrapper: script path → temp YAML → advise or run (see above).
-- **`mappings validate`** — hits WattTime `region_from_loc` with our lat/lons and checks we didn’t drift from what’s in the registry. I should run this when I touch `seed_registry.json`.
-- **`backtest`** — synthetic MOER/price; tests policy without live API.
-- **API** — same ideas over REST; run storage is still stubby.
-
----
-
-## Terms I had to learn (no shame)
-
-**MOER** — “marginal operating emissions rate.” Plain English: *if I use one more MWh of electricity at the margin of this grid, how much extra CO₂?* WattTime gives it in **lb CO₂ per MWh** a lot of the time. We convert to kg with **0.45359237**.
-
-**Why marginal and not annual average?** Because the thing that responds to *your* extra load is usually the marginal generator, not the grid’s year-average mix.
-
-**PUE** — power usage effectiveness. Facility power / IT power. If PUE is 1.2, there’s ~20% overhead (cooling, losses, etc.) on top of the servers/GPUs. We sample PUE from a distribution instead of pretending we know the exact datacenter.
-
-**Mixture** — sometimes one AWS region is modeled as split across two WattTime regions with weights. We take a **weighted average** of MOER, same idea as mixing two signals.
-
-**Forecast vs historical** — before launch we use whatever the API gives us for “near-term” (forecast path in code). After `run`, we can integrate **historical** points over the actual window for a more grounded number.
-
----
-
-## The math, in words I can explain to my dad
-
-**Core identity:**
-
-> kg CO₂ ≈ (facility MWh over the job) × (MOER in lb/MWh) × (lb → kg)
-
-**Facility MWh** isn’t just “GPU nameplate watts × hours.” We model **IT watts** (base + GPU + CPU + mem + small network), then multiply by **PUE** to get facility-level energy per hour, then multiply by **duration**. GPU power is interpolated between idle and peak using a **random utilization** each Monte Carlo draw because I don’t know if your training script is pegging the GPU or waiting on I/O.
-
-We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per region estimate — we learned the hard way not to put that inside the loop). Sort the 1000 kg outcomes → **mean**, **p10**, **p90**. That range is the honest answer to “we don’t know your exact utilization.”
-
-**Cost** is separate: base $/GPU/hr × regional multiplier × count × hours. With `--spot` (default ON), cost is multiplied by `SPOT_PRICE_FRACTION` (0.35). It’s for **relative** ranking vs other regions, not a quote from AWS billing.
-
-**Post-run:** historical MOER gets a **time-weighted** average across the window (WattTime points are ~5 min apart; we clip partial intervals at the edges). Power side still uses MC with a **fixed seed** so the number doesn’t jitter run to run — the **grid** part is what’s “real” there.
-
----
-
-## Where this is weak (I’m not going to pretend)
-
-- **Watts are modeled** unless we pipe in `nvidia-smi` or similar. MOER can be right and kg CO₂ can still be off if utilization is weird.
-- **Pricing** is a spreadsheet brain, not the Pricing API.
-- **Registry** is human-maintained; wrong WattTime v3 code → wrong grid. `mappings validate` exists for a reason.
-- **Post-run timing** is subprocess wall time, not guaranteed cluster semantics for every SkyPilot mode.
-
----
-
-## If I need to change something — file map
-
-| What I’m touching | File |
-|-------------------|------|
-| CO₂ math, Monte Carlo, post-run | `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py` |
-| Watt curves, PUE sampling | `.../estimator/power_model.py` |
-| $ estimates, spot pricing | `.../estimator/pricing.py` |
-| Region → grid JSON | `.../mapping/seed_registry.json` |
-| WattTime client / auth / retries | `.../watttime.py` |
-| Time-shift scheduling | `.../scheduler.py` |
-| Persistent run ledger (SQLite) | `.../tracking.py` |
-| Checkpoint core (framework detect, YAML patch) | `.../checkpoint.py` |
-| Checkpoint shim (remote SIGTERM wrapper) | `.../checkpoint_shim.py` |
-| CLI commands | `carbonsight/apps/cli/carbonsight_cli/commands/` |
-| API routes | `carbonsight/apps/api/carbonsight_api/routes/` |
-
----
-
-## Tests
-
-From `carbonsight/`:
-
-```bash
-PYTHONPATH=packages/core:apps/cli pytest tests/ -v
+Validation without creds:
+```
+WATTTIME_USERNAME= pytest test_central_cache_stub.py -v → 5 passed
+TestClient /v1/regions →21, /v1/recommendations without creds →17
 ```
 
 ---
 
-That’s the gist. If this doc and the code disagree, **the code wins** until I fix one of them.
+## Carbon + power math
+
+```
+kg/hr = (P_IT/1000 * PUE/1000 MWh/hr) × MOER(lb/MWh) × 0.45359237
+  P_IT = P_base 200W + P_gpu (count*(idle+u*(cap-idle))) + P_cpu + P_mem + P_net
+  GPU defaults T4 25-70W, A100 80-400W, H100 150-700W [power_model.py:13], power_it_w [power_model.py:58]
+  PUE Normal(1.20,0.05) truncated [1.05,1.60] [power_model.py:69], sample_power_params [power_model.py:85]
+  _time_weighted_moer(points,start,end) each point covers [t_i,next) clipped to window [carbon_model.py:24 + cache.py:40]
+  Facility MWh/hr deterministic seed 0 for kg/hr calc [_facility_mwh_per_hour in carbon.py]
+
+carbon $/hr = kg/hr/1000 × price_per_ton × weight [carbon.py:74-113 + unified_model.py:202]
+```
+
+Monte Carlo old: 1000 samples of u_gpu 0.6-0.9, PUE → mean/p10/p90 `estimate_region:93`.
+
+Windowed new: `ForecastCache.get_time_weighted_moer(mixture,start,end)` weighted sum over mixture [cache.py:101] for `[now,now+L̄]` not just `data[0].value` old [carbon_model.py:81].
+
+---
+
+## Spot price isolation (for your boto3 wrapper branch)
+
+`estimator/pricing.py` owned by other work: base dict [pricing.py:20] + multiplier [pricing.py:31] + SPOT_PRICE_FRACTION=0.35 [pricing.py:56] + `estimate_cost_usd:59`.
+
+Isolation via Protocol, no edits:
+
+- `providers/spot.py:26` `SpotPriceProvider` Protocol `get_spot_price_usd_per_gpu_hr`, `get_od_price`, `get_egress_per_gb`
+- `providers/spot.py:63` `StaticSpotPriceProvider` read-only copy of pricing.py dicts (no mutation) — od=base*mult, spot=od*0.35
+- `providers/spot.py:142` `Boto3SpotPriceProvider` stub: fetch EC2 DescribeSpotPriceHistory + file cache `~/.carbonsight/spot_prices.json` TTL, docstring for your wrapper to implement same protocol
+- `spot/unified_model.py:44` also defines Protocol for backward compat, but now imports from providers
+
+---
+
+## Spot scheduling (SkyNomad Sec 4.3-4.7)
+
+| Piece | File:line | Formula / behavior |
+|-------|-----------|--------------------|
+| **Probing** | `spot/availability.py:19` SpotObservation, `48` VirtualInstance, `105` AvailabilityTracker | outcome 0/1, `0→1` start, `1→0` = preemption, ends in 1 → censored, `is_available(region,at)` last observation, `to_dict` |
+| **Lifetime** | `spot/lifetime.py:41` LifetimeStats, `80` n(l)=Σ≥l(e+c), `110` h=e/n, `150` H=Σh, `180` S=exp(-H), `210` L̄(a)=1/S(a) Σ_{>a}S, `260` γ_W=e_W/Σh(a), `290` γ*, `310` S̃=S^{γ*} | heavy-tailed + volatile periods, 20+29 tests |
+| **Progress V(t)** | `spot/progress.py:44` ProgressState(p,P,t,T), `92` θ=(P-p)/(T-t), `80` θ̃=p/t fallback P/T, `110` V=C_od·θ/θ̃ anchoring V=C_od when balanced, `140` thrifty p≥P, `149` safety_net T-t<P-p+2d, `193` ODCandidate, `213` total cost C·(P-p+d)+E+carbon$/1000*price*weight, `253` select cheapest OD | deadline pressure monotonic, scale-invariant |
+| **Utility** | `spot/unified_model.py:114` MigrationCostEstimator E=e·ckpt (0.02 $/GB default), `167` CandidateState, `202` carbon_cost, `217` C_total=spot$+carbon$, `237` η=max(0,L̄-d)/L̄ (∞→1), `258` U=V·η - C_total - E/L̄, `330` rank_candidates descending U | idle U=0, OD U=V-C, spot penalized d and E/L̄, anti-flap Δ=0.05 in policy |
+| **Policy loop** | `spot/policy.py:20` PolicyState, `60` Action Launch/Idle/Stay/Terminate, `80` SkyNomadPolicy decide: thrifty→Idle, safety_net→cheapest OD, rank by U, launch if U_s>U_current+Δ | Algo1 paper |
+
+---
+
+## Joint 2D schedule command (live)
+
+`apps/cli/commands/schedule.py:30` `_GENERALLY_AVAILABLE` synthetic L̄ map (us-east-1 12h etc else 3.5h volatile), `40` `run_schedule()`:
+
+1. parse YAML `advise.py:60`, P=duration, T=deadline_hours default P*1.5, d=cold_start_minutes/60 + ckptGB*0.002
+2. Registry + Config factory carbon_provider (Api/WattTime/Synthetic), spot_provider Static, migration_estimator
+3. now→now+L̄ carbon kg/hr via `carbon_provider.get_kg_per_hr(wt_regions,now,now+L̄)` using cache time-weighted, migration_cost if region!=r0
+4. CandidateState spot+OD per region + idle, C_od_total_min = min OD C_total, V=ProgressState(0,P,0,T).future_progress_value(C_od_total_min)
+5. thrifty/safety_net → `rank_candidates` → Rich table or --json fields `cloud_region,mode,mean_lifetime_hr,eta,price_per_hr,carbon_kg_per_hr,carbon_cost,total_cost,migration,utility_U,V`
+
+Validated without creds:
+
+```
+.venv/bin/carbonsight schedule --yaml tests/fixtures/train_minimal.yaml --deadline-hours 45 --checkpoint-size-gb 100 --carbon-price 50 --json
+→ us-east-1 spot L̄12 η0.97 $1.43 kg0.144 U2.56 V4.10 top action Launch
+
+--deadline-hours 1 → safety_net_on_demand us-east-1 (T-t < P-p+2d)
+
+--carbon-price 0 → US cheapest wins, --carbon-price 20000 → green wins (need ~13700 $/ton to overcome $1 spot diff: facility 0.0006 MWh ×270 lb delta×0.453=0.073 kg/hr)
+```
+
+Registered in `main.py:18` `app.command("schedule")`.
+
+---
+
+## API / worker prod pieces
+
+- `apps/api/main.py:12` registry_path parents[3], `8` includes carbon router
+- `infra/docker/docker-compose.yml` db postgres:15-alpine healthcheck + schemas.sql init, api port 8000 env DATABASE_URL=postgresql://...@db:5432 + WTT creds, worker same build `command python -m apps.worker.fetch_watttime --loop --interval-min 15` restart unless-stopped
+
+Backtest v2 planned: `backtest/spot_runner.py` synthetic traces 13 zones patterns generally/frequent/unavailable like paper Fig 2, 30h/45h deadline ckpt 100GB baselines UP single, UP(S) cheapest-failover, metrics savings, deadline_met%, migrations, egress%.
+
+---
+
+## Tests (how we validate vibe-coding without real creds)
+
+```
+uv sync --extra dev --extra api
+uv run pytest tests/unit/test_watttime_cache.py tests/unit/test_carbon_provider.py tests/unit/test_central_cache_stub.py -v
+  9+5 passed: time-weighted 00:30-01:30→150, TTL hit fetch_count 1, mixture 140, factory, kg/hr, green vs dirty lever
+
+WATTTIME_USERNAME= pytest test_central_cache_stub.py -v  # no creds, stubbed diurnal 150 night 420 day, API 21 regions →17 recs synthetic
+
+.venv/bin/carbonsight advise --yaml tests/fixtures/... --json → [] without creds (BYOK)
+CARBONSIGHT_API_URL=http://... advise --json → 17 rows (central cache, no WTT creds) → everyone can schedule
+
+.venv/bin/pytest tests/unit -v → 191 passed, e2e advise replay →4 passed via vcr cassettes
+```
+
+If doc and code disagree, code wins.
+

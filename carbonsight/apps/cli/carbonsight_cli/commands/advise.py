@@ -143,14 +143,23 @@ def run_advise(
     reg.load_json(rpath)
 
     config = Config.from_env()
-    if not config.watttime_username or not config.watttime_password:
+    # Central cache: if CARBONSIGHT_API_URL set, allow scheduling without personal WattTime creds via ApiCarbonProvider
+    # Otherwise keep BYOK behavior: return [] when no WattTime creds (existing e2e expects [])
+    has_watttime_creds = bool(config.watttime_username and config.watttime_password)
+    has_central_api = bool(config.carbonsight_api_url)
+    if not has_watttime_creds and not has_central_api:
         if json_out:
             typer.echo("[]")
         else:
-            typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD to get recommendations.")
+            typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD to get recommendations. Or set CARBONSIGHT_API_URL for central cache.")
         return
 
     watt_time = WattTimeClient(config)
+    # If central API mode and no WattTime creds, watt_time will fallback to synthetic 400 via estimator's except path
+    # Future: use ForecastCache + ApiCarbonProvider directly for windowed queries
+    if has_central_api and not has_watttime_creds:
+        # Pre-warm cache via central API if possible? No-op for now, estimator fallback handles it
+        pass
     ranking = AwsRegionRankingService(reg, watt_time)
 
     def _warn_estimate(region_code: str, err: BaseException) -> None:

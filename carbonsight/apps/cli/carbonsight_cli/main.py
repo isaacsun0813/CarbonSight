@@ -10,6 +10,7 @@ from carbonsight_cli.commands import (
     mappings,
     report,
     run,
+    schedule,
     train,
 )
 
@@ -18,6 +19,7 @@ app = typer.Typer(name="carbonsight", help="Greenest cloud advisor and launcher 
 app.command("advise")(advise.advise)
 app.command("train")(train.train_cmd)
 app.command("run")(run.run_cmd)
+app.command("schedule")(schedule.schedule_cmd)
 app.command("history")(history.history_cmd)
 app.command("report")(report.report_cmd)
 app.command("dashboard")(dashboard.dashboard_cmd)

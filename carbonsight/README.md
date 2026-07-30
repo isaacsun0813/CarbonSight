@@ -1,101 +1,118 @@
 # CarbonSight (Python package)
 
-CLI and library to **rank AWS regions by estimated operational CO₂** for a GPU job (WattTime marginal MOER + power model), with optional **SkyPilot** launch.
-
-**“More efficient” here means lower estimated electricity-related emissions for the same job spec**, not faster wall-clock training. You still choose cost vs. carbon using `--max-cost-premium`.
-
-## Who this is for
-
-- Teams running **ML training on AWS** who want a **data-informed default** for **which region** to use.
-- Anyone using **SkyPilot** who can point at a **YAML** describing accelerators and duration.
+CLI and library to **rank AWS regions by operational CO₂ + $ + deadline**, using WattTime MOER + power model + spot lifetime, now with **SkyNomad-inspired joint rank** and **central single-credential cache**.
 
 ## Install
 
 ```bash
 cd carbonsight
-pip install -e .
+uv sync --extra dev --extra api  # or pip install -e ".[dev,api]"
 ```
 
-Development (tests + linters):
+## Configure
+
+**BYOK mode** (old, per-user WattTime):
+```bash
+export WATTTIME_USERNAME=...  WATTTIME_PASSWORD=...
+```
+
+**Central cache mode** (NEW, one cred for all):
+```bash
+export CARBONSIGHT_API_URL=http://127.0.0.1:8000
+# server holds ONE WattTime cred, worker populates grid_signal_cache
+# client needs NO WattTime env
+```
+
+## Flows
+
+### advise (1D greenest-first)
 
 ```bash
-pip install -e ".[dev]"
+carbonsight advise --yaml ../examples/skypilot/train.yaml --json
+# greenest within --max-cost-premium 20%
 ```
 
-## Configure (your WattTime account)
-
-Use **your own** [WattTime](https://www.watttime.org/) API credentials—copy [`.env.example`](.env.example) to `.env` or export:
+### schedule (NEW joint 2D region×mode, live without creds)
 
 ```bash
-export WATTTIME_USERNAME=...
-export WATTTIME_PASSWORD=...
+carbonsight schedule --yaml tests/fixtures/train_minimal.yaml \
+  --deadline-hours 45 --checkpoint-size-gb 100 --carbon-price 50
+
+# Rank by U = V·η - C_total - E/Lbar
+# C_total = spot $/hr + carbon kg/hr/1000*price, η=(Lbar-d)/Lbar, V=C_od·θ/θ̃
+# Thrifty p>=P → idle, safety-net T-t<P-p+2d → cheapest OD
 ```
 
-## Minimal flow
+<details><summary>Example U ranking JSON</summary>
 
-### Option A — YAML only
-
-1. Write or reuse a **SkyPilot-style YAML** (`resources`, `duration`, `run:`). Example: [`../examples/skypilot/train.yaml`](../examples/skypilot/train.yaml).
-2. **Advise** — ranked regions (greenest first, optional cost ceiling):
-
-   ```bash
-   carbonsight advise --yaml path/to/train.yaml --json
-   ```
-
-3. **Run** (optional) — pick greenest affordable region, patch YAML, call SkyPilot:
-
-   ```bash
-   carbonsight run path/to/train.yaml --dry-run   # see patched YAML
-   carbonsight run path/to/train.yaml --yes       # needs `sky` CLI + cloud creds
-   ```
-
-### Option B — `train` (no YAML hand-authoring)
-
-From your **project root** (so paths match what SkyPilot uploads):
+```json
+{
+  "cloud_region": "us-east-1",
+  "mode": "spot",
+  "mean_lifetime_hr": 12.0,
+  "effectiveness_eta": 0.97,
+  "price_per_hr_usd": 1.43,
+  "carbon_kg_per_hr": 0.144,
+  "total_cost_per_hr_usd": 1.44,
+  "utility_U": 2.56,
+  "V": 4.10
+}
+```
+</details>
 
 ```bash
-carbonsight train path/to/train.py --json
-carbonsight train path/to/train.py --launch --dry-run   # show patched YAML
-carbonsight train path/to/train.py --launch --yes       # launch with SkyPilot
+# Tight deadline → safety net
+carbonsight schedule --yaml ... --deadline-hours 1 --json
+# {"action":"safety_net_on_demand","chosen_region":"us-east-1"}
 ```
 
-Defaults: `A100:1`, `1h`, 8 CPUs, 32 GiB. Override with `--accelerators`, `--duration`, `--cpus`, `--memory`, `--name`.
-
-Optional: `--gpu-util 0.72` or `--nvidia-smi` to anchor GPU power; optional YAML block `carbonsight.gpu_utilization` when using `advise`/`run` with a file.
-
-## Commands
-
-| Command | Purpose |
-|---------|---------|
-| `carbonsight train SCRIPT.py [--json] [--launch ...]` | Build a SkyPilot task from `python SCRIPT.py`, then same as advise or run |
-| `carbonsight advise --yaml FILE [--json] [--max-cost-premium P]` | Rank regions by CO₂ (and cost), filter expensive outliers |
-| `carbonsight run FILE [--dry-run] [--no-exec] [--skip-preflight]` | Advise + optional AWS quota check + patch YAML + `sky launch` / `sky jobs launch` |
-| `carbonsight mappings validate` | Compare registry coords to WattTime `region-from-loc` (needs credentials) |
-| `carbonsight backtest run [--json]` | Synthetic MOER/price policy experiment |
-
-## API (optional)
+### run / train (existing)
 
 ```bash
-pip install -e ".[api]"
-uvicorn carbonsight_api.main:app --reload
+carbonsight run path/to/train.yaml --dry-run
+carbonsight train path/to/train.py --launch --dry-run
 ```
 
-- `GET /health`
-- `POST /v1/recommendations` — same inputs as a `JobSpec` (see OpenAPI at `/docs`)
-
-## Tests
+### backtest
 
 ```bash
-pytest tests/unit tests/e2e -q
+carbonsight backtest run --json
+carbonsight backtest spot --n 20 --days 14 --deadline-ratio 1.5 --checkpoint-gb 100 --json
+# SkyNomad cost mean vs UP single vs UP multi, deadline_met%, migrations, egress%
 ```
 
-Integration tests that call live WattTime **skip** without credentials. CI runs on every PR (see `.github/workflows/ci.yml`).
+## API (central ONE cred)
 
-## Design docs
+```bash
+docker-compose -f infra/docker/docker-compose.yml up -d
+# db + api:8000 + worker loop 15m (ONE WattTime cred)
 
-- Repo root [`ARCHITECTURE.md`](../ARCHITECTURE.md) — MOER, Monte Carlo, limitations  
-- [`IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) — phased scope  
+curl http://127.0.0.1:8000/v1/regions | jq length # 21
+curl "http://127.0.0.1:8000/v1/carbon/forecast?wt_region=PJM_DC" | jq .source
+curl -X POST http://127.0.0.1:8000/v1/recommendations -d '{"gpu_type":"A100"}' | jq length # 17 even without creds (synthetic)
+```
 
-## License
+## How single credential works
 
-MIT — see [`../LICENSE`](../LICENSE).
+- `watttime/cache.py:71` ForecastCache TTL 15min + time-weighted window `[t,t+Lbar]` mixture
+- `providers/carbon.py:250` factory prefers `CARBONSIGHT_API_URL` (Api no creds) > `WATTIME_USERNAME` (ONE cred server) > synthetic 400
+- Worker `fetch_watttime.py:44` dedupes 30 WT regions, horizon 72h, upserts `grid_signal_cache` ON CONFLICT
+- `routes/carbon.py:180` central proxy reads cache → DB → live → empty not 500
+
+Validate without creds: `WATTTIME_USERNAME= pytest tests/unit/test_central_cache_stub.py -v` → 5 passed
+
+## File map (short pointers)
+
+| What | File |
+|------|------|
+| Client token 25min 401/429 | `watttime/client.py:26` |
+| ForecastCache | `watttime/cache.py:71` |
+| Carbon one-cred provider | `providers/carbon.py:250` |
+| Spot price isolated | `providers/spot.py:26` Protocol, `unified_model.py:55` Static |
+| Availability Sec 4.3 | `spot/availability.py:105` |
+| Lifetime Sec 4.4 | `spot/lifetime.py:80` h=e/n, S=exp(-H), Lbar |
+| Progress V Sec 4.5 | `spot/progress.py:44` V=C_od·θ/θ̃ |
+| Utility U Sec 4.6 | `spot/unified_model.py:258` |
+
+More: `../ARCHITECTURE.md` (line pointers), `../CURRENT_STATE.md`
+

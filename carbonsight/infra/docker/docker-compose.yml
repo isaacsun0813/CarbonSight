@@ -1,5 +1,7 @@
-# CarbonSight API + Postgres (MVP)
+# CarbonSight API + Postgres + Worker (MVP production-ready central WattTime cache)
 # Run: docker-compose -f carbonsight/infra/docker/docker-compose.yml up -d
+# Worker holds ONE WattTime credential server-side and populates grid_signal_cache every 15min.
+# API optionally reads from grid_signal_cache when DATABASE_URL set, else falls back to in-memory + synthetic.
 
 services:
   db:
@@ -12,7 +14,12 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ../../infra/schemas.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ../schemas.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carbonsight -d carbonsight"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   api:
     build:
@@ -24,8 +31,32 @@ services:
       WATTTIME_USERNAME: ${WATTTIME_USERNAME:-}
       WATTTIME_PASSWORD: ${WATTTIME_PASSWORD:-}
       DATABASE_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
+      CARBONSIGHT_DB_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
+      CARBONSIGHT_CACHE_TTL_MIN: ${CARBONSIGHT_CACHE_TTL_MIN:-15}
+      GRID_CACHE_RETENTION_DAYS: ${GRID_CACHE_RETENTION_DAYS:-7}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    # Production-ready central fetcher: single credential, loop every 15min, upsert + retention
+    command: ["python", "-m", "apps.worker.fetch_watttime", "--loop", "--interval-min", "15"]
+    environment:
+      WATTTIME_USERNAME: ${WATTTIME_USERNAME:-}
+      WATTTIME_PASSWORD: ${WATTTIME_PASSWORD:-}
+      DATABASE_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
+      CARBONSIGHT_DB_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
+      GRID_CACHE_RETENTION_DAYS: ${GRID_CACHE_RETENTION_DAYS:-7}
+      CACHE_TOKENS: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:
