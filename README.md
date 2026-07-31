@@ -33,24 +33,25 @@ Factory order in [`get_carbon_provider()`](carbonsight/packages/core/carbonsight
 
 ---
 
-## Joint ranking \(U_s\)
+## Joint ranking ($U_s$)
 
 For each candidate region/instance:
 
-\[
+$$
 U_s = V \cdot \eta - C_{\mathrm{total}} - \frac{E}{\bar L}
-\]
+$$
 
 | Symbol | Meaning | Code |
 |--------|---------|------|
-| \(\theta = (P-p)/(T-t)\) | Urgency (progress rate needed) | [`progress.py`](carbonsight/packages/core/carbonsight_core/spot/progress.py) |
-| \(V = C_{od}\cdot\theta/\tilde\theta\) | Value of finishing | [`unified_model.py`](carbonsight/packages/core/carbonsight_core/spot/unified_model.py) |
-| \(\eta\) | Instance efficiency | `ODCandidate.efficiency` |
-| \(C_{\mathrm{total}}\) | Spot $ + carbon $ (MOER × MWh × \$/t) | same |
-| \(E\) | Eviction penalty × (1 − survival) | same |
-| \(\bar L\) | Expected remaining lifetime | [`lifetime.py`](carbonsight/packages/core/carbonsight_core/spot/lifetime.py) |
+| $\theta = (P-p)/(T-t)$ | Urgency (progress rate needed) | [`progress.py`](carbonsight/packages/core/carbonsight_core/spot/progress.py) |
+| $V = C_{od}\cdot\theta/\tilde\theta$ | Value of an hour of progress | [`progress.py`](carbonsight/packages/core/carbonsight_core/spot/progress.py) |
+| $\tilde\theta = p/t$ | Achieved rate (falls back to $P/T$ at $t=0$) | same |
+| $\eta = (\bar L - d)/\bar L$ | Effectiveness: share of a lifetime spent working | [`unified_model.py`](carbonsight/packages/core/carbonsight_core/spot/unified_model.py) |
+| $C_{\mathrm{total}}$ | Spot \$/hr + carbon \$/hr (MOER × MWh × \$/t) | same |
+| $E = e \cdot \mathrm{ckpt}_{GB}$ | Migration (egress) cost, amortized over $\bar L$ | same |
+| $\bar L$ | Expected remaining lifetime | [`lifetime.py`](carbonsight/packages/core/carbonsight_core/spot/lifetime.py) |
 
-Rank by **\(U_s\) descending**. Greener grids raise \(U_s\) when `carbon_price_usd_per_ton` is material.
+Rank by **$U_s$ descending** over region × {spot, on-demand} plus idle, which scores 0 so a negative $U_s$ means wait. Greener grids raise $U_s$ when `carbon_price_usd_per_ton` is material. At $t=0$ with $p=0$ we have $\theta=\tilde\theta=P/T$ and therefore $V=C_{od}$; `--progress-hours` and `--elapsed-hours` move the job off that anchor.
 
 ---
 
@@ -81,7 +82,7 @@ curl -s localhost:8001/v1/recommendations | jq length   # → 17
 | Path | Role |
 |------|------|
 | [`carbonsight/packages/core/carbonsight_core/`](carbonsight/packages/core/carbonsight_core/) | Domain brain |
-| [`spot/`](carbonsight/packages/core/carbonsight_core/spot/) | SkyNomad availability, lifetime, progress, policy, \(U_s\) |
+| [`spot/`](carbonsight/packages/core/carbonsight_core/spot/) | SkyNomad availability, lifetime, progress, policy, $U_s$ |
 | [`watttime/`](carbonsight/packages/core/carbonsight_core/watttime/) | Client + `ForecastCache` (time-weighted MOER) |
 | [`providers/`](carbonsight/packages/core/carbonsight_core/providers/) | Carbon + spot Protocols (pricing isolated) |
 | [`apps/cli`](carbonsight/apps/cli/) | `schedule`, `advise`, `backtest`, … |

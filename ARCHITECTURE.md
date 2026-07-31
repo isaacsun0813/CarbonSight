@@ -1,29 +1,135 @@
 # CarbonSight Architecture
 
-Readable map of the SkyNomad + carbon-aware stack. Paths are relative to the repo root.
+Readable map of the SkyNomad + carbon-aware stack. Paths are relative to the repo root. Please checkout repo root or this will be confusing :)
 
 ---
 
 ## 1. Product shape
 
+You have a GPU training job and a deadline. AWS will sell you that GPU in ~21 regions,
+either as **spot** (cheap, can be killed at any moment) or **on-demand** (expensive, safe),
+and every region sits on a grid with a different carbon intensity that changes hour to hour.
+
+That's ~42 ways to run the same job, each trading **dollars**, **carbon**, and
+**interruption risk** differently — and the right answer changes while the job is running,
+as grids get dirtier, spot capacity evaporates, and the deadline gets closer.
+
+CarbonSight is **not an advisor**. You hand it a job; it scores every placement with a single
+number, $U_s$, **launches on the winner, supervises the run, and moves the job when the
+winner changes.** You watch status; you don't get asked to pick.
+
 ```
-JobSpec (GPU, deadline, carbon $/t)
-        │
-        ▼
-┌───────────────────┐     ┌────────────────────┐
-│ SpotPriceProvider │     │ CarbonIntensity    │
-│ (static / boto3)  │     │ Provider (API /    │
-└─────────┬─────────┘     │  WattTime / synth) │
-          │               └─────────┬──────────┘
-          ▼                         ▼
-   ODCandidate[]  ←  LifetimeStats + AvailabilityTracker + ProgressState
-          │
-          ▼
-   rank by U_s  →  schedule / recommendations / advise
-          │
-          ▼
-   SkyNomadPolicy  (PROBE / RUN / MIGRATE / WAIT)
+  submit ──► rank ──► launch ──► supervise ──► migrate/idle ──► done
+                ▲                     │
+                └──── re-rank ◄───────┘   every probe interval (~2h)
 ```
+
+### 1.1 What goes in — [`JobSpec`](carbonsight/packages/core/carbonsight_core/models.py)
+
+| Group | Fields | Why the scheduler cares |
+|-------|--------|--------------------------|
+| **The work** | `gpu_type`, `gpu_count`, `duration_hours`, `cpu_count`, `mem_gib`, `gpu_utilization` | Feeds the power model → watts → MWh/hr → kg CO₂/hr. `gpu_utilization` (or `--nvidia-smi`) replaces sampled draw with a measured one. |
+| **The clock** | `deadline_hours` (T), `progress_hours_done` (p), `start_time_utc` | Sets deadline pressure θ = (P−p)/(T−t). Falling behind raises the value of an hour, which makes the ranker accept pricier, safer placements. |
+| **Interruption cost** | `checkpoint_size_gb`, `cold_start_minutes` (d), `current_region` (r₀) | A restart costs egress on the checkpoint plus dead time restoring it. `current_region` pays no migration, so it gets a stickiness bonus. |
+| **Your preference** | `carbon_price_usd_per_ton`, `carbon_weight` | Converts kg CO₂ into dollars so carbon competes with price in one unit. `0` ignores carbon; higher values buy greener grids. |
+| **Data movement** | `data_in_gb`, `data_out_gb`, `constraints` | Transfer cost and hard filters (region allow-lists, compliance). |
+
+### 1.2 The pipeline
+
+```
+JobSpec ── what to run · when it's due · how far along · what you'll pay for carbon
+   │
+   ├─► SpotPriceProvider ──────► $/hr for spot and on-demand, per region
+   │     (static | boto3)
+   │
+   ├─► CarbonIntensityProvider ► kg CO2/hr, per region, averaged over [t, t+Lbar]
+   │     (API | WattTime | synthetic)
+   │
+   ├─► AvailabilityTracker ────► LifetimeStats ──► Lbar  how long spot survives here
+   │     (probe history)          (Nelson-Aalen)
+   │
+   └─► ProgressState ──────────► V  what one hour of progress is worth right now
+         (p, P, t, T)
+                    │
+                    ▼
+        CandidateState[]   one per (region x {spot, on_demand}), plus one idle
+                    │
+                    ▼
+              rank by U_s          <- see 1.3
+                    │
+      ┌─────────────┼─────────────┐
+      ▼             ▼             ▼
+  schedule    recommendations   advise
+      │
+      ▼
+  SkyNomadPolicy ──► launch | stay | idle | terminate
+```
+
+### 1.4 Decide → execute → supervise → report
+
+The ranker is one stage of a closed loop, not the product. The loop is:
+
+| Stage | Does what | Today |
+|-------|-----------|-------|
+| **Rank** | Score every region×mode by $U_s$ | ✅ `schedule`, `scheduler_service` |
+| **Decide** | Thrifty / safety-net / launch / stay / migrate | ✅ `SkyNomadPolicy` emits actions |
+| **Execute** | Patch YAML, `sky launch` / `sky jobs launch`, quota preflight | ⚠️ **only via `run`** — one-shot, carbon-only pick, never re-evaluated |
+| **Supervise** | Re-rank on a cadence, act on the new decision | ❌ **not built** — nothing consumes `SkyNomadPolicy`'s actions |
+| **Migrate** | Checkpoint → egress → relaunch elsewhere → resume | ⚠️ checkpoint/restore primitives exist; the region-to-region move does not |
+| **Report** | Live job status while running | ❌ **not built** — `history`/`dashboard`/`report` read *finished* runs only |
+
+The two gaps that matter:
+
+**`schedule` doesn't launch.** It ranks and prints. `carbonsight run` is the only path that
+actually calls SkyPilot, and it decides once, on the old carbon-only ranking, and never
+revisits that choice. Closing this means `schedule` becomes the launcher and inherits `run`'s
+executor (`launch_skypilot_with_patched_yaml`, quota preflight, checkpoint wrapping).
+
+**The ledger can't answer "what's my job doing?"** [`tracking.py`](carbonsight/packages/core/carbonsight_core/tracking.py)'s
+`runs` table is written once, after launch, for cost/carbon accounting. It has no `status`,
+no current region over time, no progress $p$, no migration count. A live status view needs
+those columns plus a supervisor writing to them on every probe — at which point
+`carbonsight status` can show: where the job is now, hours in vs. deadline, $p/P$, how many
+times it moved, cumulative \$ and kg, and what the next probe will consider.
+
+---
+
+### 1.3 What "rank by $U_s$" means
+
+$U_s$ is a **single dollars-per-hour score** answering one question per candidate:
+*is running here for the next hour worth what it costs?* Every term is \$/hr, so they subtract cleanly.
+
+$$
+U_s = \underbrace{V \cdot \eta}_{\text{value earned}} - \underbrace{C_{\mathrm{total}}}_{\text{price + carbon}} - \underbrace{E / \bar L}_{\text{move cost, spread out}}
+$$
+
+| Term | Reads as | Detail |
+|------|----------|--------|
+| $V$ | what an hour of progress is worth | $C_{od}\cdot\theta/\tilde\theta$ — anchored so that **on schedule → $V$ = cheapest on-demand rate**. Fall behind and $V$ climbs, so pricier/riskier options start winning. |
+| $\eta$ | fraction of the instance actually spent working | $(\bar L - d)/\bar L$. A 3-hour spot slot with a 20-min restore only gives you ~89% useful time. On-demand has $\bar L = \infty$, so $\eta = 1$. |
+| $C_{\mathrm{total}}$ | the real hourly bill | spot \$/hr **+** carbon priced in: `kg/hr ÷ 1000 × carbon_price × carbon_weight`. |
+| $E / \bar L$ | migration, amortized | $E$ = egress \$/GB × checkpoint GB, paid once. Divided by $\bar L$ because a slot you'll hold 12h absorbs it far better than one you'll hold 3h. Zero for `current_region`. |
+
+**Highest $U_s$ wins.** Idle scores exactly `0`, so a negative $U_s$ everywhere means *nothing is worth
+paying for right now* and the scheduler waits.
+
+Two rules short-circuit the ranking before it runs:
+
+- **Thrifty** — `p >= P`: the job is done. Release the instance.
+- **Safety net** — `T - t < P - p + 2d`: too little slack left to risk another spot restart.
+  Skip ranking and take the cheapest on-demand region that can still finish in time.
+
+**Worked example** — `schedule --deadline-hours 45 --checkpoint-size-gb 100`, no credentials,
+already running in `us-east-1`:
+
+| Region | Mode | $\bar L$ | $\eta$ | \$/hr | kg/hr | $E/\bar L$ | $U_s$ |
+|---|---|---|---|---|---|---|---|
+| us-east-1 | spot | 12.0h | 0.975 | 1.43 | 0.144 | \$0.00 | **2.56** |
+| us-east-2 | spot | 3.5h | 0.914 | 1.43 | 0.144 | \$0.57 | 1.74 |
+
+Identical price, identical carbon. `us-east-1` wins purely because spot survives ~3.5× longer
+there *and* the checkpoint is already sitting in it — which is exactly the trade the older
+carbon-only ranking could not see.
 
 ---
 
@@ -33,15 +139,15 @@ Paper: [SkyNomad arXiv:2601.06520](https://arxiv.org/pdf/2601.06520).
 
 | Section | Module | Responsibility |
 |---------|--------|----------------|
-| 4.3 Availability | [`availability.py`](carbonsight/packages/core/carbonsight_core/spot/availability.py) | `SpotObservation`, `VirtualInstance`, `AvailabilityTracker`, at-risk set, eviction counts |
-| 4.4 Lifetime | [`lifetime.py`](carbonsight/packages/core/carbonsight_core/spot/lifetime.py) | Kaplan–Meier style `compute_at_risk`, hazard, cumulative hazard, survival, `expected_remaining` (Lbar) |
-| 4.5 Progress | [`progress.py`](carbonsight/packages/core/carbonsight_core/spot/progress.py) | `ProgressState`: \(P,p,T,t\), `theta()`, `urgency()` |
-| 4.6 Unified | [`unified_model.py`](carbonsight/packages/core/carbonsight_core/spot/unified_model.py) | `ODCandidate`, \(U_s = V\eta - C_{total} - E/\bar L\) |
-| 4.7 Policy | [`policy.py`](carbonsight/packages/core/carbonsight_core/spot/policy.py) | `Action` enum, `SkyNomadPolicy`, probe every 2h + Δ migrate |
-| Orchestration | [`scheduler_service.py`](carbonsight/packages/core/carbonsight_core/spot/scheduler_service.py) | Build candidates, `schedule_job`, 17-row synthetic pad |
+| 4.3 Availability | [`availability.py`](carbonsight/packages/core/carbonsight_core/spot/availability.py) | `SpotObservation`, `VirtualInstance`, `AvailabilityTracker`: probe trace → 0→1/1→0 transitions → lifetimes with censoring |
+| 4.4 Lifetime | [`lifetime.py`](carbonsight/packages/core/carbonsight_core/spot/lifetime.py) | Nelson–Aalen `compute_at_risk`, $h=e/n$, $H=\sum h$, $S=e^{-H}$, `expected_remaining` ($\bar L$), $\gamma^*$ volatility adjustment |
+| 4.5 Progress | [`progress.py`](carbonsight/packages/core/carbonsight_core/spot/progress.py) | `ProgressState(p,P,t,T)`: `deadline_pressure`, `avg_progress`, `future_progress_value`, `is_thrifty`, `is_safety_net` |
+| 4.6 Unified | [`unified_model.py`](carbonsight/packages/core/carbonsight_core/spot/unified_model.py) | `CandidateState`, `MigrationCostEstimator`, $U_s = V\eta - C_{total} - E/\bar L$ (all \$/hr) |
+| 4.7 Policy | [`policy.py`](carbonsight/packages/core/carbonsight_core/spot/policy.py) | `PolicyState`, `Action`, `SkyNomadPolicy`: thrifty → safety net → probe → rank → Δ |
+| Orchestration | [`scheduler_service.py`](carbonsight/packages/core/carbonsight_core/spot/scheduler_service.py) | `build_candidates`, `schedule_job` over every region the registry maps (21 AWS today) |
 
-Carbon is an **extra lever** inside \(C_{total}\):  
-`spot_cost + (carbon_kg/1000) * carbon_price * carbon_weight`, with  
+Carbon is an **extra lever** inside $C_{total}$:
+`spot_cost + (carbon_kg/1000) * carbon_price * carbon_weight`, with
 `carbon_kg = MWh * MOER_lb * 0.45359237`.
 
 ---
@@ -60,7 +166,7 @@ Carbon is an **extra lever** inside \(C_{total}\):
 
 - `ApiCarbonProvider` — `GET {CARBONSIGHT_API_URL}/v1/carbon/forecast?region=`
 - `WattTimeCarbonProvider` — direct client + cache
-- `SyntheticCarbonProvider` — 17 deterministic regions
+- `SyntheticCarbonProvider` — 17 deterministic grid regions, each with its own MOER curve
 - `get_carbon_provider()` preference: **API URL > WattTime env > synthetic**
 
 ### 3.3 API routes
@@ -68,8 +174,8 @@ Carbon is an **extra lever** inside \(C_{total}\):
 | Route | File |
 |-------|------|
 | `GET /v1/carbon/forecast` | [`routes/carbon.py`](carbonsight/apps/api/carbonsight_api/routes/carbon.py) |
-| `GET /v1/regions` | [`routes/regions.py`](carbonsight/apps/api/carbonsight_api/routes/regions.py) — never empty |
-| `GET/POST /v1/recommendations` | [`routes/recommendations.py`](carbonsight/apps/api/carbonsight_api/routes/recommendations.py) — **17 rows** synthetic-capable |
+| `GET /v1/regions` | [`routes/regions.py`](carbonsight/apps/api/carbonsight_api/routes/regions.py) — registry contents only |
+| `GET/POST /v1/recommendations` | [`routes/recommendations.py`](carbonsight/apps/api/carbonsight_api/routes/recommendations.py) — one row per mapped region, greenest first |
 | Lifespan warm | [`main.py`](carbonsight/apps/api/carbonsight_api/main.py) |
 
 ### 3.4 Worker + DB
@@ -80,7 +186,7 @@ Carbon is an **extra lever** inside \(C_{total}\):
 
 ### 3.5 Time-weighted MOER
 
-Integrate MOER over \([t, t+\bar L]\). If the window extends beyond the forecast, **hold the last value**. Mixture mappings blend series by weight (`mixture_weighted_moer`).
+Integrate MOER over $[t, t+\bar L]$. If the window extends beyond the forecast, **hold the last value**. Mixture mappings blend series by weight (`mixture_weighted_moer`).
 
 ---
 
