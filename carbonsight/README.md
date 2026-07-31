@@ -1,101 +1,65 @@
 # CarbonSight (Python package)
 
-CLI and library to **rank AWS regions by estimated operational CO₂** for a GPU job (WattTime marginal MOER + power model), with optional **SkyPilot** launch.
+SkyNomad-style **multi-lever scheduler** (cost · carbon · time · spot availability) with a **central WattTime cache** so CLIs need no personal grid credentials.
 
-**“More efficient” here means lower estimated electricity-related emissions for the same job spec**, not faster wall-clock training. You still choose cost vs. carbon using `--max-cost-premium`.
-
-## Who this is for
-
-- Teams running **ML training on AWS** who want a **data-informed default** for **which region** to use.
-- Anyone using **SkyPilot** who can point at a **YAML** describing accelerators and duration.
-
-## Install
+## Install (`uv`)
 
 ```bash
 cd carbonsight
-pip install -e .
+uv sync --all-extras
 ```
 
-Development (tests + linters):
+Or editable classic: `uv pip install -e ".[dev,api]"`.
 
-```bash
-pip install -e ".[dev]"
-```
+## Configure
 
-## Configure (your WattTime account)
+| Mode | Env |
+|------|-----|
+| **Team CLI → API** | `CARBONSIGHT_API_URL=http://localhost:8001` |
+| **Direct WattTime** | `WATTTIME_USERNAME` / `WATTTIME_PASSWORD` |
+| **Offline / CI** | (none) → synthetic 17-region MOER |
 
-Use **your own** [WattTime](https://www.watttime.org/) API credentials—copy [`.env.example`](.env.example) to `.env` or export:
-
-```bash
-export WATTTIME_USERNAME=...
-export WATTTIME_PASSWORD=...
-```
-
-## Minimal flow
-
-### Option A — YAML only
-
-1. Write or reuse a **SkyPilot-style YAML** (`resources`, `duration`, `run:`). Example: [`../examples/skypilot/train.yaml`](../examples/skypilot/train.yaml).
-2. **Advise** — ranked regions (greenest first, optional cost ceiling):
-
-   ```bash
-   carbonsight advise --yaml path/to/train.yaml --json
-   ```
-
-3. **Run** (optional) — pick greenest affordable region, patch YAML, call SkyPilot:
-
-   ```bash
-   carbonsight run path/to/train.yaml --dry-run   # see patched YAML
-   carbonsight run path/to/train.yaml --yes       # needs `sky` CLI + cloud creds
-   ```
-
-### Option B — `train` (no YAML hand-authoring)
-
-From your **project root** (so paths match what SkyPilot uploads):
-
-```bash
-carbonsight train path/to/train.py --json
-carbonsight train path/to/train.py --launch --dry-run   # show patched YAML
-carbonsight train path/to/train.py --launch --yes       # launch with SkyPilot
-```
-
-Defaults: `A100:1`, `1h`, 8 CPUs, 32 GiB. Override with `--accelerators`, `--duration`, `--cpus`, `--memory`, `--name`.
-
-Optional: `--gpu-util 0.72` or `--nvidia-smi` to anchor GPU power; optional YAML block `carbonsight.gpu_utilization` when using `advise`/`run` with a file.
+Copy [`.env.example`](.env.example). Never commit secrets.
 
 ## Commands
 
-| Command | Purpose |
-|---------|---------|
-| `carbonsight train SCRIPT.py [--json] [--launch ...]` | Build a SkyPilot task from `python SCRIPT.py`, then same as advise or run |
-| `carbonsight advise --yaml FILE [--json] [--max-cost-premium P]` | Rank regions by CO₂ (and cost), filter expensive outliers |
-| `carbonsight run FILE [--dry-run] [--no-exec] [--skip-preflight]` | Advise + optional AWS quota check + patch YAML + `sky launch` / `sky jobs launch` |
-| `carbonsight mappings validate` | Compare registry coords to WattTime `region-from-loc` (needs credentials) |
-| `carbonsight backtest run [--json]` | Synthetic MOER/price policy experiment |
-
-## API (optional)
-
 ```bash
-pip install -e ".[api]"
-uvicorn carbonsight_api.main:app --reload
+# Multi-lever schedule (joint U_s)
+uv run carbonsight schedule \
+  --yaml tests/fixtures/train_minimal.yaml \
+  --deadline-hours 45 --checkpoint-size-gb 100 --carbon-price 50 --json
+
+# Classic advise (falls back to joint/synthetic without WattTime)
+uv run carbonsight advise --yaml tests/fixtures/train_minimal.yaml --json
+
+# Spot-aware backtest
+uv run carbonsight backtest run --spot --n 200 --json
 ```
 
-- `GET /health`
-- `POST /v1/recommendations` — same inputs as a `JobSpec` (see OpenAPI at `/docs`)
+## API
+
+```bash
+uv run uvicorn carbonsight_api.main:app --host 0.0.0.0 --port 8001
+```
+
+| Endpoint | Notes |
+|----------|--------|
+| `GET /v1/carbon/forecast?region=CAISO_NORTH` | Cached MOER series |
+| `GET /v1/regions` | Cloud/grid regions (non-empty) |
+| `GET /v1/recommendations` | **17** ranked rows (synthetic OK) |
+
+Docker: `infra/docker/docker-compose.yml` (API **:8001**, worker, Postgres `grid_signal_cache`).
+
+## Domain map
+
+- Core: `packages/core/carbonsight_core/`
+- Spot / SkyNomad: `…/spot/`
+- WattTime cache: `…/watttime/`
+- Providers: `…/providers/`
+- See repo root [`ARCHITECTURE.md`](../ARCHITECTURE.md) for formulas and code pointers.
 
 ## Tests
 
 ```bash
-pytest tests/unit tests/e2e -q
+uv run pytest tests/unit -q
 ```
-
-Integration tests that call live WattTime **skip** without credentials. CI runs on every PR (see `.github/workflows/ci.yml`).
-
-## Design docs
-
-- Repo root [`ARCHITECTURE.md`](../ARCHITECTURE.md) — MOER, Monte Carlo, limitations  
-- [`IMPLEMENTATION_PLAN.md`](../IMPLEMENTATION_PLAN.md) — phased scope  
-
-## License
-
-MIT — see [`../LICENSE`](../LICENSE).

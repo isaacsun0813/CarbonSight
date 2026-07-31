@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "carbonsight"
-version = "0.1.0"
-description = "Rank AWS regions by estimated training CO₂ (WattTime MOER) and optional SkyPilot launch"
+version = "0.2.0"
+description = "SkyNomad multi-lever scheduler + carbon-aware region ranking (WattTime MOER)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -40,14 +40,25 @@ dev = [
     "vcrpy>=4.0",
     "ruff>=0.1",
     "mypy>=1.0",
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "httpx>=0.25",
 ]
 
 [project.scripts]
 carbonsight = "carbonsight_cli.main:app"
 
-[tool.setuptools.packages.find]
-where = ["packages/core", "apps/cli", "apps/api"]
-include = ["carbonsight_*"]
+[tool.hatch.build.targets.wheel]
+packages = [
+    "packages/core/carbonsight_core",
+    "apps/cli/carbonsight_cli",
+    "apps/api/carbonsight_api",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"packages/core/carbonsight_core" = "carbonsight_core"
+"apps/cli/carbonsight_cli" = "carbonsight_cli"
+"apps/api/carbonsight_api" = "carbonsight_api"
 
 [tool.ruff]
 line-length = 100
@@ -65,5 +76,17 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["packages/core", "apps/cli", "apps/api"]
+pythonpath = ["packages/core", "apps/cli", "apps/api", "apps"]
 addopts = "-v"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "pytest-vcr>=1.0",
+    "vcrpy>=4.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "httpx>=0.25",
+]

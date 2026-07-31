@@ -13,7 +13,9 @@ from carbonsight_core.paths import (
     carbonsight_package_root_from_cli_command_file,
     resolve_registry_json_file,
 )
+from carbonsight_core.providers.carbon import get_carbon_provider
 from carbonsight_core.region_ranking import AwsRegionRankingService
+from carbonsight_core.spot.scheduler_service import schedule_job
 from carbonsight_core.telemetry.nvidia_smi import sample_mean_gpu_utilization_from_nvidia_smi
 from carbonsight_core.watttime import WattTimeClient
 from rich.console import Console
@@ -143,31 +145,44 @@ def run_advise(
     reg.load_json(rpath)
 
     config = Config.from_env()
+    # Prefer central API / synthetic joint ranking when no direct WattTime creds
     if not config.watttime_username or not config.watttime_password:
-        if json_out:
-            typer.echo("[]")
-        else:
-            typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD to get recommendations.")
-        return
+        # Ensure provider factory is exercised (ApiCarbonProvider if CARBONSIGHT_API_URL)
+        _ = get_carbon_provider(config)
+        result = schedule_job(job, registry=reg, config=config)
+        all_estimates = result.estimates
+        if not all_estimates:
+            if json_out:
+                typer.echo("[]")
+            else:
+                typer.echo("No regions returned (synthetic fallback failed).")
+            return
+        visible, min_cost, cost_ceiling = AwsRegionRankingService.rank_greenest_first_then_cost_ceiling(
+            all_estimates, max_cost_premium
+        )
+    else:
+        watt_time = WattTimeClient(config)
+        ranking = AwsRegionRankingService(reg, watt_time)
 
-    watt_time = WattTimeClient(config)
-    ranking = AwsRegionRankingService(reg, watt_time)
+        def _warn_estimate(region_code: str, err: BaseException) -> None:
+            typer.echo(f"Warning: {region_code}: {err}", err=True)
 
-    def _warn_estimate(region_code: str, err: BaseException) -> None:
-        typer.echo(f"Warning: {region_code}: {err}", err=True)
+        all_estimates = ranking.collect_estimates(job, on_estimate_error=_warn_estimate)
 
-    all_estimates = ranking.collect_estimates(job, on_estimate_error=_warn_estimate)
+        if not all_estimates:
+            # Fall back to joint synthetic path rather than empty
+            result = schedule_job(job, registry=reg, config=config)
+            all_estimates = result.estimates
+            if not all_estimates:
+                if json_out:
+                    typer.echo("[]")
+                else:
+                    typer.echo("No regions returned (check WattTime credentials and registry).")
+                return
 
-    if not all_estimates:
-        if json_out:
-            typer.echo("[]")
-        else:
-            typer.echo("No regions returned (check WattTime credentials and registry).")
-        return
-
-    visible, min_cost, cost_ceiling = AwsRegionRankingService.rank_greenest_first_then_cost_ceiling(
-        all_estimates, max_cost_premium
-    )
+        visible, min_cost, cost_ceiling = AwsRegionRankingService.rank_greenest_first_then_cost_ceiling(
+            all_estimates, max_cost_premium
+        )
 
     if json_out:
         typer.echo(json.dumps([r.model_dump(mode="json") for r in visible], indent=2))

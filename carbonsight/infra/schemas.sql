@@ -51,5 +51,9 @@ CREATE TABLE IF NOT EXISTS grid_signal_cache (
     PRIMARY KEY (wt_region, signal_type, point_time)
 );
 
+-- Retention: worker fetch_watttime prunes rows older than GRID_SIGNAL_RETENTION_HOURS (default 168h).
+-- Example manual prune:
+--   DELETE FROM grid_signal_cache WHERE point_time < now() - interval '7 days';
+
 CREATE INDEX IF NOT EXISTS idx_run_submitted ON run(submitted_at);
 CREATE INDEX IF NOT EXISTS idx_grid_signal_region_time ON grid_signal_cache(wt_region, point_time);

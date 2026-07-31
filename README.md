@@ -1,55 +1,97 @@
 # CarbonSight
 
-**Pick a lower-carbon AWS region for GPU training** before you launch—using live **marginal grid emissions** (MOER) from [WattTime](https://www.watttime.org/) and a rough power model for your job.
+**Multi-lever GPU training scheduler**: pick *where* and *when* to run so you minimize **cost + carbon + risk** under a **deadline**.
 
-This is **not** certified carbon accounting or offsets. It is an **operational estimate** to compare regions and reason about **electricity-related** CO₂ when you train in the cloud.
+Built on [SkyNomad](https://arxiv.org/pdf/2601.06520) (multi-region spot scheduling) plus a **carbon lever** from [WattTime](https://www.watttime.org/) marginal operating emissions rates (MOER).
 
-## Why this exists
+This is an **operational estimate**, not certified LCA or offsets.
 
-Cloud ML training uses electricity; grids differ by hour and region. CarbonSight helps you **see greener options** (and cost tradeoffs) and, if you use [SkyPilot](https://skypilot.readthedocs.io/), **patch your job YAML and launch** in the region you choose.
+---
 
-## Repository layout
+## Why ONE WattTime credential (central cache)
 
-| Path | Purpose |
-|------|---------|
-| [`carbonsight/`](carbonsight/) | Python package (CLI, core library, optional API) |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How the pipeline works (MOER, power model, Monte Carlo) |
-| [`CURRENT_STATE.md`](CURRENT_STATE.md) | What the code can do right now (code-derived) |
-| [`AGENTS.md`](AGENTS.md) | Contributor / AI agent guidelines |
-| [`examples/`](examples/) | Minimal SkyPilot + training stub |
-| [`LICENSE`](LICENSE) | MIT |
+Personal WattTime keys do not scale for a team CLI. CarbonSight uses a **server-side credential + forecast cache**:
 
-## Quick start
+```
+CLI / clients                     API (one WattTime login)
+───────────────                   ─────────────────────────
+CARBONSIGHT_API_URL  ──GET──►  /v1/carbon/forecast
+                               ForecastCache (TTL 15 min)
+                               WattTimeClient  ──or── synthetic fallback
+```
 
-1. **WattTime account** — Sign up for API access ([WattTime](https://www.watttime.org/)); you will use **your own** credentials (bring-your-own-key).
+| Who | Needs |
+|-----|--------|
+| **API server** | `WATTTIME_USERNAME` / `WATTTIME_PASSWORD` (optional; synthetic if absent) |
+| **CLI users** | only `CARBONSIGHT_API_URL=http://localhost:8001` |
 
-2. **Install** (from `carbonsight/`):
+Factory order in [`get_carbon_provider()`](carbonsight/packages/core/carbonsight_core/providers/carbon.py):
 
-   ```bash
-   cd carbonsight
-   pip install -e .
-   ```
+1. `CARBONSIGHT_API_URL` → `ApiCarbonProvider`
+2. `WATTTIME_*` → `WattTimeCarbonProvider`
+3. else → `SyntheticCarbonProvider` (deterministic 17 regions)
 
-3. **Configure** — Copy [`carbonsight/.env.example`](carbonsight/.env.example) to `carbonsight/.env` or export `WATTTIME_USERNAME` and `WATTTIME_PASSWORD`.
+---
 
-4. **Advise** — Rank regions for a SkyPilot-style YAML:
+## Joint ranking \(U_s\)
 
-   ```bash
-   carbonsight advise --yaml examples/skypilot/train.yaml --json
-   ```
+For each candidate region/instance:
 
-   Or point at a **Python file** (CarbonSight builds a temporary SkyPilot task):
+\[
+U_s = V \cdot \eta - C_{\mathrm{total}} - \frac{E}{\bar L}
+\]
 
-   ```bash
-   cd carbonsight
-   carbonsight train ../examples/skypilot/train_stub.py --json
-   ```
+| Symbol | Meaning | Code |
+|--------|---------|------|
+| \(\theta = (P-p)/(T-t)\) | Urgency (progress rate needed) | [`progress.py`](carbonsight/packages/core/carbonsight_core/spot/progress.py) |
+| \(V = C_{od}\cdot\theta/\tilde\theta\) | Value of finishing | [`unified_model.py`](carbonsight/packages/core/carbonsight_core/spot/unified_model.py) |
+| \(\eta\) | Instance efficiency | `ODCandidate.efficiency` |
+| \(C_{\mathrm{total}}\) | Spot $ + carbon $ (MOER × MWh × \$/t) | same |
+| \(E\) | Eviction penalty × (1 − survival) | same |
+| \(\bar L\) | Expected remaining lifetime | [`lifetime.py`](carbonsight/packages/core/carbonsight_core/spot/lifetime.py) |
 
-5. **Optional: launch** — With SkyPilot installed, `carbonsight run` or `carbonsight train script.py --launch` can patch `cloud`/`region` and call `sky launch` (see `carbonsight/README.md`).
+Rank by **\(U_s\) descending**. Greener grids raise \(U_s\) when `carbon_price_usd_per_ton` is material.
 
-## Contributing
+---
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). PRs welcome; keep domain logic in `carbonsight_core` and one ranking path for CLI + API.
+## Quick start (`uv`)
+
+```bash
+cd carbonsight
+uv sync --all-extras
+export CARBONSIGHT_API_URL=   # empty → synthetic
+uv run carbonsight schedule \
+  --yaml tests/fixtures/train_minimal.yaml \
+  --deadline-hours 45 --checkpoint-size-gb 100 --carbon-price 50 --json
+```
+
+API (synthetic without creds):
+
+```bash
+uv run uvicorn carbonsight_api.main:app --port 8001
+curl -s localhost:8001/v1/regions | head
+curl -s "localhost:8001/v1/carbon/forecast?region=CAISO_NORTH" | head
+curl -s localhost:8001/v1/recommendations | jq length   # → 17
+```
+
+---
+
+## Layout
+
+| Path | Role |
+|------|------|
+| [`carbonsight/packages/core/carbonsight_core/`](carbonsight/packages/core/carbonsight_core/) | Domain brain |
+| [`spot/`](carbonsight/packages/core/carbonsight_core/spot/) | SkyNomad availability, lifetime, progress, policy, \(U_s\) |
+| [`watttime/`](carbonsight/packages/core/carbonsight_core/watttime/) | Client + `ForecastCache` (time-weighted MOER) |
+| [`providers/`](carbonsight/packages/core/carbonsight_core/providers/) | Carbon + spot Protocols (pricing isolated) |
+| [`apps/cli`](carbonsight/apps/cli/) | `schedule`, `advise`, `backtest`, … |
+| [`apps/api`](carbonsight/apps/api/) | Central cache proxy |
+| [`apps/worker`](carbonsight/apps/worker/) | Periodic WattTime → cache/DB |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Deep dive + code pointers |
+
+**Do not edit** base price dicts in [`estimator/pricing.py`](carbonsight/packages/core/carbonsight_core/estimator/pricing.py). Spot prices go through [`StaticSpotPriceProvider`](carbonsight/packages/core/carbonsight_core/providers/spot.py) (read-only snapshot).
+
+---
 
 ## License
 

@@ -25,6 +25,27 @@ class JobSpec(BaseModel):
             "When set, GPU draw uses this value instead of sampling utilization."
         ),
     )
+    # SkyNomad / carbon-aware scheduling extensions
+    deadline_hours: float = Field(
+        48.0,
+        gt=0,
+        description="Wall-clock deadline from now (hours) for multi-lever scheduling.",
+    )
+    checkpoint_size_gb: float = Field(
+        0.0,
+        ge=0,
+        description="Checkpoint size used to estimate migration cost/time.",
+    )
+    cold_start_minutes: float = Field(
+        5.0,
+        ge=0,
+        description="Cold-start overhead when launching or migrating (minutes).",
+    )
+    carbon_price_usd_per_ton: float = Field(
+        50.0,
+        ge=0,
+        description="Social cost of carbon ($/metric ton) for joint U ranking.",
+    )
 
     @field_validator("gpu_utilization")
     @classmethod
@@ -48,6 +69,12 @@ class EstimateResult(BaseModel):
     expected_co2_kg_p90: float = 0.0
     mapping_confidence: float = Field(..., ge=0, le=1)
     notes: list[str] = Field(default_factory=list)
+    # Optional joint-ranking extras (schedule / recommendations synthetic path)
+    utility_score: float | None = None
+    moer_lb_per_mwh: float | None = None
+    spot_price_usd_per_gpu_hr: float | None = None
+    survival: float | None = None
+    lbar_hours: float | None = None
 
 
 class ActualRunResult(BaseModel):

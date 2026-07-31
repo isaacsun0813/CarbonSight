@@ -1,4 +1,4 @@
-"""CarbonSight core: models, estimator, mapping, config."""
+"""CarbonSight core: models, estimator, mapping, spot scheduler, carbon providers."""
 
 from carbonsight_core.estimator import JobCarbonEstimator
 from carbonsight_core.models import EstimateResult, JobSpec

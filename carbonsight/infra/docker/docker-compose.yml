@@ -1,5 +1,6 @@
-# CarbonSight API + Postgres (MVP)
+# CarbonSight API + Postgres + WattTime cache worker
 # Run: docker-compose -f carbonsight/infra/docker/docker-compose.yml up -d
+# API default host port 8001 (matches CARBONSIGHT_API_URL=http://localhost:8001)
 
 services:
   db:
@@ -19,13 +20,32 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.api
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       WATTTIME_USERNAME: ${WATTTIME_USERNAME:-}
       WATTTIME_PASSWORD: ${WATTTIME_PASSWORD:-}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-900}
+      CARBON_PRICE_USD_PER_TON: ${CARBON_PRICE_USD_PER_TON:-50}
       DATABASE_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
     depends_on:
       - db
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    command: ["python", "-m", "worker.fetch_watttime"]
+    working_dir: /app/apps
+    environment:
+      WATTTIME_USERNAME: ${WATTTIME_USERNAME:-}
+      WATTTIME_PASSWORD: ${WATTTIME_PASSWORD:-}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-900}
+      WORKER_INTERVAL_SECONDS: ${WORKER_INTERVAL_SECONDS:-900}
+      DATABASE_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
+      PYTHONPATH: /app/packages/core:/app/apps/api:/app/apps
+    depends_on:
+      - db
+      - api
 
 volumes:
   pgdata:

@@ -4,6 +4,7 @@ import json
 
 import typer
 from carbonsight_core.backtest.runner import run_backtest
+from carbonsight_core.backtest.spot_runner import run_spot_backtest
 
 backtest_group = typer.Typer(help="Backtesting harness")
 
@@ -14,8 +15,34 @@ def run_backtest_cmd(
     n: int = typer.Option(1000, "--n", help="Number of synthetic workloads"),
     seed: int = typer.Option(42, "--seed", help="Random seed for reproducibility"),
     json_out: bool = typer.Option(False, "--json", help="Output metrics as JSON"),
+    spot: bool = typer.Option(False, "--spot", help="Use spot-aware runner (evictions + carbon)"),
+    carbon_price: float = typer.Option(50.0, "--carbon-price", help="USD/ton for spot backtest"),
 ) -> None:
     """Generate workloads and output savings, regret, rank accuracy."""
+    if spot:
+        result = run_spot_backtest(
+            n=n, days=days, seed=seed, carbon_price_usd_per_ton=carbon_price
+        )
+        payload = {
+            "n_workloads": result.n_workloads,
+            "days": result.days,
+            "carbon_savings_pct_mean": result.carbon_savings_pct_mean,
+            "cost_savings_pct_mean": result.cost_savings_pct_mean,
+            "eviction_rate": result.eviction_rate,
+            "joint_utility_mean": result.joint_utility_mean,
+            "regret_mean": result.regret_mean,
+        }
+        if json_out:
+            typer.echo(json.dumps(payload, indent=2))
+        else:
+            typer.echo(f"Spot backtest: n={result.n_workloads}, days={result.days}")
+            typer.echo(f"  Carbon savings (mean %): {result.carbon_savings_pct_mean:.1f}")
+            typer.echo(f"  Cost savings (mean %):   {result.cost_savings_pct_mean:.1f}")
+            typer.echo(f"  Eviction rate:           {result.eviction_rate:.3f}")
+            typer.echo(f"  Joint U mean:            {result.joint_utility_mean:.3f}")
+            typer.echo(f"  Regret mean:             {result.regret_mean:.3f}")
+        return
+
     result = run_backtest(n=n, days=days, seed=seed)
     if json_out:
         typer.echo(json.dumps({
