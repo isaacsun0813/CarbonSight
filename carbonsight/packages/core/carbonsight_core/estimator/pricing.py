@@ -1,8 +1,9 @@
 """
 AWS on-demand GPU instance pricing (per GPU per hour, USD).
 
-Static tables are the default. When live AWS pricing is enabled, spot costs use
-EC2 describe_spot_price_history with static fallback on errors.
+Static tables are the default. When live AWS pricing is enabled:
+- on-demand: Pricing API get_products
+- spot: EC2 describe_spot_price_history
 
 Sources (static):
   - https://aws.amazon.com/ec2/pricing/on-demand/ (sampled Feb 2026)
@@ -12,6 +13,7 @@ Sources (static):
 from dataclasses import dataclass, field
 
 from carbonsight_core.config import Config
+from carbonsight_core.estimator.aws_ondemand_pricing import OnDemandPriceProvider
 from carbonsight_core.estimator.aws_spot_pricing import SpotPriceProvider
 
 # Base price per GPU per hour (us-east-1 on-demand)
@@ -60,6 +62,7 @@ SPOT_PRICE_FRACTION = 0.35
 
 _live_aws_pricing: bool = False
 _spot_provider: SpotPriceProvider | None = None
+_ondemand_provider: OnDemandPriceProvider | None = None
 
 
 @dataclass
@@ -75,27 +78,43 @@ def configure_pricing(
     *,
     live_aws_pricing: bool | None = None,
 ) -> None:
-    """Set module-level live pricing flag and spot provider (call from CLI before ranking)."""
-    global _live_aws_pricing, _spot_provider
+    """Set module-level live pricing flag and AWS providers (call from CLI before ranking)."""
+    global _live_aws_pricing, _spot_provider, _ondemand_provider
     cfg = config or Config.from_env()
     if live_aws_pricing is not None:
         _live_aws_pricing = live_aws_pricing
     else:
         _live_aws_pricing = cfg.live_aws_pricing
-    _spot_provider = SpotPriceProvider(cfg) if _live_aws_pricing else None
+    if _live_aws_pricing:
+        _spot_provider = SpotPriceProvider(cfg)
+        _ondemand_provider = OnDemandPriceProvider(cfg)
+    else:
+        _spot_provider = None
+        _ondemand_provider = None
 
 
 def reset_pricing_state() -> None:
     """Reset module state (for tests)."""
-    global _live_aws_pricing, _spot_provider
+    global _live_aws_pricing, _spot_provider, _ondemand_provider
     _live_aws_pricing = False
     _spot_provider = None
+    _ondemand_provider = None
 
 
 def _static_on_demand_per_gpu_hour(gpu_type: str, cloud_region: str) -> float:
     base = _GPU_BASE_PRICE_USD_PER_HR.get(gpu_type.upper(), _DEFAULT_GPU_PRICE)
     multiplier = _REGION_MULTIPLIER.get(cloud_region, _DEFAULT_MULTIPLIER)
     return base * multiplier
+
+
+def _on_demand_per_gpu_hour(gpu_type: str, cloud_region: str) -> tuple[float, list[str]]:
+    """Resolve on-demand $/GPU/hr with live API when enabled, else static tables."""
+    if _live_aws_pricing and _ondemand_provider is not None:
+        live = _ondemand_provider.ondemand_price_per_gpu_hour(gpu_type, cloud_region)
+        if live is not None:
+            return live, ["cost:live_ondemand"]
+        return _static_on_demand_per_gpu_hour(gpu_type, cloud_region), ["cost:static_ondemand_fallback"]
+    return _static_on_demand_per_gpu_hour(gpu_type, cloud_region), []
 
 
 def estimate_job_cost(
@@ -108,8 +127,8 @@ def estimate_job_cost(
 ) -> CostEstimate:
     """Return estimated job cost with provenance notes."""
     if not use_spot:
-        usd = _static_on_demand_per_gpu_hour(gpu_type, cloud_region) * gpu_count * duration_hours
-        return CostEstimate(usd=usd)
+        per_gpu_hr, notes = _on_demand_per_gpu_hour(gpu_type, cloud_region)
+        return CostEstimate(usd=per_gpu_hr * gpu_count * duration_hours, notes=list(notes))
 
     if _live_aws_pricing and _spot_provider is not None:
         spot_per_gpu_hr = _spot_provider.spot_price_per_gpu_hour(gpu_type, cloud_region)
@@ -134,7 +153,8 @@ def _static_spot_job_cost(
     duration_hours: float,
     cloud_region: str,
 ) -> float:
-    on_demand = _static_on_demand_per_gpu_hour(gpu_type, cloud_region) * gpu_count * duration_hours
+    per_gpu_hr, _ = _on_demand_per_gpu_hour(gpu_type, cloud_region)
+    on_demand = per_gpu_hr * gpu_count * duration_hours
     return on_demand * SPOT_PRICE_FRACTION
 
 
