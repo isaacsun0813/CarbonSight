@@ -1,6 +1,8 @@
 # CarbonSight API + Postgres + WattTime cache worker
 # Run: docker-compose -f carbonsight/infra/docker/docker-compose.yml up -d
 # API default host port 8001 (matches CARBONSIGHT_API_URL=http://localhost:8001)
+# The worker holds the one WattTime credential and refills grid_signal_cache;
+# the API reads that table when DATABASE_URL is set, else its in-memory cache.
 
 services:
   db:
@@ -13,7 +15,13 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ../../infra/schemas.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ../schemas.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carbonsight -d carbonsight"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
 
   api:
     build:
@@ -27,8 +35,11 @@ services:
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-900}
       CARBON_PRICE_USD_PER_TON: ${CARBON_PRICE_USD_PER_TON:-50}
       DATABASE_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+    restart: unless-stopped
 
   worker:
     build:
@@ -41,11 +52,14 @@ services:
       WATTTIME_PASSWORD: ${WATTTIME_PASSWORD:-}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-900}
       WORKER_INTERVAL_SECONDS: ${WORKER_INTERVAL_SECONDS:-900}
+      GRID_SIGNAL_RETENTION_HOURS: ${GRID_SIGNAL_RETENTION_HOURS:-168}
       DATABASE_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
       PYTHONPATH: /app/packages/core:/app/apps/api:/app/apps
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      - db
-      - api
+      db:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:
