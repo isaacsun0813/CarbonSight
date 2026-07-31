@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from carbonsight_core.mapping.registry import Registry
@@ -46,7 +47,7 @@ def _load_registry(request: Request) -> Registry | None:
     return reg
 
 
-def _run_recommendations(req: RecommendationRequest, request: Request) -> list[dict]:
+def _run_recommendations(req: RecommendationRequest, request: Request) -> dict:
     job = JobSpec(
         gpu_type=req.gpu_type,
         gpu_count=req.gpu_count,
@@ -62,19 +63,45 @@ def _run_recommendations(req: RecommendationRequest, request: Request) -> list[d
         progress_hours_done=req.progress_hours_done,
         current_region=req.current_region,
     )
-    result = schedule_job(
-        job, registry=_load_registry(request), elapsed_hours=req.elapsed_hours
-    )
-    return [e.model_dump(mode="json") for e in result.estimates]
+    result = schedule_job(job, registry=_load_registry(request), elapsed_hours=req.elapsed_hours)
+
+    decision: dict | None = None
+    if result.decision is not None:
+        decision = {
+            "kind": result.decision.kind,
+            "rule": result.decision.rule,
+            "region": result.decision.region,
+            "mode": result.decision.mode,
+            "reason": result.decision.reason,
+            "estimated_total_cost_usd": result.decision.estimated_total_cost_usd,
+        }
+
+    # V is infinite once the deadline has passed, which is not representable in
+    # JSON — send null and let ``action``/``decision`` carry the situation.
+    value_v = result.value_v if math.isfinite(result.value_v) else None
+
+    return {
+        "action": result.action,
+        "decision": decision,
+        "value_v": value_v,
+        "deadline_passed": value_v is None,
+        "regions": [e.model_dump(mode="json") for e in result.estimates],
+    }
 
 
 @router.post("/recommendations")
-def post_recommendations(req: RecommendationRequest, request: Request) -> list[dict]:
-    """Rank the registry's regions by joint U (cost + carbon + lifetime + deadline)."""
+def post_recommendations(req: RecommendationRequest, request: Request) -> dict:
+    """Rank the registry's regions by joint U, with the policy's decision attached.
+
+    ``action`` is ``rank`` | ``thrifty`` | ``safety_net`` | ``empty``. When the
+    job is out of slack the ranking is still returned for context, but
+    ``decision`` is what the caller should act on — a bare list of spot rows
+    would tell a job past its deadline to keep gambling on spot.
+    """
     return _run_recommendations(req, request)
 
 
 @router.get("/recommendations")
-def get_recommendations(request: Request) -> list[dict]:
+def get_recommendations(request: Request) -> dict:
     """GET convenience: the same ranking for a default 1h A100 job."""
     return _run_recommendations(RecommendationRequest(), request)

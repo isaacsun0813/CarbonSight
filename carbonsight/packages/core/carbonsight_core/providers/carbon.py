@@ -91,15 +91,23 @@ def _utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
-def facility_mwh_per_hr(job: JobSpec, *, seed: int = 0) -> float:
+def facility_mwh_per_hr(job: JobSpec, *, samples: int = 64, seed: int = 0) -> float:
     """Mean facility MWh drawn per wall-clock hour: P_IT * PUE / 1e6.
 
-    Uses the same power model as the estimator, with a fixed seed so rankings are
-    reproducible. ``job.gpu_utilization`` (``--gpu-util`` / ``--nvidia-smi``) pins
-    the GPU term instead of sampling it.
+    Averages ``samples`` draws from the same power model the estimator uses, on
+    a fixed seed so rankings stay reproducible. A single draw is a sample of the
+    utilisation and PUE distributions, not their mean — the previous one-shot
+    version happened to sit near the 72nd percentile of PUE.
+
+    ``job.gpu_utilization`` (``--gpu-util`` / ``--nvidia-smi``) pins the GPU term
+    instead of sampling it, in which case only PUE and CPU load still vary.
     """
-    params = sample_power_params(job, random.Random(seed))
-    return params.p_it_w * params.pue / 1_000_000.0
+    rng = random.Random(seed)
+    total = 0.0
+    for _ in range(samples):
+        params = sample_power_params(job, rng)
+        total += params.p_it_w * params.pue
+    return total / samples / 1_000_000.0
 
 
 class _ForecastBackedProvider:
@@ -224,13 +232,24 @@ class ApiCarbonProvider(_ForecastBackedProvider):
         self._timeout = timeout
         self._cache = cache or ForecastCache(ttl_seconds=cfg.cache_ttl_seconds)
         self._fallback = SyntheticCarbonProvider()
+        # Where the last forecast for each region actually came from, as reported
+        # by the server ("db"/"live"/"cache"/"synthetic") or "local_synthetic"
+        # when we never reached it. Without this a caller cannot tell a real
+        # WattTime reading from a made-up curve.
+        self.sources: dict[str, str] = {}
+
+    def last_source(self, region: str) -> str | None:
+        """Provenance of the most recent forecast for ``region``."""
+        return self.sources.get(region)
 
     def get_forecast(self, region: str, *, horizon_hours: int = 24) -> list[dict[str, Any]]:
         cached = self._cache.get(region)
         if cached is not None:
             return cached
         if not self._base:
+            self.sources[region] = "local_synthetic"
             return self._fallback.get_forecast(region, horizon_hours=horizon_hours)
+        source = "local_synthetic"
         try:
             with httpx.Client(timeout=self._timeout) as client:
                 r = client.get(
@@ -241,14 +260,18 @@ class ApiCarbonProvider(_ForecastBackedProvider):
                 body = r.json()
             if isinstance(body, dict):
                 pts = list(body.get("data") or body.get("points") or [])
+                source = str(body.get("source") or "api")
             elif isinstance(body, list):
                 pts = body
+                source = "api"
             else:
                 pts = []
         except Exception:
             pts = []
         if not pts:
+            self.sources[region] = "local_synthetic"
             return self._fallback.get_forecast(region, horizon_hours=horizon_hours)
+        self.sources[region] = source
         self._cache.set(region, pts)
         return pts
 

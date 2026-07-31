@@ -330,19 +330,27 @@ def candidates_to_estimates(result: ScheduleResult, job: JobSpec) -> list[Estima
     lifetime — this is the row the ``advise`` and ``/v1/recommendations`` contracts
     promise.
     """
+    # Past the deadline V is infinite, and so is every utility. Infinity is not
+    # JSON, so it would reach an API client as null with "U_s=inf" left in the
+    # notes; report it as unavailable instead and let ``action`` carry the news.
     best_utility: dict[str, float] = {}
     for cand, u in result.ranked:
-        if cand.is_idle:
+        if cand.is_idle or not math.isfinite(u):
             continue
         prev = best_utility.get(cand.region)
         if prev is None or u > prev:
             best_utility[cand.region] = u
+    deadline_passed = not math.isfinite(result.value_v)
 
     out: list[EstimateResult] = []
     for region, inp in result.inputs.items():
         kg = inp.carbon_kg_per_hr * job.duration_hours
         cost = inp.spot_price_per_hr * job.duration_hours
         utility_score = best_utility.get(region)
+        if utility_score is None:
+            u_note = "U_s=n/a (deadline passed)" if deadline_passed else "U_s=n/a"
+        else:
+            u_note = f"U_s={utility_score:.4f}"
         out.append(
             EstimateResult(
                 cloud=inp.cloud,
@@ -356,7 +364,7 @@ def candidates_to_estimates(result: ScheduleResult, job: JobSpec) -> list[Estima
                 notes=[
                     f"Lbar={inp.mean_lifetime_hr:.2f}h",
                     f"eta={effectiveness(inp.mean_lifetime_hr, result.cold_start_hr):.3f}",
-                    f"U_s={utility_score:.4f}" if utility_score is not None else "U_s=n/a",
+                    u_note,
                 ],
                 utility_score=utility_score,
                 moer_lb_per_mwh=inp.moer_lb_per_mwh,

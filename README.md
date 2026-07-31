@@ -45,7 +45,7 @@ $$
 |--------|---------|------|
 | $\theta = (P-p)/(T-t)$ | Urgency (progress rate needed) | [`progress.py`](carbonsight/packages/core/carbonsight_core/spot/progress.py) |
 | $V = C_{od}\cdot\theta/\tilde\theta$ | Value of an hour of progress | [`progress.py`](carbonsight/packages/core/carbonsight_core/spot/progress.py) |
-| $\tilde\theta = p/t$ | Achieved rate (falls back to $P/T$ at $t=0$) | same |
+| $\tilde\theta = p/t$ | Achieved rate (only $t=0$ falls back to $P/T$) | same |
 | $\eta = (\bar L - d)/\bar L$ | Effectiveness: share of a lifetime spent working | [`unified_model.py`](carbonsight/packages/core/carbonsight_core/spot/unified_model.py) |
 | $C_{\mathrm{total}}$ | Spot \$/hr + carbon \$/hr (MOER × MWh × \$/t) | same |
 | $E = e \cdot \mathrm{ckpt}_{GB}$ | Migration (egress) cost, amortized over $\bar L$ | same |
@@ -72,7 +72,7 @@ API (synthetic without creds):
 uv run uvicorn carbonsight_api.main:app --port 8001
 curl -s localhost:8001/v1/regions | head
 curl -s "localhost:8001/v1/carbon/forecast?region=CAISO_NORTH" | head
-curl -s localhost:8001/v1/recommendations | jq length   # → 17
+curl -s localhost:8001/v1/recommendations | jq '.action, (.regions | length)'   # → "rank", 21
 ```
 
 ---

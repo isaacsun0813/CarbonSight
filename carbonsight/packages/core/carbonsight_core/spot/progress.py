@@ -87,11 +87,14 @@ class ProgressState:
         if theta <= 0:
             return 0.0
         tilde = self.avg_progress
-        if tilde <= 1e-12:
-            tilde = self.target_rate
-        if tilde <= 1e-12:
-            return c_od_per_hr
-        return c_od_per_hr * theta / tilde
+        if tilde > 1e-12:
+            return c_od_per_hr * theta / tilde
+        # theta_tilde == 0. At t=0 that can only mean a degenerate P or T, since
+        # avg_progress returns P/T there — anchor at C_od. At t>0 it means the
+        # job has genuinely done nothing in the time it has had, which is maximal
+        # pressure, not "on plan": falling back to P/T here would let a stalled
+        # job bid the same as a healthy one.
+        return c_od_per_hr if self.t <= 1e-12 else math.inf
 
     def is_thrifty(self) -> bool:
         """p >= P: nothing left to do."""
