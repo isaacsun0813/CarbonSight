@@ -280,3 +280,87 @@ class TestUtilityTerms:
 
     def test_effectiveness_is_zero_when_cold_start_eats_the_lifetime(self):
         assert effectiveness(0.4, 0.5) == 0.0
+
+
+# --- documentation pin ------------------------------------------------------
+
+
+class TestArchitectureWorkedExample:
+    """Pins the ARCHITECTURE.md worked example so the docs cannot drift silently.
+
+    The table there was hand-constructed once and went stale invisibly: it
+    claimed L-bar 12.0h for us-east-1 (actual 2.13h) and "identical carbon" for
+    two regions that differ 2x. If any of these change, update both.
+    """
+
+    EXPECTED = [
+        # rank, region, Lbar, eta, $/hr, kg/hr, E/Lbar, U
+        (1, "ap-northeast-1", 14.70, 0.980, 1.72, 0.289, 0.136, 2.148),
+        (2, "ap-south-1", 8.65, 0.965, 1.58, 0.090, 0.231, 2.148),
+        (3, "eu-west-1", 9.66, 0.969, 1.65, 0.086, 0.207, 2.115),
+        (4, "us-east-1", 2.13, 0.859, 1.43, 0.084, 0.000, 2.086),
+        (8, "us-east-2", 3.65, 0.918, 1.43, 0.164, 0.548, 1.776),
+    ]
+
+    @staticmethod
+    def _rows():
+        from carbonsight_core.spot.scheduler_service import ranked_as_json
+
+        job = JobSpec(
+            gpu_type="A100",
+            gpu_count=1,
+            duration_hours=1.0,
+            deadline_hours=45.0,
+            checkpoint_size_gb=100.0,
+            cold_start_minutes=6.0,
+            current_region="us-east-1",
+        )
+        result = schedule_job(job, now=datetime(2026, 7, 31, 12, 0, tzinfo=UTC))
+        return result, ranked_as_json(result, job)
+
+    def test_shape_and_anchor(self):
+        result, rows = self._rows()
+        assert len(rows) == 43  # 21 regions x 2 modes + idle
+        assert result.value_v == pytest.approx(4.104, abs=5e-4)
+        best_od = next(u for c, u in result.ranked if c.is_od)
+        assert best_od == pytest.approx(0.0, abs=1e-9)
+
+    @pytest.mark.parametrize("row", EXPECTED, ids=lambda r: f"rank{r[0]}-{r[1]}")
+    def test_documented_row(self, row):
+        rank, region, lbar, eta, price, kg, amort, u = row
+        _result, rows = self._rows()
+        actual = rows[rank - 1]
+        assert (actual["cloud_region"], actual["mode"]) == (region, "spot")
+        assert actual["mean_lifetime_hr"] == pytest.approx(lbar, abs=5e-3)
+        assert actual["effectiveness_eta"] == pytest.approx(eta, abs=5e-4)
+        assert actual["price_per_hr_usd"] == pytest.approx(price, abs=5e-3)
+        assert actual["carbon_kg_per_hr"] == pytest.approx(kg, abs=5e-4)
+        assert actual["amortized_migration_per_hr"] == pytest.approx(amort, abs=5e-4)
+        assert actual["utility_u"] == pytest.approx(u, abs=5e-4)
+
+    def test_incumbent_pays_no_egress_and_that_is_the_whole_story(self):
+        """The documented decomposition: +0.242 value, -0.548 egress, net -0.310."""
+        result, rows = self._rows()
+        by_region = {r["cloud_region"]: r for r in rows if r["mode"] == "spot"}
+        one, two = by_region["us-east-1"], by_region["us-east-2"]
+        assert one["price_per_hr_usd"] == pytest.approx(two["price_per_hr_usd"])
+        value_gain = result.value_v * (two["effectiveness_eta"] - one["effectiveness_eta"])
+        assert value_gain == pytest.approx(0.242, abs=5e-3)
+        assert two["amortized_migration_per_hr"] == pytest.approx(0.548, abs=5e-3)
+        assert two["utility_u"] - one["utility_u"] == pytest.approx(-0.310, abs=5e-3)
+
+    def test_carbon_price_reorders_the_table_by_200_per_ton(self):
+        """The documented threshold: ap-south-1 leads outright at $200/t."""
+        job = JobSpec(
+            gpu_type="A100",
+            gpu_count=1,
+            duration_hours=1.0,
+            deadline_hours=45.0,
+            checkpoint_size_gb=100.0,
+            cold_start_minutes=6.0,
+            current_region="us-east-1",
+            carbon_price_usd_per_ton=200.0,
+        )
+        result = schedule_job(job, now=datetime(2026, 7, 31, 12, 0, tzinfo=UTC))
+        top_spot = [c.region for c, _u in result.ranked if c.is_spot][:1]
+        assert top_spot == ["ap-south-1"]

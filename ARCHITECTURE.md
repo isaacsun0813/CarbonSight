@@ -65,6 +65,76 @@ JobSpec ── what to run · when it's due · how far along · what you'll pay 
   SkyNomadPolicy ──► launch | stay | idle | terminate
 ```
 
+### 1.3 What "rank by $U_s$" means
+
+$U_s$ is a **single dollars-per-hour score** answering one question per candidate:
+*is running here for the next hour worth what it costs?* Every term is \$/hr, so they subtract cleanly.
+
+$$
+U_s = \underbrace{V \cdot \eta}_{\text{value earned}} - \underbrace{C_{\mathrm{total}}}_{\text{price + carbon}} - \underbrace{E / \bar L}_{\text{move cost, spread out}}
+$$
+
+| Term | Reads as | Detail |
+|------|----------|--------|
+| $V$ | what an hour of progress is worth | $C_{od}\cdot\theta/\tilde\theta$ — anchored so that **on schedule → $V$ = cheapest on-demand rate**. Fall behind and $V$ climbs, so pricier/riskier options start winning. |
+| $\eta$ | fraction of the instance actually spent working | $(\bar L - d)/\bar L$. A 3-hour spot slot with a 20-min restore only gives you ~89% useful time. On-demand has $\bar L = \infty$, so $\eta = 1$. |
+| $C_{\mathrm{total}}$ | the real hourly bill | spot \$/hr **+** carbon priced in: `kg/hr ÷ 1000 × carbon_price × carbon_weight`. |
+| $E / \bar L$ | migration, amortized | $E$ = egress \$/GB × checkpoint GB, paid once. Divided by $\bar L$ because a slot you'll hold 12h absorbs it far better than one you'll hold 3h. Zero for `current_region`. |
+
+**Highest $U_s$ wins.** Idle scores exactly `0`, so a negative $U_s$ everywhere means *nothing is worth
+paying for right now* and the scheduler waits.
+
+Two rules short-circuit the ranking before it runs:
+
+- **Thrifty** — `p >= P`: the job is done. Release the instance.
+- **Safety net** — `T - t < P - p + 2d`: too little slack left to risk another spot restart.
+  Skip ranking and take the cheapest on-demand region that can still finish in time.
+
+**Worked example** — real output, not hand-constructed. Reproduce with:
+
+```python
+from datetime import UTC, datetime
+from carbonsight_core.models import JobSpec
+from carbonsight_core.spot.scheduler_service import ranked_as_json, schedule_job
+
+job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0, deadline_hours=45.0,
+              checkpoint_size_gb=100.0, cold_start_minutes=6.0, current_region="us-east-1")
+res = schedule_job(job, now=datetime(2026, 7, 31, 12, 0, tzinfo=UTC))
+```
+
+(`carbonsight schedule --deadline-hours 45 --checkpoint-size-gb 100 --current-region us-east-1
+--json` is the same thing at the current wall clock; `now` is pinned here only so the table is
+stable.) No credentials, so synthetic MOER and static prices. 43 rows — 21 regions ×
+{spot, on-demand} plus idle. $V = 4.104$: on schedule at $t=0$, so $V$ lands exactly on the
+cheapest on-demand total. Top four, plus the `us-east-*` pair:
+
+| Rank | Region | Mode | $\bar L$ | $\eta$ | \$/hr | kg/hr | $E/\bar L$ | $U_s$ |
+|---|---|---|---|---|---|---|---|---|
+| 1 | ap-northeast-1 | spot | 14.70h | 0.980 | 1.72 | 0.289 | \$0.136 | **2.148** |
+| 2 | ap-south-1 | spot | 8.65h | 0.965 | 1.58 | 0.090 | \$0.231 | 2.148 |
+| 3 | eu-west-1 | spot | 9.66h | 0.969 | 1.65 | 0.086 | \$0.207 | 2.115 |
+| 4 | us-east-1 | spot | 2.13h | 0.859 | 1.43 | 0.084 | \$0.000 | 2.086 |
+| 8 | us-east-2 | spot | 3.65h | 0.918 | 1.43 | 0.164 | \$0.548 | 1.776 |
+
+Three things this shows that a carbon-only ranking cannot:
+
+- **Egress outweighs a real effectiveness advantage.** `us-east-1` and `us-east-2` have
+  *identical* \$1.435/hr spot. `us-east-2` actually earns **more** value per hour — its longer
+  3.65h lifetime lifts $V\eta$ by \$0.242 — but the \$0.548/hr amortized egress on a 100 GB
+  checkpoint it would have to move swamps that, for a net \$0.310 deficit. Incumbency is a
+  priced term, not a tiebreak.
+- **Lifetime beats headline price.** `us-east-1` is the cheapest region on the board and still
+  loses to `ap-northeast-1` at \$1.72/hr: a 2.13h expected lifetime against a 0.28h cold start
+  throws away 14% of every slot ($\eta = 0.859$), where `ap-northeast-1` throws away 2%.
+- **Carbon is the weakest lever at \$50/t, but it is live.** Ranks 1 and 2 sit within 0.0004 of
+  each other even though `ap-south-1` is 3.2× cleaner (0.090 vs 0.289 kg/hr) — worth only
+  \$0.010/hr here, so which of the two leads flips with the time of day. Raise
+  `--carbon-price` to \$200/t and `ap-south-1` takes first outright; by \$500/t the top three
+  are `ap-south-1`, `eu-west-1`, `us-east-1` and `ap-northeast-1` has dropped out.
+
+The best on-demand row scores exactly `0.000`, tying with idle. That is the $V$ anchoring
+working as designed: for a job on schedule, paying on-demand rates is precisely break-even.
+
 ### 1.4 Decide → execute → supervise → report
 
 The ranker is one stage of a closed loop, not the product. The loop is:
@@ -91,45 +161,6 @@ no current region over time, no progress $p$, no migration count. A live status 
 those columns plus a supervisor writing to them on every probe — at which point
 `carbonsight status` can show: where the job is now, hours in vs. deadline, $p/P$, how many
 times it moved, cumulative \$ and kg, and what the next probe will consider.
-
----
-
-### 1.3 What "rank by $U_s$" means
-
-$U_s$ is a **single dollars-per-hour score** answering one question per candidate:
-*is running here for the next hour worth what it costs?* Every term is \$/hr, so they subtract cleanly.
-
-$$
-U_s = \underbrace{V \cdot \eta}_{\text{value earned}} - \underbrace{C_{\mathrm{total}}}_{\text{price + carbon}} - \underbrace{E / \bar L}_{\text{move cost, spread out}}
-$$
-
-| Term | Reads as | Detail |
-|------|----------|--------|
-| $V$ | what an hour of progress is worth | $C_{od}\cdot\theta/\tilde\theta$ — anchored so that **on schedule → $V$ = cheapest on-demand rate**. Fall behind and $V$ climbs, so pricier/riskier options start winning. |
-| $\eta$ | fraction of the instance actually spent working | $(\bar L - d)/\bar L$. A 3-hour spot slot with a 20-min restore only gives you ~89% useful time. On-demand has $\bar L = \infty$, so $\eta = 1$. |
-| $C_{\mathrm{total}}$ | the real hourly bill | spot \$/hr **+** carbon priced in: `kg/hr ÷ 1000 × carbon_price × carbon_weight`. |
-| $E / \bar L$ | migration, amortized | $E$ = egress \$/GB × checkpoint GB, paid once. Divided by $\bar L$ because a slot you'll hold 12h absorbs it far better than one you'll hold 3h. Zero for `current_region`. |
-
-**Highest $U_s$ wins.** Idle scores exactly `0`, so a negative $U_s$ everywhere means *nothing is worth
-paying for right now* and the scheduler waits.
-
-Two rules short-circuit the ranking before it runs:
-
-- **Thrifty** — `p >= P`: the job is done. Release the instance.
-- **Safety net** — `T - t < P - p + 2d`: too little slack left to risk another spot restart.
-  Skip ranking and take the cheapest on-demand region that can still finish in time.
-
-**Worked example** — `schedule --deadline-hours 45 --checkpoint-size-gb 100`, no credentials,
-already running in `us-east-1`:
-
-| Region | Mode | $\bar L$ | $\eta$ | \$/hr | kg/hr | $E/\bar L$ | $U_s$ |
-|---|---|---|---|---|---|---|---|
-| us-east-1 | spot | 12.0h | 0.975 | 1.43 | 0.144 | \$0.00 | **2.56** |
-| us-east-2 | spot | 3.5h | 0.914 | 1.43 | 0.144 | \$0.57 | 1.74 |
-
-Identical price, identical carbon. `us-east-1` wins purely because spot survives ~3.5× longer
-there *and* the checkpoint is already sitting in it — which is exactly the trade the older
-carbon-only ranking could not see.
 
 ---
 
