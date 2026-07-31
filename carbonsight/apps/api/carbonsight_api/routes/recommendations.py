@@ -1,10 +1,9 @@
-"""POST/GET /v1/recommendations — joint U rank with synthetic 17-row fallback."""
+"""POST/GET /v1/recommendations — joint U rank over the registry's real regions."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from carbonsight_core.config import Config
 from carbonsight_core.mapping.registry import Registry
 from carbonsight_core.models import JobSpec
 from carbonsight_core.spot.scheduler_service import schedule_job
@@ -32,6 +31,10 @@ class RecommendationRequest(BaseModel):
     checkpoint_size_gb: float = 0.0
     cold_start_minutes: float = 5.0
     carbon_price_usd_per_ton: float = Field(50.0, description="Social cost of carbon for joint U.")
+    carbon_weight: float = Field(1.0, description="Weight on the carbon lever vs dollars.")
+    progress_hours_done: float = Field(0.0, description="Compute-hours already done (p).")
+    elapsed_hours: float = Field(0.0, description="Wall-clock hours since the job started (t).")
+    current_region: str = Field("", description="Region holding the checkpoint (r0).")
 
 
 def _load_registry(request: Request) -> Registry | None:
@@ -55,39 +58,23 @@ def _run_recommendations(req: RecommendationRequest, request: Request) -> list[d
         checkpoint_size_gb=req.checkpoint_size_gb,
         cold_start_minutes=req.cold_start_minutes,
         carbon_price_usd_per_ton=req.carbon_price_usd_per_ton,
+        carbon_weight=req.carbon_weight,
+        progress_hours_done=req.progress_hours_done,
+        current_region=req.current_region,
     )
-    reg = _load_registry(request)
-    result = schedule_job(job, registry=reg, config=Config.from_env())
-    rows = [e.model_dump(mode="json") for e in result.estimates]
-    # Guarantee synthetic fallback never returns []
-    if not rows:
-        # Absolute fallback: 17 empty-ish synthetic rows
-        from carbonsight_core.providers.carbon import DEFAULT_CARBON_REGIONS
-
-        for i, wt in enumerate(DEFAULT_CARBON_REGIONS):
-            rows.append(
-                {
-                    "cloud": "aws",
-                    "cloud_region": f"synthetic-{i}",
-                    "watttime_regions": [[wt, 1.0]],
-                    "expected_cost_usd": 1.0,
-                    "expected_co2_kg_mean": float(i + 1),
-                    "expected_co2_kg_p10": float(i + 1) * 0.8,
-                    "expected_co2_kg_p90": float(i + 1) * 1.2,
-                    "mapping_confidence": 0.5,
-                    "notes": ["synthetic_fallback"],
-                }
-            )
-    return rows
+    result = schedule_job(
+        job, registry=_load_registry(request), elapsed_hours=req.elapsed_hours
+    )
+    return [e.model_dump(mode="json") for e in result.estimates]
 
 
 @router.post("/recommendations")
 def post_recommendations(req: RecommendationRequest, request: Request) -> list[dict]:
-    """Rank regions by joint U_s (cost + carbon + availability); always returns rows."""
+    """Rank the registry's regions by joint U (cost + carbon + lifetime + deadline)."""
     return _run_recommendations(req, request)
 
 
 @router.get("/recommendations")
 def get_recommendations(request: Request) -> list[dict]:
-    """GET convenience: default job, 17 synthetic-capable rows."""
+    """GET convenience: the same ranking for a default 1h A100 job."""
     return _run_recommendations(RecommendationRequest(), request)
