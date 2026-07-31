@@ -35,7 +35,11 @@ from carbonsight_core.providers.spot import (
     get_spot_price_provider,
 )
 from carbonsight_core.spot.availability import AvailabilityTracker, synthetic_probe_trace
-from carbonsight_core.spot.lifetime import LifetimeStats, predict_remaining_lifetime
+from carbonsight_core.spot.lifetime import (
+    MIN_LIFETIME_HR,
+    LifetimeStats,
+    predict_remaining_lifetime,
+)
 from carbonsight_core.spot.progress import (
     ODCandidate,
     ProgressState,
@@ -52,7 +56,6 @@ from carbonsight_core.spot.unified_model import (
 
 DEFAULT_COLD_START_HR = 0.1
 CHECKPOINT_RESTORE_HR_PER_GB = 0.002  # ~7 s/GB at 10 Gbps
-MIN_LIFETIME_HR = 0.25
 
 
 @dataclass
@@ -110,26 +113,32 @@ def registry_pairs(
     return out
 
 
-@lru_cache(maxsize=256)
 def synthetic_lifetime_stats(region: str) -> LifetimeStats:
     """Nelson-Aalen stats for a region from a deterministic synthetic probe trace.
 
     Stands in for a real availability ledger. Real ``AvailabilityTracker``
     observations go through the same ``observed_lifetimes`` -> ``LifetimeStats``
-    path, so swapping the source in changes nothing downstream.
+    path, so swapping the source in changes nothing downstream. Returns a fresh
+    object each call: ``LifetimeStats`` is mutable and callers may ``add`` to it.
     """
     tracker = AvailabilityTracker(synthetic_probe_trace(region))
     return LifetimeStats.from_observations(tracker.observed_lifetimes(region))
 
 
+@lru_cache(maxsize=256)
+def _synthetic_mean_lifetime_hr(region: str) -> float:
+    """Cached Lbar for the synthetic trace — a float, so nothing mutable is shared."""
+    return predict_remaining_lifetime(synthetic_lifetime_stats(region), age=0.0)
+
+
 def mean_lifetime_hr(region: str, tracker: AvailabilityTracker | None = None) -> float:
     """Lbar(0) for a region, from real probe data when available, else synthetic."""
-    stats = (
-        LifetimeStats.from_observations(tracker.observed_lifetimes(region))
-        if tracker is not None and tracker.get_observations(region)
-        else synthetic_lifetime_stats(region)
-    )
-    return max(MIN_LIFETIME_HR, predict_remaining_lifetime(stats, age=0.0))
+    if tracker is not None and tracker.get_observations(region):
+        stats = LifetimeStats.from_observations(tracker.observed_lifetimes(region))
+        lbar = predict_remaining_lifetime(stats, age=0.0)
+    else:
+        lbar = _synthetic_mean_lifetime_hr(region)
+    return max(MIN_LIFETIME_HR, lbar)
 
 
 def cold_start_hours(job: JobSpec) -> float:

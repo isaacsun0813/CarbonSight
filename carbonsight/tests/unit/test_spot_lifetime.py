@@ -178,36 +178,77 @@ class TestCumulativeAndSurvival:
 
 
 class TestExpectedRemaining:
-    def test_expected_remaining_basic(self):
-        h = compute_hazard(HAND_STATS)
-        cum = compute_cumulative_hazard(h)
-        surv = compute_survival(cum)
+    """L(a) is the area under the survival step function, so gaps count.
 
-        # Age 0: S(a)=1, sum all S
-        rem0 = expected_remaining(surv, 0)
-        expected_sum = sum(surv.values())
-        assert rem0 == pytest.approx(expected_sum, rel=1e-9)
+    HAND_STATS has lifetimes 1, 2, 3, 5 — note the gap between 3 and 5. S is flat
+    on each [l_i, l_{i+1}), so the rectangles are:
 
-        # Age 1: S(a)=S1, sum_{>1} S
-        rem1 = expected_remaining(surv, 1)
-        assert rem1 == pytest.approx((surv[2] + surv[3] + surv[5]) / surv[1], rel=1e-9)
+        [0,1) width 1 at S=1        [1,2) width 1 at S1
+        [2,3) width 1 at S2         [3,5) width 2 at S3
+
+    Values below are computed by hand from S_i = exp(-H_i) with
+    H = 1/7, 1/7+1/3, 1/7+2/3 and pinned as literals, so that changing the
+    weighting scheme has to change the numbers rather than the derivation.
+    """
+
+    S1 = 0.8668778997501816  # exp(-1/7)
+    S2 = 0.6211451576154515  # exp(-10/21)
+    S3 = 0.4450699538427624  # exp(-17/21)
+
+    def test_expected_remaining_at_age_zero(self):
+        surv = compute_survival(compute_cumulative_hazard(compute_hazard(HAND_STATS)))
+        # 1 + S1 + S2 + 2*S3
+        assert expected_remaining(surv, 0) == pytest.approx(3.3781629650511578, rel=1e-12)
+
+    def test_expected_remaining_at_age_one(self):
+        surv = compute_survival(compute_cumulative_hazard(compute_hazard(HAND_STATS)))
+        # (S1 + S2 + 2*S3) / S1
+        assert expected_remaining(surv, 1) == pytest.approx(2.7433655486389732, rel=1e-12)
+
+    def test_expected_remaining_at_age_two(self):
+        surv = compute_survival(compute_cumulative_hazard(compute_hazard(HAND_STATS)))
+        # (S2 + 2*S3) / S2
+        assert expected_remaining(surv, 2) == pytest.approx(2.4330626211475783, rel=1e-12)
+
+    def test_final_gap_is_weighted_by_its_width(self):
+        """At age 3 only the width-2 gap [3,5) is left, so L = 2 exactly."""
+        surv = compute_survival(compute_cumulative_hazard(compute_hazard(HAND_STATS)))
+        assert expected_remaining(surv, 3) == pytest.approx(2.0, rel=1e-12)
+
+    def test_unit_width_sum_is_not_what_we_compute(self):
+        """Guards the actual bug: sum(S) ignores the 3->5 gap and the [0,1) head."""
+        surv = compute_survival(compute_cumulative_hazard(compute_hazard(HAND_STATS)))
+        assert expected_remaining(surv, 0) != pytest.approx(sum(surv.values()), rel=1e-6)
+
+    @pytest.mark.parametrize("last", [4, 40, 400])
+    def test_lbar_scales_with_lifetime_magnitude(self, last):
+        """The regression: [1,2,3,4], [1,2,3,40] and [1,2,3,400] all gave 1.7998.
+
+        Four uncensored observations, so n = 4, 3, 2, 1 and h = 1/4, 1/3, 1/2, 1.
+        Closed form, derived from the hazard definitions rather than from
+        ``expected_remaining`` itself:
+
+            L(0) = 1*[0,1) + S1*[1,2) + S2*[2,3) + S3*(last - 3)
+        """
+        s1 = math.exp(-1 / 4)
+        s2 = math.exp(-(1 / 4 + 1 / 3))
+        s3 = math.exp(-(1 / 4 + 1 / 3 + 1 / 2))
+        expected = 1.0 + s1 + s2 + s3 * (last - 3)
+
+        stats = LifetimeStats.from_observations([(x, True) for x in (1, 2, 3, last)])
+        assert predict_remaining_lifetime(stats, age=0) == pytest.approx(expected, rel=1e-12)
+
+    def test_lbar_tracks_the_sample_mean(self):
+        """A long-tailed sample: restricted L(0) should land near the sample mean."""
+        sample = [1, 1, 2, 2, 3, 4, 6, 9, 14, 20]
+        stats = LifetimeStats.from_observations([(x, True) for x in sample])
+        lbar = predict_remaining_lifetime(stats, age=0)
+        assert lbar == pytest.approx(sum(sample) / len(sample), rel=0.35)
 
     def test_expected_remaining_decreasing_with_age_tendency(self):
-        """As age increases, remaining should not increase drastically; non-negative."""
-        h = compute_hazard(HAND_STATS)
-        cum = compute_cumulative_hazard(h)
-        surv = compute_survival(cum)
-        rem0 = expected_remaining(surv, 0)
-        rem2 = expected_remaining(surv, 2)
-        rem5 = expected_remaining(surv, 5)
-        # Past last lifetime -> 0
-        assert rem5 == 0.0
-        assert rem0 >= 0
-        assert rem2 >= 0
-        # Generally remaining at 0 >= remaining at 2 (since fewer future points weighted)
-        # In this dataset: rem0 = S1+S2+S3+S5 ≈ 0.866+0.621+0.445+0.445=2.377
-        # rem2 = (S3+S5)/S2 ≈ (0.445+0.445)/0.621 ≈1.433 -> less than rem0
-        assert rem0 > rem2
+        surv = compute_survival(compute_cumulative_hazard(compute_hazard(HAND_STATS)))
+        assert expected_remaining(surv, 5) == 0.0  # past the last lifetime
+        assert expected_remaining(surv, 0) > expected_remaining(surv, 2) >= 0
 
     def test_expected_remaining_age_before_first(self):
         h = compute_hazard(HAND_STATS)

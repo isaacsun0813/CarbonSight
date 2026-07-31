@@ -4,11 +4,11 @@ SkyNomad Sec 4.4 — lifetime prediction via the Nelson-Aalen hazard estimator.
 Observations are aggregated as ``lifetime -> (e, c)``: ``e`` preemptions and
 ``c`` censored (proactively migrated / still alive) instances at that lifetime.
 
-    n(l) = sum_{x >= l} (e(x) + c(x))       at-risk set
-    h(l) = e(l) / n(l)                      hazard increment
-    H(l) = sum_{l_i <= l} h(l_i)            cumulative hazard
-    S(l) = exp(-H(l))                       survival
-    L(a) = 1/S(a) * sum_{l_i > a} S(l_i)    expected remaining lifetime at age a
+    n(l) = sum_{x >= l} (e(x) + c(x))            at-risk set
+    h(l) = e(l) / n(l)                           hazard increment
+    H(l) = sum_{l_i <= l} h(l_i)                 cumulative hazard
+    S(l) = exp(-H(l))                            survival
+    L(a) = 1/S(a) * integral_a^l_max S(t) dt     expected remaining lifetime at age a
 
 Volatility adjustment for a burst of preemptions in a recent window W:
 
@@ -16,8 +16,17 @@ Volatility adjustment for a burst of preemptions in a recent window W:
     gamma*  = max over windows ending now
     S~(l)   = exp(-gamma* * H(l)) = S(l) ** gamma*
 
-The ``L(a)`` sum treats consecutive observed lifetimes as unit steps, so feed it
-lifetimes on a fixed grid (the hourly probe grid in ``spot/availability.py``).
+S is a right-continuous step function — S(t) = S(l_i) for t in [l_i, l_{i+1}) —
+so that integral is an exact sum of rectangles whose widths are the *gaps*
+between consecutive observed lifetimes. Weighting each S(l_i) by an implicit
+width of 1 instead makes L(a) depend on how many distinct lifetimes were
+observed rather than how long they were: [1,2,3,4] and [1,2,3,400] both come out
+at 1.7998. An hourly probe grid makes lifetimes integer-*valued*, not
+*contiguous*, so it does not rescue the unit-width form.
+
+The integral is truncated at the largest observed lifetime (a restricted mean
+survival time). With censored observations S never reaches 0, so an untruncated
+tail would diverge; the restriction makes L(a) a documented lower bound.
 
 Pure Python — no numpy, no pricing, no AWS.
 """
@@ -29,6 +38,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 Stats = Mapping[float, tuple[int, int]]
+
+# Floor applied by callers so a region with a degenerate fit cannot divide by ~0
+# in E/Lbar or drive eta to 0. Shared so the scheduler and the backtest agree.
+MIN_LIFETIME_HR = 0.25
 
 
 def _normalize(stats: LifetimeStats | Stats) -> dict[float, tuple[int, int]]:
@@ -124,18 +137,40 @@ def compute_survival(cumulative_hazard: Mapping[float, float]) -> dict[float, fl
 
 
 def expected_remaining(survival: Mapping[float, float], age: float) -> float:
-    """L(a) = 1/S(a) * sum_{l_i > a} S(l_i). Zero past the last observed lifetime."""
+    """L(a) = (1/S(a)) * integral from a to l_max of S(t) dt.
+
+    Exact for the step function, not a unit-width approximation: each rectangle
+    is S at the left edge times the gap to the next observed lifetime. Zero once
+    ``age`` reaches the last observed lifetime, where the restricted integral is
+    empty. Negative ages are clamped to 0.
+    """
     if not survival:
         return 0.0
+    age = max(0.0, age)
     lifetimes = sorted(survival)
-    s_age = 1.0
+    if age >= lifetimes[-1]:
+        return 0.0
+
+    # S at the left edge of the first interval: survival at the newest lifetime
+    # already passed, or 1 when the job has not reached the first one.
+    s_left = 1.0
     for lifetime in lifetimes:
         if lifetime > age:
             break
-        s_age = float(survival[lifetime])
-    if s_age <= 0.0:
+        s_left = float(survival[lifetime])
+    if s_left <= 0.0:
         return 0.0
-    return sum(float(survival[x]) for x in lifetimes if x > age) / s_age
+
+    s_age = s_left
+    area = 0.0
+    left = age
+    for lifetime in lifetimes:
+        if lifetime <= age:
+            continue
+        area += s_left * (lifetime - left)
+        left = lifetime
+        s_left = float(survival[lifetime])
+    return area / s_age
 
 
 def compute_gamma(num_preemptions_in_window: int, hazard_sum: float) -> float:
