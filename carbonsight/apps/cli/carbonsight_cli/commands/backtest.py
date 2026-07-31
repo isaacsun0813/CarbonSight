@@ -4,7 +4,7 @@ import json
 
 import typer
 from carbonsight_core.backtest.runner import run_backtest
-from carbonsight_core.backtest.spot_runner import run_spot_backtest
+from carbonsight_core.backtest.spot_runner import run_spot_backtest_multi
 
 backtest_group = typer.Typer(help="Backtesting harness")
 
@@ -17,50 +17,57 @@ def run_backtest_cmd(
     json_out: bool = typer.Option(False, "--json", help="Output metrics as JSON"),
     spot: bool = typer.Option(False, "--spot", help="Use spot-aware runner (evictions + carbon)"),
     carbon_price: float = typer.Option(50.0, "--carbon-price", help="USD/ton for spot backtest"),
+    seeds: str = typer.Option(
+        "", "--seeds", help="Comma-separated seeds for --spot; defaults to --seed alone"
+    ),
 ) -> None:
     """Generate workloads and output savings, regret, rank accuracy."""
     if spot:
-        result = run_spot_backtest(
-            n=n, days=days, seed=seed, carbon_price_usd_per_ton=carbon_price
+        seed_list = tuple(int(x) for x in seeds.split(",")) if seeds else (seed,)
+        multi = run_spot_backtest_multi(
+            n=n, days=days, seeds=seed_list, carbon_price_usd_per_ton=carbon_price
         )
+        first = multi.per_seed[0]
         payload = {
-            "n_workloads": result.n_workloads,
-            "days": result.days,
-            "deadline_ratio": result.deadline_ratio,
-            "checkpoint_gb": result.checkpoint_gb,
-            "skynomad_cost_mean": result.skynomad_cost_mean,
-            "up_single_cost_mean": result.up_single_cost_mean,
-            "up_multi_cost_mean": result.up_multi_cost_mean,
-            "cost_savings_vs_up_single_pct": result.cost_savings_vs_up_single_pct,
-            "cost_savings_vs_up_multi_pct": result.cost_savings_vs_up_multi_pct,
-            "deadline_met_pct": result.deadline_met_pct,
-            "up_single_deadline_met_pct": result.up_single_deadline_met_pct,
-            "up_multi_deadline_met_pct": result.up_multi_deadline_met_pct,
-            "migrations_mean": result.migrations_mean,
-            "egress_cost_pct_mean": result.egress_cost_pct_mean,
-            "carbon_kg_mean": result.carbon_kg_mean,
-            "up_multi_carbon_kg_mean": result.up_multi_carbon_kg_mean,
+            "n_workloads": multi.n_workloads,
+            "days": multi.days,
+            "seeds": multi.seeds,
+            "deadline_ratio": first.deadline_ratio,
+            "checkpoint_gb": first.checkpoint_gb,
+            "up_single_default_region": multi.up_single_default_region,
+            "up_single_best_region": first.up_single_best_region,
+            "metrics_mean_stdev": {k: list(v) for k, v in multi.metrics.items()},
+            "caveats": multi.caveats,
         }
         if json_out:
             typer.echo(json.dumps(payload, indent=2))
-        else:
-            typer.echo(f"Spot backtest: n={result.n_workloads}, days={result.days}")
-            typer.echo(f"  Cost mean  SkyNomad:  ${result.skynomad_cost_mean:.2f}")
-            typer.echo(f"             UP-single: ${result.up_single_cost_mean:.2f}")
-            typer.echo(f"             UP-multi:  ${result.up_multi_cost_mean:.2f}")
-            typer.echo(f"  Savings vs UP-single: {result.cost_savings_vs_up_single_pct:+.1f}%")
-            typer.echo(f"  Savings vs UP-multi:  {result.cost_savings_vs_up_multi_pct:+.1f}%")
-            typer.echo(
-                f"  Deadline met: SkyNomad {result.deadline_met_pct:.0f}%, "
-                f"UP-single {result.up_single_deadline_met_pct:.0f}%, "
-                f"UP-multi {result.up_multi_deadline_met_pct:.0f}%"
-            )
-            typer.echo(f"  Migrations (mean):    {result.migrations_mean:.2f}")
-            typer.echo(f"  Egress share of cost: {result.egress_cost_pct_mean:.1f}%")
-            typer.echo(
-                f"  CO2 kg mean: SkyNomad {result.carbon_kg_mean:.3f}, "
-                f"UP-multi {result.up_multi_carbon_kg_mean:.3f}"
-            )
+            return
+
+        def line(label: str, key: str, unit: str = "") -> None:
+            mean, sd = multi.metrics[key]
+            typer.echo(f"  {label:<34} {mean:8.2f}{unit} +/- {sd:.2f}")
+
+        typer.echo(
+            f"Spot backtest: n={multi.n_workloads}/seed, days={multi.days}, "
+            f"seeds={len(multi.seeds)} (mean +/- sigma across seeds)"
+        )
+        line("SkyNomad cost", "skynomad_cost_mean")
+        line(f"UP-single pinned {multi.up_single_default_region}", "up_single_default_cost_mean")
+        line(f"UP-single best ({first.up_single_best_region}, hindsight)", "up_single_best_cost_mean")
+        line("UP-multi cost", "up_multi_cost_mean")
+        typer.echo("")
+        line("Savings vs pinned default", "cost_savings_vs_up_single_default_pct", "%")
+        line("Savings vs best single pin", "cost_savings_vs_up_single_best_pct", "%")
+        line("Savings vs UP-multi", "cost_savings_vs_up_multi_pct", "%")
+        typer.echo("")
+        line("Deadline met", "deadline_met_pct", "%")
+        line("Migrations", "migrations_mean")
+        line("Idle hours", "idle_hours_mean")
+        line("Egress share of cost", "egress_cost_pct_mean", "%")
+        line("CO2 kg SkyNomad", "carbon_kg_mean")
+        line("CO2 kg UP-multi", "up_multi_carbon_kg_mean")
+        for caveat in multi.caveats:
+            typer.echo(f"  NOTE: {caveat}")
         return
 
     result = run_backtest(n=n, days=days, seed=seed)

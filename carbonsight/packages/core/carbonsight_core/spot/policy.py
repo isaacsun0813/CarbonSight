@@ -15,7 +15,6 @@ would trigger a checkpoint migration every probe.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -31,6 +30,9 @@ from carbonsight_core.spot.unified_model import (
 )
 
 ActionKind = Literal["launch", "terminate", "idle", "stay"]
+# Which rule fired. Exposed so callers branch on structure instead of parsing
+# ``reason``; the API and the CLI both render off this.
+ActionRule = Literal["thrifty", "safety_net", "rank", "no_candidates"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,28 +53,48 @@ class PolicyState:
 
 @dataclass(frozen=True, slots=True)
 class Action:
-    """A policy decision, always with a human-readable reason."""
+    """A policy decision: what to do, which rule decided it, and why in words.
+
+    ``estimated_total_cost_usd`` is set only for safety-net launches, where the
+    rule already had to price finishing the job on that region to choose it.
+    """
 
     kind: ActionKind
     region: str | None = None
     mode: str | None = None
     reason: str = ""
+    rule: ActionRule = "rank"
+    estimated_total_cost_usd: float | None = None
 
     @classmethod
-    def launch(cls, region: str, mode: str = "spot", reason: str = "") -> Action:
-        return cls(kind="launch", region=region, mode=mode, reason=reason)
+    def launch(
+        cls,
+        region: str,
+        mode: str = "spot",
+        reason: str = "",
+        rule: ActionRule = "rank",
+        estimated_total_cost_usd: float | None = None,
+    ) -> Action:
+        return cls(
+            kind="launch",
+            region=region,
+            mode=mode,
+            reason=reason,
+            rule=rule,
+            estimated_total_cost_usd=estimated_total_cost_usd,
+        )
 
     @classmethod
-    def terminate(cls, reason: str = "") -> Action:
-        return cls(kind="terminate", reason=reason)
+    def terminate(cls, reason: str = "", rule: ActionRule = "rank") -> Action:
+        return cls(kind="terminate", reason=reason, rule=rule)
 
     @classmethod
-    def idle(cls, reason: str = "") -> Action:
-        return cls(kind="idle", reason=reason)
+    def idle(cls, reason: str = "", rule: ActionRule = "thrifty") -> Action:
+        return cls(kind="idle", reason=reason, rule=rule)
 
     @classmethod
-    def stay(cls, reason: str = "") -> Action:
-        return cls(kind="stay", reason=reason)
+    def stay(cls, reason: str = "", rule: ActionRule = "rank") -> Action:
+        return cls(kind="stay", reason=reason, rule=rule)
 
     @property
     def is_launch(self) -> bool:
@@ -116,15 +138,18 @@ class SkyNomadPolicy:
     def _probe_due(self, state: PolicyState) -> bool:
         return (state.t - self._last_probe_t) >= self.probe_interval_hr - 1e-9
 
-    def _cheapest_od(
+    def cheapest_od(
         self,
         candidates: list[CandidateState],
         progress: ProgressState,
         state: PolicyState,
-    ) -> CandidateState | None:
-        """argmin_r C_od(r)*(P-p+d) + E(r) + carbon$(r) over the on-demand candidates."""
-        best: CandidateState | None = None
-        best_cost = math.inf
+    ) -> tuple[CandidateState, float] | None:
+        """argmin_r C_od(r)*(P-p+d) + E(r) + carbon$(r) over the on-demand candidates.
+
+        Returns the candidate and its modelled cost to finish, so callers can
+        report the figure the rule actually decided on instead of re-deriving it.
+        """
+        best: tuple[CandidateState, float] | None = None
         for cand in candidates:
             if not cand.is_od:
                 continue
@@ -140,8 +165,8 @@ class SkyNomadPolicy:
                 self.carbon_price_usd_per_ton,
                 self.carbon_weight,
             )
-            if cost < best_cost:
-                best, best_cost = cand, cost
+            if best is None or cost < best[1]:
+                best = (cand, cost)
         return best
 
     def _safety_net_action(
@@ -152,12 +177,22 @@ class SkyNomadPolicy:
     ) -> Action:
         threshold = progress.remaining_work + 2 * state.cold_start_hr
         why = f"safety_net: T-t={progress.remaining_time:.3f} < P-p+2d={threshold:.3f}"
-        best = self._cheapest_od(candidates, progress, state)
+        best = self.cheapest_od(candidates, progress, state)
         if best is not None:
-            return Action.launch(best.region, best.mode, f"{why}, cheapest OD {best.region}")
+            cand, cost = best
+            return Action.launch(
+                cand.region,
+                cand.mode,
+                f"{why}, cheapest OD {cand.region}",
+                rule="safety_net",
+                estimated_total_cost_usd=cost,
+            )
         fallback = state.current_region or state.r0
         return Action.launch(
-            fallback, "on_demand", f"{why}, no OD candidates - fallback {fallback} OD"
+            fallback,
+            "on_demand",
+            f"{why}, no OD candidates - fallback {fallback} OD",
+            rule="safety_net",
         )
 
     def _decide_ranked(
@@ -168,7 +203,7 @@ class SkyNomadPolicy:
     ) -> Action:
         probe_note = "; probing triggered" if probing_due else ""
         if not ranked:
-            return Action.stay(f"no candidates{probe_note}")
+            return Action.stay(f"no candidates{probe_note}", rule="no_candidates")
 
         best, best_u = ranked[0]
         if best.region == state.current_region and best.mode == state.current_mode:
@@ -204,7 +239,9 @@ class SkyNomadPolicy:
             self._last_probe_t = state.t
 
         if progress.is_thrifty():
-            return ranked, Action.idle(f"thrifty: p={state.p} >= P={state.P}")
+            return ranked, Action.idle(
+                f"thrifty: p={state.p} >= P={state.P}", rule="thrifty"
+            )
         if progress.is_safety_net(state.cold_start_hr):
             return ranked, self._safety_net_action(state, candidates, progress)
         return ranked, self._decide_ranked(state, ranked, probing_due)
@@ -220,4 +257,4 @@ class SkyNomadPolicy:
         return self.rank_and_decide(state, candidates, progress, v)[1]
 
 
-__all__ = ["Action", "ActionKind", "PolicyState", "SkyNomadPolicy"]
+__all__ = ["Action", "ActionKind", "ActionRule", "PolicyState", "SkyNomadPolicy"]

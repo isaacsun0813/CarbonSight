@@ -40,17 +40,12 @@ from carbonsight_core.spot.lifetime import (
     LifetimeStats,
     predict_remaining_lifetime,
 )
-from carbonsight_core.spot.progress import (
-    ODCandidate,
-    ProgressState,
-    carbon_usd_per_hr,
-    select_cheapest_od_region,
-)
+from carbonsight_core.spot.policy import Action, PolicyState, SkyNomadPolicy
+from carbonsight_core.spot.progress import ODCandidate, ProgressState, carbon_usd_per_hr
 from carbonsight_core.spot.unified_model import (
     CandidateState,
     MigrationCostEstimator,
     effectiveness,
-    rank_candidates,
     total_cost_per_hr,
 )
 
@@ -76,15 +71,31 @@ class RegionInputs:
 
 @dataclass
 class ScheduleResult:
+    """A ranking plus the ``SkyNomadPolicy`` decision that goes with it.
+
+    ``decision`` is the authoritative Algo 1 output; ``action`` mirrors
+    ``decision.rule`` (plus ``"empty"`` when the registry maps nothing) so
+    callers can switch on a plain string.
+    """
+
     ranked: list[tuple[CandidateState, float]]
     progress: ProgressState
     value_v: float
     cold_start_hr: float
     action: str
     inputs: dict[str, RegionInputs]
+    decision: Action | None = None
     estimates: list[EstimateResult] = field(default_factory=list)
-    safety_net_region: str | None = None
-    safety_net_total_cost: float | None = None
+
+    @property
+    def safety_net_region(self) -> str | None:
+        return self.decision.region if self.action == "safety_net" and self.decision else None
+
+    @property
+    def safety_net_total_cost(self) -> float | None:
+        if self.action != "safety_net" or self.decision is None:
+            return None
+        return self.decision.estimated_total_cost_usd
 
 
 def default_registry() -> Registry | None:
@@ -234,8 +245,17 @@ def schedule_job(
     egress_usd_per_gb: float = 0.02,
     now: datetime | None = None,
     top_n: int | None = None,
+    policy: SkyNomadPolicy | None = None,
+    current_mode: str = "spot",
+    current_utility: float = 0.0,
 ) -> ScheduleResult:
-    """Providers -> candidates -> V(t) -> thrifty / safety net / ranked U."""
+    """Providers -> candidates -> V(t) -> ``SkyNomadPolicy`` decision + ranking.
+
+    The thrifty / safety-net / delta rules are not reimplemented here: this
+    delegates to ``SkyNomadPolicy.rank_and_decide`` so there is exactly one
+    Algo 1 in the tree for the CLI, the API, the backtest and any future
+    supervisor loop to share.
+    """
     progress = progress_from_job(job, elapsed_hours=elapsed_hours)
     candidates, od_options, inputs, progress = build_candidates(
         job,
@@ -263,34 +283,32 @@ def schedule_job(
     )
     value_v = progress.future_progress_value(c_od_min)
 
-    ranked = rank_candidates(
-        candidates,
-        value_v,
-        cold_start_hr,
-        job.carbon_price_usd_per_ton,
-        job.carbon_weight,
+    policy = policy or SkyNomadPolicy(
+        migration_estimator=MigrationCostEstimator(
+            egress_usd_per_gb=egress_usd_per_gb,
+            carbon_price_usd_per_ton=job.carbon_price_usd_per_ton,
+            carbon_weight=job.carbon_weight,
+        ),
+        carbon_price_usd_per_ton=job.carbon_price_usd_per_ton,
+        carbon_weight=job.carbon_weight,
     )
+    state = PolicyState(
+        p=progress.p,
+        P=progress.P,
+        t=progress.t,
+        T=progress.T,
+        r0=job.current_region,
+        ckpt_size_gb=job.checkpoint_size_gb,
+        cold_start_hr=cold_start_hr,
+        current_region=job.current_region,
+        current_mode=current_mode,
+        current_utility=current_utility,
+    )
+    ranked, decision = policy.rank_and_decide(state, candidates, progress, value_v)
+
+    action = "empty" if not candidates else decision.rule
     if top_n is not None:
         ranked = ranked[:top_n]
-
-    action = "rank"
-    sn_region: str | None = None
-    sn_cost: float | None = None
-    if not candidates:
-        action = "empty"
-    elif progress.is_thrifty():
-        action = "thrifty"
-    elif progress.is_safety_net(cold_start_hr):
-        best = select_cheapest_od_region(
-            od_options,
-            progress.remaining_work,
-            cold_start_hr,
-            job.carbon_price_usd_per_ton,
-            job.carbon_weight,
-        )
-        if best is not None:
-            action = "safety_net"
-            sn_region, sn_cost = best[0].region, best[1]
 
     result = ScheduleResult(
         ranked=ranked,
@@ -299,8 +317,7 @@ def schedule_job(
         cold_start_hr=cold_start_hr,
         action=action,
         inputs=inputs,
-        safety_net_region=sn_region,
-        safety_net_total_cost=sn_cost,
+        decision=decision,
     )
     result.estimates = candidates_to_estimates(result, job)
     return result
