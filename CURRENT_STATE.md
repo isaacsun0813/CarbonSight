@@ -31,7 +31,7 @@ Key behavior from the code:
   - `--nvidia-smi` (samples local `nvidia-smi` utilization)
   - YAML `carbonsight.gpu_utilization`
 - **Registry required**: the CLI loads a mapping registry JSON (defaults to a seeded file if present).
-- **Live spot cost (optional)**: `CARBONSIGHT_LIVE_AWS_PRICING=1` or `--live-pricing` uses EC2 spot history when estimating cost (with `--spot` on `run`/`train --launch`). `--static-pricing` forces static tables. Live rows may include `notes` like `cost:live_spot` in JSON output.
+- **Live AWS pricing (optional)**: `CARBONSIGHT_LIVE_AWS_PRICING=1` or `--live-pricing` uses EC2 spot history when `--spot`, and Pricing API on-demand when `--no-spot` (or `advise` without `--spot`). `--static-pricing` forces static tables. JSON may include `notes` like `cost:live_spot`, `cost:live_ondemand`, or `cost:static_*_fallback`.
 - **Credentials required for recommendations**: if WattTime credentials aren’t in env, the CLI prints an empty list (`--json`) or a message.
 
 Relevant code:
@@ -52,7 +52,7 @@ Relevant code:
 
 Key behavior from the code:
 
-- **Spot pricing**: `--spot` (default ON) sets `resources.use_spot: true` in the patched YAML. By default, cost uses static on-demand × 35% (`SPOT_PRICE_FRACTION`). With `CARBONSIGHT_LIVE_AWS_PRICING=1` or `--live-pricing`, spot cost uses EC2 `describe_spot_price_history` (falls back to static on API errors). `--static-pricing` forces static tables. Use `--no-spot` for on-demand static pricing only.
+- **Spot pricing**: `--spot` (default ON) sets `resources.use_spot: true` in the patched YAML. By default, cost uses static on-demand × 35% (`SPOT_PRICE_FRACTION`). With `CARBONSIGHT_LIVE_AWS_PRICING=1` or `--live-pricing`, spot cost uses EC2 `describe_spot_price_history`; on-demand (`--no-spot`) uses Pricing API `get_products`. Falls back to static tables on API errors. `--static-pricing` forces static tables.
 - **Carbon-aware scheduling**: `--max-delay 6h` scans the forecast for the lowest-carbon start time within the delay window and prints a recommendation. Default `0h` (run immediately).
 - **Checkpoint resilience**: `--checkpoint` (default ON) wraps the training command with automatic checkpoint saving and resume. Detects the ML framework (HuggingFace, Lightning, PyTorch) via AST analysis, mounts persistent SkyPilot Storage at `/ckpt`, and injects a shim that handles SIGTERM → SIGINT for graceful saves on preemption. Auto-enables `--managed` (SkyPilot managed spot) when spot + checkpoint are both on. Customizable with `--checkpoint-bucket` (explicit S3 URI) and `--checkpoint-interval` (steps, default 500). Disable with `--no-checkpoint`.
 - **Run tracking**: each run is persisted to a SQLite ledger (`~/.carbonsight/runs.db` by default, overridable with `--db` or `CARBONSIGHT_DB`). Baseline is `us-east-1` on-demand/spot (matching `--spot`).
@@ -143,6 +143,7 @@ Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and per
 - **Core orchestration**: `carbonsight/packages/core/carbonsight_core/region_ranking.py`
 - **Estimator**: `carbonsight/packages/core/carbonsight_core/estimator/`
 - **Live spot pricing**: `carbonsight/packages/core/carbonsight_core/estimator/aws_spot_pricing.py`
+- **Live on-demand pricing**: `carbonsight/packages/core/carbonsight_core/estimator/aws_ondemand_pricing.py`
 - **Scheduler**: `carbonsight/packages/core/carbonsight_core/scheduler.py`
 - **Run ledger**: `carbonsight/packages/core/carbonsight_core/tracking.py`
 - **Checkpoint core**: `carbonsight/packages/core/carbonsight_core/checkpoint.py`
