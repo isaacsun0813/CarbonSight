@@ -48,17 +48,16 @@ dev = [
 [project.scripts]
 carbonsight = "carbonsight_cli.main:app"
 
+# `packages` already maps each source tree to its top-level import name. A
+# force-include of the same paths would additionally *copy* them into the wheel,
+# and those copies shadow the .pth in an editable install — leaving `carbonsight`
+# on the CLI running a frozen snapshot while pytest (pythonpath ini) runs source.
 [tool.hatch.build.targets.wheel]
 packages = [
     "packages/core/carbonsight_core",
     "apps/cli/carbonsight_cli",
     "apps/api/carbonsight_api",
 ]
-
-[tool.hatch.build.targets.wheel.force-include]
-"packages/core/carbonsight_core" = "carbonsight_core"
-"apps/cli/carbonsight_cli" = "carbonsight_cli"
-"apps/api/carbonsight_api" = "carbonsight_api"
 
 [tool.ruff]
 line-length = 100
