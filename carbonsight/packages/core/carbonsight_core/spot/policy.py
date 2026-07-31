@@ -1,190 +1,223 @@
 """
-SkyNomad Sec 4.7 — Policy loop.
+SkyNomad Sec 4.7 — Algo 1, the decision loop, with a carbon lever.
 
-Actions: PROBE, RUN, MIGRATE, WAIT, TERMINATE.
-while p < P: probe every 2h + Delta heuristic for migrate/wait.
+One step:
+
+    1. thrifty      p >= P                 -> idle
+    2. safety net   T-t < P-p+2d           -> launch the cheapest on-demand region
+    3. probe        every probe_interval_hr (recorded, does not change the action)
+    4. rank         U = V*eta - C_total - E/Lbar over region x mode
+    5. delta        launch the best only if U_best > U_current + delta, else stay
+
+Step 5 is the anti-flapping rule: without it a candidate that is a cent better
+would trigger a checkpoint migration every probe.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
-from enum import Enum
+import math
+from dataclasses import dataclass
+from typing import Literal
 
-from carbonsight_core.spot.availability import AvailabilityTracker
-from carbonsight_core.spot.lifetime import LifetimeStats
-from carbonsight_core.spot.progress import ProgressState
-from carbonsight_core.spot.unified_model import ODCandidate, rank_candidates
+from carbonsight_core.spot.progress import (
+    ODCandidate,
+    ProgressState,
+    compute_safety_net_total_cost,
+)
+from carbonsight_core.spot.unified_model import (
+    CandidateState,
+    MigrationCostEstimator,
+    rank_candidates,
+)
+
+ActionKind = Literal["launch", "terminate", "idle", "stay"]
 
 
-class Action(str, Enum):
-    PROBE = "PROBE"
-    RUN = "RUN"
-    MIGRATE = "MIGRATE"
-    WAIT = "WAIT"
-    TERMINATE = "TERMINATE"
+@dataclass(frozen=True, slots=True)
+class PolicyState:
+    """Everything the policy needs about the job and its current placement."""
+
+    p: float
+    P: float
+    t: float
+    T: float
+    r0: str
+    ckpt_size_gb: float = 0.0
+    cold_start_hr: float = 0.1
+    current_region: str = ""
+    current_mode: str = "spot"
+    current_utility: float = 0.0
 
 
-@dataclass
-class PolicyDecision:
-    action: Action
-    target: ODCandidate | None = None
+@dataclass(frozen=True, slots=True)
+class Action:
+    """A policy decision, always with a human-readable reason."""
+
+    kind: ActionKind
+    region: str | None = None
+    mode: str | None = None
     reason: str = ""
-    ranked: list[ODCandidate] = field(default_factory=list)
+
+    @classmethod
+    def launch(cls, region: str, mode: str = "spot", reason: str = "") -> Action:
+        return cls(kind="launch", region=region, mode=mode, reason=reason)
+
+    @classmethod
+    def terminate(cls, reason: str = "") -> Action:
+        return cls(kind="terminate", reason=reason)
+
+    @classmethod
+    def idle(cls, reason: str = "") -> Action:
+        return cls(kind="idle", reason=reason)
+
+    @classmethod
+    def stay(cls, reason: str = "") -> Action:
+        return cls(kind="stay", reason=reason)
+
+    @property
+    def is_launch(self) -> bool:
+        return self.kind == "launch"
+
+    @property
+    def is_idle(self) -> bool:
+        return self.kind == "idle"
+
+    @property
+    def is_stay(self) -> bool:
+        return self.kind == "stay"
+
+    @property
+    def is_terminate(self) -> bool:
+        return self.kind == "terminate"
 
 
-@dataclass
 class SkyNomadPolicy:
-    """Multi-lever scheduler: cost + carbon + time + availability + migration."""
+    """Algo 1 as a single-step decision function over a candidate list."""
 
-    tracker: AvailabilityTracker
-    lifetime: LifetimeStats
-    progress: ProgressState
-    carbon_price_usd_per_ton: float = 50.0
-    probe_interval_hours: float = 2.0
-    delta_utility: float = 1.0  # migrate if best_U - current_U > delta
-    last_probe_at: datetime | None = None
-    current: ODCandidate | None = None
+    def __init__(
+        self,
+        spot_provider: object | None = None,
+        carbon_provider: object | None = None,
+        migration_estimator: MigrationCostEstimator | None = None,
+        delta: float = 0.05,
+        probe_interval_hr: float = 2.0,
+        carbon_price_usd_per_ton: float = 50.0,
+        carbon_weight: float = 1.0,
+    ) -> None:
+        self.spot_provider = spot_provider
+        self.carbon_provider = carbon_provider
+        self.migration_estimator = migration_estimator or MigrationCostEstimator()
+        self.delta = float(delta)
+        self.probe_interval_hr = float(probe_interval_hr)
+        self.carbon_price_usd_per_ton = float(carbon_price_usd_per_ton)
+        self.carbon_weight = float(carbon_weight)
+        self._last_probe_t = 0.0
+
+    def _probe_due(self, state: PolicyState) -> bool:
+        return (state.t - self._last_probe_t) >= self.probe_interval_hr - 1e-9
+
+    def _cheapest_od(
+        self,
+        candidates: list[CandidateState],
+        progress: ProgressState,
+        state: PolicyState,
+    ) -> CandidateState | None:
+        """argmin_r C_od(r)*(P-p+d) + E(r) + carbon$(r) over the on-demand candidates."""
+        best: CandidateState | None = None
+        best_cost = math.inf
+        for cand in candidates:
+            if not cand.is_od:
+                continue
+            cost = compute_safety_net_total_cost(
+                ODCandidate(
+                    region=cand.region,
+                    od_price_per_hr=cand.price_per_hr,
+                    migration_cost=cand.migration_cost,
+                    carbon_kg_per_hr=cand.carbon_kg_per_hr,
+                ),
+                progress.remaining_work,
+                state.cold_start_hr,
+                self.carbon_price_usd_per_ton,
+                self.carbon_weight,
+            )
+            if cost < best_cost:
+                best, best_cost = cand, cost
+        return best
+
+    def _safety_net_action(
+        self,
+        state: PolicyState,
+        candidates: list[CandidateState],
+        progress: ProgressState,
+    ) -> Action:
+        threshold = progress.remaining_work + 2 * state.cold_start_hr
+        why = f"safety_net: T-t={progress.remaining_time:.3f} < P-p+2d={threshold:.3f}"
+        best = self._cheapest_od(candidates, progress, state)
+        if best is not None:
+            return Action.launch(best.region, best.mode, f"{why}, cheapest OD {best.region}")
+        fallback = state.current_region or state.r0
+        return Action.launch(
+            fallback, "on_demand", f"{why}, no OD candidates - fallback {fallback} OD"
+        )
+
+    def _decide_ranked(
+        self,
+        state: PolicyState,
+        ranked: list[tuple[CandidateState, float]],
+        probing_due: bool,
+    ) -> Action:
+        probe_note = "; probing triggered" if probing_due else ""
+        if not ranked:
+            return Action.stay(f"no candidates{probe_note}")
+
+        best, best_u = ranked[0]
+        if best.region == state.current_region and best.mode == state.current_mode:
+            return Action.stay(
+                f"already in best {best.region}/{best.mode} U={best_u:.4f}{probe_note}"
+            )
+        if best_u > state.current_utility + self.delta:
+            return Action.launch(
+                best.region,
+                best.mode,
+                f"U_best {best_u:.4f} ({best.region}/{best.mode}) > "
+                f"U_current {state.current_utility:.4f}+delta {self.delta}{probe_note}",
+            )
+        return Action.stay(
+            f"U_best {best_u:.4f} <= U_current {state.current_utility:.4f}"
+            f"+delta {self.delta}, no migration{probe_note}"
+        )
+
+    def rank_and_decide(
+        self,
+        state: PolicyState,
+        candidates: list[CandidateState],
+        progress: ProgressState,
+        v: float,
+    ) -> tuple[list[tuple[CandidateState, float]], Action]:
+        """One Algo 1 step; returns the ranking as well as the chosen action."""
+        ranked = rank_candidates(
+            candidates, v, state.cold_start_hr, self.carbon_price_usd_per_ton, self.carbon_weight
+        )
+
+        probing_due = self._probe_due(state)
+        if probing_due:
+            self._last_probe_t = state.t
+
+        if progress.is_thrifty():
+            return ranked, Action.idle(f"thrifty: p={state.p} >= P={state.P}")
+        if progress.is_safety_net(state.cold_start_hr):
+            return ranked, self._safety_net_action(state, candidates, progress)
+        return ranked, self._decide_ranked(state, ranked, probing_due)
 
     def decide(
         self,
-        candidates: list[ODCandidate],
-        *,
-        now: datetime | None = None,
-    ) -> PolicyDecision:
-        """One policy step given current candidates."""
-        now = now or datetime.now(UTC)
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=UTC)
-        self.progress.t = now
+        state: PolicyState,
+        candidates: list[CandidateState],
+        progress: ProgressState,
+        v: float,
+    ) -> Action:
+        """One Algo 1 step."""
+        return self.rank_and_decide(state, candidates, progress, v)[1]
 
-        if self.progress.is_complete():
-            return PolicyDecision(Action.TERMINATE, reason="progress complete")
 
-        if self.progress.time_left_hours() <= 0:
-            return PolicyDecision(Action.TERMINATE, reason="deadline passed")
-
-        # Probe cadence
-        need_probe = (
-            self.last_probe_at is None
-            or (now - self.last_probe_at) >= timedelta(hours=self.probe_interval_hours)
-        )
-        if need_probe and self.current is None:
-            self.last_probe_at = now
-            ranked = rank_candidates(
-                list(candidates),
-                self.progress,
-                carbon_price_usd_per_ton=self.carbon_price_usd_per_ton,
-            )
-            best = ranked[0] if ranked else None
-            return PolicyDecision(
-                Action.PROBE,
-                target=best,
-                reason="initial / periodic probe",
-                ranked=ranked,
-            )
-
-        ranked = rank_candidates(
-            list(candidates),
-            self.progress,
-            carbon_price_usd_per_ton=self.carbon_price_usd_per_ton,
-        )
-        if not ranked:
-            return PolicyDecision(Action.WAIT, reason="no candidates")
-
-        best = ranked[0]
-
-        # Periodic re-probe
-        if need_probe:
-            self.last_probe_at = now
-            if self.current is not None and best.region != self.current.region:
-                return PolicyDecision(
-                    Action.PROBE,
-                    target=best,
-                    reason="probe interval elapsed; evaluating migrate",
-                    ranked=ranked,
-                )
-
-        # Delta heuristic: migrate if material utility gain
-        if self.current is not None:
-            # Ensure current has utility computed
-            cur_list = rank_candidates(
-                [self.current],
-                self.progress,
-                carbon_price_usd_per_ton=self.carbon_price_usd_per_ton,
-            )
-            cur_u = cur_list[0].utility if cur_list else self.current.utility
-            if best.utility - cur_u > self.delta_utility and (
-                best.region != self.current.region
-                or best.instance_type != self.current.instance_type
-            ):
-                return PolicyDecision(
-                    Action.MIGRATE,
-                    target=best,
-                    reason=f"delta U={best.utility - cur_u:.3f} > {self.delta_utility}",
-                    ranked=ranked,
-                )
-            # At-risk check
-            at_risk = self.tracker.at_risk_set()
-            if (self.current.region, self.current.instance_type) in at_risk:
-                return PolicyDecision(
-                    Action.MIGRATE,
-                    target=best,
-                    reason="current placement at-risk",
-                    ranked=ranked,
-                )
-            # Low survival -> wait or migrate
-            if self.current.survival < 0.3 and best.survival > self.current.survival:
-                return PolicyDecision(
-                    Action.MIGRATE,
-                    target=best,
-                    reason="low survival on current",
-                    ranked=ranked,
-                )
-            return PolicyDecision(
-                Action.RUN,
-                target=self.current,
-                reason="continue current placement",
-                ranked=ranked,
-            )
-
-        # No current placement: run best (or wait if urgency low and prices high)
-        if self.progress.urgency() < 1e-6:
-            return PolicyDecision(Action.WAIT, target=best, reason="no urgency", ranked=ranked)
-
-        return PolicyDecision(Action.RUN, target=best, reason="start best candidate", ranked=ranked)
-
-    def run_loop(
-        self,
-        candidates_fn,
-        *,
-        max_steps: int = 100,
-        step_hours: float = 1.0,
-        work_per_hour: float = 0.05,
-        now: datetime | None = None,
-    ) -> list[PolicyDecision]:
-        """Simulate while p < P with probe every 2h + Delta heuristic.
-
-        candidates_fn(now) -> list[ODCandidate]
-        """
-        t = now or datetime.now(UTC)
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=UTC)
-        decisions: list[PolicyDecision] = []
-        for _ in range(max_steps):
-            if self.progress.is_complete():
-                decisions.append(PolicyDecision(Action.TERMINATE, reason="done"))
-                break
-            cands = list(candidates_fn(t))
-            d = self.decide(cands, now=t)
-            decisions.append(d)
-            if d.action == Action.TERMINATE:
-                break
-            if d.action in (Action.RUN, Action.MIGRATE, Action.PROBE) and d.target is not None:
-                self.current = d.target
-                self.progress.advance(work_per_hour * step_hours, now=t)
-            elif d.action == Action.WAIT:
-                pass
-            t = t + timedelta(hours=step_hours)
-            self.progress.t = t
-        return decisions
+__all__ = ["Action", "ActionKind", "PolicyState", "SkyNomadPolicy"]

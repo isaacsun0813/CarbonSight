@@ -1,8 +1,20 @@
 """
-Carbon intensity providers.
+Carbon intensity providers — one protocol, three sources.
 
-Factory preference (P0 central-credential design):
-  1. CARBONSIGHT_API_URL  -> ApiCarbonProvider  (CLI without personal WattTime creds)
+Every provider answers the same four questions:
+
+    get_forecast(region)                       raw MOER points for one grid region
+    get_moer_lb_per_mwh(wt_regions, s, e)      mixture- and time-weighted MOER
+    get_kg_per_hr(job, wt_regions, s, e)       kgCO2/hr for *this* job's power draw
+    get_cost_per_hr(job, wt_regions, s, e)     the same, dollarised
+
+``wt_regions`` is the ``[(wt_region, weight)]`` mixture from the mapping registry,
+so a cloud region straddling two grids is priced correctly. ``get_kg_per_hr``
+runs the real power model (``estimator/power_model.sample_power_params``), so GPU
+type, GPU count and ``--gpu-util`` all move the number.
+
+Factory preference (central-credential design):
+  1. CARBONSIGHT_API_URL  -> ApiCarbonProvider  (CLI needs no personal creds)
   2. WATTTIME_USERNAME    -> WattTimeCarbonProvider
   3. else                 -> SyntheticCarbonProvider
 """
@@ -10,31 +22,124 @@ Factory preference (P0 central-credential design):
 from __future__ import annotations
 
 import os
+import random
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
 from carbonsight_core.config import Config
-from carbonsight_core.watttime.cache import ForecastCache, get_global_forecast_cache, time_weighted_moer
+from carbonsight_core.estimator.power_model import sample_power_params
+from carbonsight_core.models import JobSpec
+from carbonsight_core.watttime.cache import (
+    ForecastCache,
+    get_global_forecast_cache,
+    mixture_weighted_moer,
+    time_weighted_moer,
+)
 from carbonsight_core.watttime.client import (
+    LB_TO_KG,
     SYNTHETIC_WT_REGIONS,
     WattTimeClient,
     build_synthetic_forecast,
     synthetic_moer_for_region,
 )
 
-# Canonical list of ~17 grid regions used for synthetic rankings / API fallback
+# Canonical list of grid regions used for synthetic rankings / API fallback
 DEFAULT_CARBON_REGIONS: list[str] = list(SYNTHETIC_WT_REGIONS)
+FALLBACK_MOER = 400.0
 
 
 @runtime_checkable
 class CarbonIntensityProvider(Protocol):
-    """Protocol for MOER forecast access."""
+    """Mixture- and job-aware MOER access."""
 
     def get_forecast(self, region: str, *, horizon_hours: int = 24) -> list[dict[str, Any]]:
-        """Return list of {point_time, value} MOER points (lb/MWh)."""
+        """MOER points ``{point_time, value}`` (lb/MWh) for one grid region."""
         ...
+
+    def get_moer_lb_per_mwh(
+        self, wt_regions: list[tuple[str, float]], start: datetime, end: datetime
+    ) -> float:
+        """Mixture-weighted, time-weighted MOER over ``[start, end]``."""
+        ...
+
+    def get_kg_per_hr(
+        self, job: JobSpec, wt_regions: list[tuple[str, float]], start: datetime, end: datetime
+    ) -> float:
+        """kgCO2 per wall-clock hour for this job in this grid mixture."""
+        ...
+
+    def get_cost_per_hr(
+        self,
+        job: JobSpec,
+        wt_regions: list[tuple[str, float]],
+        start: datetime,
+        end: datetime,
+        carbon_price_usd_per_ton: float = 50.0,
+        carbon_weight: float = 1.0,
+    ) -> float:
+        """``get_kg_per_hr`` dollarised at the social cost of carbon."""
+        ...
+
+    def list_regions(self) -> list[str]:
+        """Known grid region codes."""
+        ...
+
+
+def _utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def facility_mwh_per_hr(job: JobSpec, *, seed: int = 0) -> float:
+    """Mean facility MWh drawn per wall-clock hour: P_IT * PUE / 1e6.
+
+    Uses the same power model as the estimator, with a fixed seed so rankings are
+    reproducible. ``job.gpu_utilization`` (``--gpu-util`` / ``--nvidia-smi``) pins
+    the GPU term instead of sampling it.
+    """
+    params = sample_power_params(job, random.Random(seed))
+    return params.p_it_w * params.pue / 1_000_000.0
+
+
+class _ForecastBackedProvider:
+    """Shared mixture/job math; subclasses only supply ``get_forecast``."""
+
+    def get_forecast(self, region: str, *, horizon_hours: int = 24) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def list_regions(self) -> list[str]:
+        return list(DEFAULT_CARBON_REGIONS)
+
+    def get_moer_lb_per_mwh(
+        self, wt_regions: list[tuple[str, float]], start: datetime, end: datetime
+    ) -> float:
+        series = [
+            (points, weight)
+            for points, weight in ((self.get_forecast(r), w) for r, w in wt_regions)
+            if points
+        ]
+        if not series:
+            return FALLBACK_MOER
+        return mixture_weighted_moer(series, _utc(start), _utc(end)) or FALLBACK_MOER
+
+    def get_kg_per_hr(
+        self, job: JobSpec, wt_regions: list[tuple[str, float]], start: datetime, end: datetime
+    ) -> float:
+        moer = self.get_moer_lb_per_mwh(wt_regions, start, end)
+        return facility_mwh_per_hr(job) * moer * LB_TO_KG
+
+    def get_cost_per_hr(
+        self,
+        job: JobSpec,
+        wt_regions: list[tuple[str, float]],
+        start: datetime,
+        end: datetime,
+        carbon_price_usd_per_ton: float = 50.0,
+        carbon_weight: float = 1.0,
+    ) -> float:
+        kg = self.get_kg_per_hr(job, wt_regions, start, end)
+        return kg / 1000.0 * carbon_price_usd_per_ton * carbon_weight
 
     def get_moer(
         self,
@@ -43,16 +148,18 @@ class CarbonIntensityProvider(Protocol):
         lbar_hours: float = 1.0,
         window_start: datetime | None = None,
     ) -> float:
-        """Time-weighted average MOER over [t, t+Lbar]."""
-        ...
-
-    def list_regions(self) -> list[str]:
-        """Known region codes (at least the synthetic 17)."""
-        ...
+        """Single-region convenience: time-weighted MOER over ``[t, t+Lbar]``."""
+        start = _utc(window_start or datetime.now(UTC))
+        end = start + timedelta(hours=max(lbar_hours, 1e-6))
+        return time_weighted_moer(self.get_forecast(region), start, end)
 
 
-class SyntheticCarbonProvider:
-    """Deterministic fake MOER data for tests and no-creds demos."""
+class SyntheticCarbonProvider(_ForecastBackedProvider):
+    """Deterministic per-region MOER curves for tests and no-creds demos.
+
+    Curves differ region to region (see ``synthetic_moer_for_region``) so the
+    carbon lever is visible in the default demo rather than flat everywhere.
+    """
 
     def __init__(self, regions: list[str] | None = None) -> None:
         self._regions = list(regions or DEFAULT_CARBON_REGIONS)
@@ -66,20 +173,6 @@ class SyntheticCarbonProvider:
         self._cache.set(region, pts)
         return pts
 
-    def get_moer(
-        self,
-        region: str,
-        *,
-        lbar_hours: float = 1.0,
-        window_start: datetime | None = None,
-    ) -> float:
-        pts = self.get_forecast(region)
-        start = window_start or datetime.now(UTC)
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=UTC)
-        end = start + timedelta(hours=max(lbar_hours, 1e-6))
-        return time_weighted_moer(pts, start, end)
-
     def list_regions(self) -> list[str]:
         return list(self._regions)
 
@@ -88,8 +181,8 @@ class SyntheticCarbonProvider:
         return synthetic_moer_for_region(region)
 
 
-class WattTimeCarbonProvider:
-    """Direct WattTime access + local ForecastCache. Requires WATTTIME_* env."""
+class WattTimeCarbonProvider(_ForecastBackedProvider):
+    """Direct WattTime access plus a local ForecastCache. Requires WATTTIME_*."""
 
     def __init__(
         self,
@@ -110,28 +203,13 @@ class WattTimeCarbonProvider:
         self._cache.set(region, pts)
         return pts
 
-    def get_moer(
-        self,
-        region: str,
-        *,
-        lbar_hours: float = 1.0,
-        window_start: datetime | None = None,
-    ) -> float:
-        pts = self.get_forecast(region)
-        start = window_start or datetime.now(UTC)
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=UTC)
-        end = start + timedelta(hours=max(lbar_hours, 1e-6))
-        return time_weighted_moer(pts, start, end)
 
-    def list_regions(self) -> list[str]:
-        return list(DEFAULT_CARBON_REGIONS)
+class ApiCarbonProvider(_ForecastBackedProvider):
+    """Proxy forecasts through the CarbonSight API (one central credential).
 
-
-class ApiCarbonProvider:
-    """Proxy carbon forecasts through CarbonSight API (central credential).
-
-    CLI sets CARBONSIGHT_API_URL=http://localhost:8001 — no personal WattTime creds.
+    The CLI sets ``CARBONSIGHT_API_URL=http://localhost:8001`` and needs no
+    WattTime credentials of its own. Falls back to synthetic when the server is
+    unreachable so the CLI degrades instead of failing.
     """
 
     def __init__(
@@ -167,26 +245,12 @@ class ApiCarbonProvider:
                 pts = body
             else:
                 pts = []
-            if not pts:
-                return self._fallback.get_forecast(region, horizon_hours=horizon_hours)
-            self._cache.set(region, pts)
-            return pts
         except Exception:
+            pts = []
+        if not pts:
             return self._fallback.get_forecast(region, horizon_hours=horizon_hours)
-
-    def get_moer(
-        self,
-        region: str,
-        *,
-        lbar_hours: float = 1.0,
-        window_start: datetime | None = None,
-    ) -> float:
-        pts = self.get_forecast(region)
-        start = window_start or datetime.now(UTC)
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=UTC)
-        end = start + timedelta(hours=max(lbar_hours, 1e-6))
-        return time_weighted_moer(pts, start, end)
+        self._cache.set(region, pts)
+        return pts
 
     def list_regions(self) -> list[str]:
         if not self._base:
@@ -196,28 +260,29 @@ class ApiCarbonProvider:
                 r = client.get(f"{self._base}/v1/regions")
                 r.raise_for_status()
                 body = r.json()
-            if isinstance(body, list) and body:
-                # API may return cloud regions or WT regions
-                out: list[str] = []
-                for item in body:
-                    if isinstance(item, str):
-                        out.append(item)
-                    elif isinstance(item, dict):
-                        code = item.get("wt_region") or item.get("region_code") or item.get("region")
-                        if code:
-                            out.append(str(code))
-                return out or self._fallback.list_regions()
+            out: list[str] = []
+            for item in body if isinstance(body, list) else ():
+                if isinstance(item, str):
+                    out.append(item)
+                elif isinstance(item, dict):
+                    code = item.get("wt_region") or item.get("region_code") or item.get("region")
+                    if code:
+                        out.append(str(code))
+            if out:
+                return out
         except Exception:
             pass
         return self._fallback.list_regions()
 
 
 def get_carbon_provider(config: Config | None = None) -> CarbonIntensityProvider:
-    """Factory: CARBONSIGHT_API_URL > WATTTIME_USERNAME > synthetic."""
+    """Factory: CARBONSIGHT_API_URL > WATTTIME_USERNAME/PASSWORD > synthetic."""
     cfg = config or Config.from_env()
-    api_url = cfg.carbonsight_api_url or os.environ.get("CARBONSIGHT_API_URL", "")
-    if api_url.strip():
-        return ApiCarbonProvider(base_url=api_url.strip())
+    api_url = (cfg.carbonsight_api_url or os.environ.get("CARBONSIGHT_API_URL", "")).strip()
+    if api_url:
+        return ApiCarbonProvider(base_url=api_url)
     if cfg.watttime_username and cfg.watttime_password:
-        return WattTimeCarbonProvider(config=cfg, cache=get_global_forecast_cache(cfg.cache_ttl_seconds))
+        return WattTimeCarbonProvider(
+            config=cfg, cache=get_global_forecast_cache(cfg.cache_ttl_seconds)
+        )
     return SyntheticCarbonProvider()

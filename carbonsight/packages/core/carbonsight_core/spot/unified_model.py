@@ -1,142 +1,159 @@
 """
-SkyNomad Sec 4.6 — Unified multi-lever model (cost + carbon + time + availability).
+SkyNomad Sec 4.6 — unified region x mode utility, extended with a carbon lever.
 
-U_s = V * eta - C_total - E / Lbar
+    E        = e * ckpt_gb                       migration cost ($, egress)
+    eta      = max(0, Lbar - d) / Lbar           effectiveness (1 for on-demand)
+    C_total  = price $/hr + carbon $/hr          both levers in one unit
+    U        = V * eta - C_total - E / Lbar      utility, $/hr throughout
 
-where:
-  V(t) = C_od * theta / theta_tilde     value of finishing
-  eta  = instance efficiency (perf / cost proxy)
-  C_total = spot_cost + carbon_dollarized
-  E = eviction_penalty * (1 - survival)
-  Lbar = expected remaining lifetime hours
+``V`` comes from ``ProgressState.future_progress_value``; ``Lbar`` from the
+Nelson-Aalen fit in ``spot/lifetime.py``. On-demand has ``Lbar = inf`` so
+``eta = 1`` and ``E/Lbar = 0``, leaving ``U_od = V - C_total_od``. Idle scores 0,
+which is what makes "wait" a real option rather than a special case.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Literal
 
-from carbonsight_core.providers.spot import StaticSpotPriceProvider
-from carbonsight_core.spot.progress import ProgressState
+from carbonsight_core.spot.progress import carbon_usd_per_hr
 
-# Re-export canonical provider (single definition lives in providers/spot.py)
-__all__ = [
-    "ODCandidate",
-    "StaticSpotPriceProvider",
-    "compute_utility",
-    "rank_candidates",
-    "facility_mwh_for_job",
-]
-
-LB_TO_KG = 0.45359237
-KG_PER_TON = 1000.0
-
-# Default facility power draw proxy (kW) per GPU for tiny carbon estimates
-_DEFAULT_GPU_KW = 0.3
-_DEFAULT_PUE = 1.2
+Mode = Literal["spot", "on_demand", "idle"]
 
 
-@dataclass
-class ODCandidate:
-    """One on-demand/spot placement candidate for joint ranking."""
+@dataclass(frozen=True, slots=True)
+class MigrationCostEstimator:
+    """E = e * ckpt_gb, optionally plus the dollarised carbon of the transfer."""
+
+    egress_usd_per_gb: float = 0.02
+    egress_carbon_kg_per_gb: float = 0.0
+    carbon_price_usd_per_ton: float = 50.0
+    carbon_weight: float = 1.0
+
+    def estimate(self, ckpt_size_gb: float) -> float:
+        if ckpt_size_gb <= 0:
+            return 0.0
+        return self.egress_usd_per_gb * ckpt_size_gb + carbon_usd_per_hr(
+            self.egress_carbon_kg_per_gb * ckpt_size_gb,
+            self.carbon_price_usd_per_ton,
+            self.carbon_weight,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateState:
+    """One region x mode option. Prices are totals for the job's GPU count."""
 
     region: str
-    instance_type: str
-    spot_price: float  # USD per GPU-hour
-    moer: float  # lb CO2 / MWh (time-weighted over Lbar)
-    survival: float = 0.9
-    lbar: float = 12.0  # expected remaining hours
-    on_demand_price: float | None = None  # USD per GPU-hour; default spot/0.35
-    gpu_count: int = 1
-    efficiency: float = 1.0  # eta
-    notes: list[str] = field(default_factory=list)
+    mode: Mode
+    mean_lifetime_hr: float
+    price_per_hr: float
+    carbon_kg_per_hr: float
+    migration_cost: float = 0.0
 
-    # Filled by compute_utility
-    utility: float = 0.0
-    c_total: float = 0.0
-    carbon_kg: float = 0.0
-    value_v: float = 0.0
+    @property
+    def is_spot(self) -> bool:
+        return self.mode == "spot"
 
+    @property
+    def is_od(self) -> bool:
+        return self.mode == "on_demand"
 
-def facility_mwh_for_job(
-    *,
-    gpu_count: int,
-    lbar_hours: float,
-    gpu_kw: float = _DEFAULT_GPU_KW,
-    pue: float = _DEFAULT_PUE,
-) -> float:
-    """Rough facility MWh over remaining lifetime: kW * h * PUE / 1000."""
-    return max(0.0, gpu_count * gpu_kw * lbar_hours * pue / 1000.0)
+    @property
+    def is_idle(self) -> bool:
+        return self.mode == "idle"
 
 
-def compute_utility(
-    cand: ODCandidate,
-    progress: ProgressState,
-    *,
+def total_cost_per_hr(
+    price_per_hr: float,
+    carbon_kg_per_hr: float,
     carbon_price_usd_per_ton: float = 50.0,
     carbon_weight: float = 1.0,
-    eviction_penalty: float = 50.0,
-    theta_tilde: float | None = None,
-    gpu_kw: float = _DEFAULT_GPU_KW,
-    pue: float = _DEFAULT_PUE,
 ) -> float:
-    """Compute U_s for one candidate and mutate cand with intermediates."""
-    theta = progress.theta()
-    # Baseline rate: finish remaining work over full original deadline window proxy
-    if theta_tilde is None or theta_tilde <= 0:
-        # Use a gentle baseline so V stays well-scaled
-        theta_tilde = max(theta, 1e-6) * 0.5 if theta > 0 else 1e-3
-        theta_tilde = max(theta_tilde, 1e-6)
-
-    c_od = cand.on_demand_price
-    if c_od is None or c_od <= 0:
-        # Invert default spot fraction 0.35
-        c_od = cand.spot_price / 0.35 if cand.spot_price > 0 else 1.0
-
-    # V(t) = C_od * theta / theta_tilde  (value of finishing under urgency)
-    v = c_od * (theta / theta_tilde)
-    eta = max(cand.efficiency, 1e-9)
-    lbar = max(cand.lbar, 1e-6)
-
-    # Spot compute cost over expected remaining
-    spot_cost = cand.spot_price * cand.gpu_count * lbar
-
-    # Carbon kg = MWh * MOER_lb * lb_to_kg
-    mwh = facility_mwh_for_job(
-        gpu_count=cand.gpu_count, lbar_hours=lbar, gpu_kw=gpu_kw, pue=pue
+    """C_total = compute $/hr + carbon $/hr."""
+    return price_per_hr + carbon_usd_per_hr(
+        carbon_kg_per_hr, carbon_price_usd_per_ton, carbon_weight
     )
-    carbon_kg = mwh * cand.moer * LB_TO_KG
-    carbon_usd = (carbon_kg / KG_PER_TON) * carbon_price_usd_per_ton * carbon_weight
 
-    c_total = spot_cost + carbon_usd
 
-    # Eviction penalty scaled by failure probability, amortized by Lbar
-    e = eviction_penalty * (1.0 - max(0.0, min(1.0, cand.survival)))
-    u = v * eta - c_total - (e / lbar)
+def effectiveness(mean_lifetime_hr: float, cold_start_hr: float) -> float:
+    """eta = max(0, Lbar - d) / Lbar — the fraction of a lifetime spent working."""
+    if math.isinf(mean_lifetime_hr):
+        return 1.0
+    if mean_lifetime_hr <= 1e-12:
+        return 0.0
+    return max(0.0, (mean_lifetime_hr - cold_start_hr) / mean_lifetime_hr)
 
-    cand.utility = u
-    cand.c_total = c_total
-    cand.carbon_kg = carbon_kg
-    cand.value_v = v
-    return u
+
+def utility(
+    v: float,
+    eta: float,
+    c_total_per_hr: float,
+    migration_cost: float,
+    mean_lifetime_hr: float,
+) -> float:
+    """U = V*eta - C_total - E/Lbar, all in $/hr."""
+    if math.isinf(v):
+        return math.inf if eta > 0 else -math.inf
+    if math.isinf(mean_lifetime_hr):
+        amortized = 0.0
+    elif mean_lifetime_hr > 1e-12:
+        amortized = migration_cost / mean_lifetime_hr
+    else:
+        return -math.inf
+    return v * eta - c_total_per_hr - amortized
+
+
+def candidate_utility(
+    candidate: CandidateState,
+    v: float,
+    cold_start_hr: float,
+    carbon_price_usd_per_ton: float = 50.0,
+    carbon_weight: float = 1.0,
+) -> float:
+    """U for one candidate; idle is the zero baseline."""
+    if candidate.is_idle:
+        return 0.0
+    return utility(
+        v,
+        effectiveness(candidate.mean_lifetime_hr, cold_start_hr),
+        total_cost_per_hr(
+            candidate.price_per_hr,
+            candidate.carbon_kg_per_hr,
+            carbon_price_usd_per_ton,
+            carbon_weight,
+        ),
+        candidate.migration_cost,
+        candidate.mean_lifetime_hr,
+    )
 
 
 def rank_candidates(
-    candidates: list[ODCandidate],
-    progress: ProgressState,
-    *,
+    candidates: Iterable[CandidateState],
+    v: float,
+    cold_start_hr: float,
     carbon_price_usd_per_ton: float = 50.0,
     carbon_weight: float = 1.0,
-    eviction_penalty: float = 50.0,
-    theta_tilde: float | None = None,
-) -> list[ODCandidate]:
-    """Rank candidates by U_s descending (higher is better)."""
-    for c in candidates:
-        compute_utility(
-            c,
-            progress,
-            carbon_price_usd_per_ton=carbon_price_usd_per_ton,
-            carbon_weight=carbon_weight,
-            eviction_penalty=eviction_penalty,
-            theta_tilde=theta_tilde,
-        )
-    return sorted(candidates, key=lambda c: c.utility, reverse=True)
+) -> list[tuple[CandidateState, float]]:
+    """``(candidate, U)`` sorted best-first."""
+    scored = [
+        (c, candidate_utility(c, v, cold_start_hr, carbon_price_usd_per_ton, carbon_weight))
+        for c in candidates
+    ]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return scored
+
+
+__all__ = [
+    "CandidateState",
+    "MigrationCostEstimator",
+    "Mode",
+    "candidate_utility",
+    "effectiveness",
+    "rank_candidates",
+    "total_cost_per_hr",
+    "utility",
+]

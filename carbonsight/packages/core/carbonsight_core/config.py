@@ -22,6 +22,8 @@ class Config:
     cache_ttl_seconds: int = 900
     # Social cost of carbon used to dollarize emissions in joint ranking
     carbon_price_usd_per_ton: float = 50.0
+    # Postgres DSN for the persistent grid_signal_cache (API + worker)
+    database_url: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -40,6 +42,9 @@ class Config:
             carbonsight_api_url=os.environ.get("CARBONSIGHT_API_URL", "").rstrip("/"),
             cache_ttl_seconds=int(os.environ.get("CACHE_TTL_SECONDS", "900")),
             carbon_price_usd_per_ton=float(os.environ.get("CARBON_PRICE_USD_PER_TON", "50")),
+            database_url=(
+                os.environ.get("DATABASE_URL") or os.environ.get("CARBONSIGHT_DB_URL") or ""
+            ),
         )
 
 

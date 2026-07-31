@@ -46,6 +46,20 @@ class JobSpec(BaseModel):
         ge=0,
         description="Social cost of carbon ($/metric ton) for joint U ranking.",
     )
+    carbon_weight: float = Field(
+        1.0,
+        ge=0,
+        description="Lambda weight on the carbon lever relative to dollars.",
+    )
+    progress_hours_done: float = Field(
+        0.0,
+        ge=0,
+        description="Compute-hours already completed (p in the deadline-pressure model).",
+    )
+    current_region: str = Field(
+        "",
+        description="Region holding the current checkpoint (r0); migration cost is 0 for it.",
+    )
 
     @field_validator("gpu_utilization")
     @classmethod

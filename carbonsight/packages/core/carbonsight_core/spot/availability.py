@@ -1,128 +1,250 @@
 """
-SkyNomad Sec 4.3 — Spot availability tracking.
+SkyNomad Sec 4.3 — spot availability probing.
 
-Track eviction observations per (region, instance_type). Availability =
-1 - eviction_rate over the observation window.
+A probe returns 1 (spot available / a request would succeed) or 0. From a probe
+trace we recover *virtual instances*:
+
+    0 -> 1                    starts one at the timestamp of the 1
+    1 -> 0                    ends it at the timestamp of the 0, "preemption"
+    trace ends while 1        ends it at the last observation, "censored"
+
+Censored instances are right-censored observations for the Nelson-Aalen fit in
+``spot/lifetime.py``. Timestamps are ``datetime`` throughout (naive values are
+read as UTC); lifetimes are reported in hours to match the rest of the scheduler.
+
+Pure Python — no boto3, no network.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from typing import Iterable
+import hashlib
+import random
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
+
+EndReason = Literal["preemption", "censored"]
+
+
+def _as_utc(t: datetime) -> datetime:
+    if not isinstance(t, datetime):
+        raise TypeError(f"timestamp must be a datetime, got {type(t).__name__}")
+    return t if t.tzinfo is not None else t.replace(tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)
 class SpotObservation:
-    """One observed spot lifecycle event."""
+    """One probe result: outcome 1 = spot available, 0 = unavailable."""
 
+    t: datetime
     region: str
-    instance_type: str
-    timestamp: datetime
-    evicted: bool
+    outcome: int
+
+    def __post_init__(self) -> None:
+        if self.outcome not in (0, 1):
+            raise ValueError(f"outcome must be 0 or 1, got {self.outcome!r}")
+        if not isinstance(self.region, str) or not self.region:
+            raise ValueError("region must be a non-empty string")
+        object.__setattr__(self, "t", _as_utc(self.t))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"t": self.t.isoformat(), "region": self.region, "outcome": self.outcome}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> SpotObservation:
+        return cls(t=datetime.fromisoformat(d["t"]), region=d["region"], outcome=int(d["outcome"]))
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class VirtualInstance:
-    """A logical spot capacity unit being tracked."""
+    """An inferred spot opportunity: [start_t, end_t] plus how it ended."""
 
+    id: str
     region: str
-    instance_type: str
-    launched_at: datetime
-    instance_id: str = ""
-    alive: bool = True
-    evicted_at: datetime | None = None
+    start_t: datetime
+    end_t: datetime
+    end_reason: EndReason
 
-    def mark_evicted(self, when: datetime | None = None) -> SpotObservation:
-        self.alive = False
-        self.evicted_at = when or datetime.now(UTC)
-        return SpotObservation(
-            region=self.region,
-            instance_type=self.instance_type,
-            timestamp=self.evicted_at,
-            evicted=True,
-        )
+    def __post_init__(self) -> None:
+        if self.end_reason not in ("preemption", "censored"):
+            raise ValueError(f"end_reason must be preemption|censored, got {self.end_reason!r}")
+        object.__setattr__(self, "start_t", _as_utc(self.start_t))
+        object.__setattr__(self, "end_t", _as_utc(self.end_t))
 
+    @property
+    def lifetime_hours(self) -> float:
+        return (self.end_t - self.start_t).total_seconds() / 3600.0
 
-@dataclass
-class AvailabilityTracker:
-    """dict[(region, instance_type)] -> list[SpotObservation]."""
+    @property
+    def preempted(self) -> bool:
+        return self.end_reason == "preemption"
 
-    observations: dict[tuple[str, str], list[SpotObservation]] = field(default_factory=dict)
-    virtual_instances: list[VirtualInstance] = field(default_factory=list)
-
-    def _key(self, region: str, instance_type: str) -> tuple[str, str]:
-        return (region, instance_type)
-
-    def add_observation(self, obs: SpotObservation) -> None:
-        key = self._key(obs.region, obs.instance_type)
-        self.observations.setdefault(key, []).append(obs)
-
-    def record(
-        self,
-        region: str,
-        instance_type: str,
-        *,
-        evicted: bool,
-        timestamp: datetime | None = None,
-    ) -> SpotObservation:
-        obs = SpotObservation(
-            region=region,
-            instance_type=instance_type,
-            timestamp=timestamp or datetime.now(UTC),
-            evicted=evicted,
-        )
-        self.add_observation(obs)
-        return obs
-
-    def get_observations(self, region: str, instance_type: str) -> list[SpotObservation]:
-        return list(self.observations.get(self._key(region, instance_type), []))
-
-    def eviction_rate(self, region: str, instance_type: str) -> float:
-        obs = self.get_observations(region, instance_type)
-        if not obs:
-            return 0.0
-        evicted = sum(1 for o in obs if o.evicted)
-        return evicted / len(obs)
-
-    def get_availability(self, region: str, instance_type: str) -> float:
-        """Availability ≈ 1 - eviction_rate. Clamped to [0, 1]."""
-        rate = self.eviction_rate(region, instance_type)
-        return max(0.0, min(1.0, 1.0 - rate))
-
-    def at_risk_set(self, *, min_eviction_rate: float = 0.3) -> set[tuple[str, str]]:
-        """Pairs currently considered at-risk based on eviction rate."""
-        at_risk: set[tuple[str, str]] = set()
-        for key, obs in self.observations.items():
-            if not obs:
-                continue
-            rate = sum(1 for o in obs if o.evicted) / len(obs)
-            if rate >= min_eviction_rate:
-                at_risk.add(key)
-        return at_risk
-
-    def eviction_counts(self) -> dict[tuple[str, str], int]:
+    def to_dict(self) -> dict[str, Any]:
         return {
-            key: sum(1 for o in obs if o.evicted) for key, obs in self.observations.items()
+            "id": self.id,
+            "region": self.region,
+            "start_t": self.start_t.isoformat(),
+            "end_t": self.end_t.isoformat(),
+            "end_reason": self.end_reason,
         }
 
-    def seed_defaults(
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> VirtualInstance:
+        return cls(
+            id=d["id"],
+            region=d["region"],
+            start_t=datetime.fromisoformat(d["start_t"]),
+            end_t=datetime.fromisoformat(d["end_t"]),
+            end_reason=d["end_reason"],
+        )
+
+
+class AvailabilityTracker:
+    """Per-region probe log; turns probe traces into virtual instances."""
+
+    def __init__(self, observations: Iterable[SpotObservation] | None = None) -> None:
+        self._by_region: dict[str, list[SpotObservation]] = {}
+        self._n = 0
+        for obs in observations or ():
+            self.record_observation(obs)
+
+    def record_observation(
         self,
-        pairs: Iterable[tuple[str, str]],
-        *,
-        default_availability: float = 0.85,
-        n: int = 20,
+        t_or_obs: SpotObservation | datetime,
+        region: str | None = None,
+        outcome: int | None = None,
     ) -> None:
-        """Seed synthetic observations so ranking works without live history."""
-        # availability = 1 - eviction_rate => eviction_rate = 1 - avail
-        er = max(0.0, min(1.0, 1.0 - default_availability))
-        n_evicted = int(round(er * n))
-        now = datetime.now(UTC)
-        for region, itype in pairs:
-            for i in range(n):
-                self.record(
-                    region,
-                    itype,
-                    evicted=(i < n_evicted),
-                    timestamp=now,
+        """Record a probe, either as a ``SpotObservation`` or as ``(t, region, outcome)``."""
+        if isinstance(t_or_obs, SpotObservation):
+            if region is not None or outcome is not None:
+                raise ValueError("pass either a SpotObservation or (t, region, outcome), not both")
+            obs = t_or_obs
+        else:
+            if region is None or outcome is None:
+                raise ValueError("region and outcome are required when passing a timestamp")
+            obs = SpotObservation(t=t_or_obs, region=region, outcome=outcome)
+        self._by_region.setdefault(obs.region, []).append(obs)
+        self._n += 1
+
+    def regions(self) -> list[str]:
+        return sorted(self._by_region)
+
+    def get_observations(self, region: str | None = None) -> list[SpotObservation]:
+        """Observations sorted by time; all regions (region-then-time) when omitted."""
+        if region is not None:
+            return sorted(self._by_region.get(region, ()), key=lambda o: o.t)
+        return [o for reg in self.regions() for o in self.get_observations(reg)]
+
+    def extract_virtual_instances(self, region: str | None = None) -> list[VirtualInstance]:
+        """Walk each region's probe trace and emit its virtual instances in order."""
+        out: list[VirtualInstance] = []
+        for reg in [region] if region is not None else self.regions():
+            obs_list = self.get_observations(reg)
+            if not obs_list:
+                continue
+            start: datetime | None = None
+            prev: int | None = None
+            for obs in obs_list:
+                if obs.outcome == 1 and prev != 1:
+                    start = obs.t
+                elif obs.outcome == 0 and prev == 1 and start is not None:
+                    out.append(
+                        VirtualInstance(
+                            id=f"{reg}-{len(out) + 1}",
+                            region=reg,
+                            start_t=start,
+                            end_t=obs.t,
+                            end_reason="preemption",
+                        )
+                    )
+                    start = None
+                prev = obs.outcome
+            if start is not None:
+                out.append(
+                    VirtualInstance(
+                        id=f"{reg}-{len(out) + 1}",
+                        region=reg,
+                        start_t=start,
+                        end_t=obs_list[-1].t,
+                        end_reason="censored",
+                    )
                 )
+        return out
+
+    def observed_lifetimes(self, region: str | None = None) -> list[tuple[float, bool]]:
+        """``(lifetime_hours, preempted)`` pairs, ready for ``LifetimeStats``."""
+        return [(vi.lifetime_hours, vi.preempted) for vi in self.extract_virtual_instances(region)]
+
+    def is_available(self, region: str, at: datetime) -> bool:
+        """True iff the latest probe at or before ``at`` returned 1."""
+        at = _as_utc(at)
+        last: SpotObservation | None = None
+        for obs in self.get_observations(region):
+            if obs.t > at:
+                break
+            last = obs
+        return last is not None and last.outcome == 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"observations": [o.to_dict() for o in self.get_observations()]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AvailabilityTracker:
+        return cls(SpotObservation.from_dict(o) for o in data.get("observations", ()))
+
+    def clear(self) -> None:
+        self._by_region.clear()
+        self._n = 0
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __repr__(self) -> str:
+        return f"AvailabilityTracker(n_obs={self._n}, regions={self.regions()})"
+
+
+def synthetic_uptime(region: str, *, low: float = 0.45, high: float = 0.95) -> float:
+    """Deterministic per-region spot uptime in [low, high], derived from the region name.
+
+    Stand-in for real probe telemetry so lifetimes vary across regions before a
+    ledger exists; superseded by ``AvailabilityTracker`` data as soon as there is any.
+    """
+    h = int(hashlib.md5(region.encode("utf-8")).hexdigest()[:8], 16)
+    return low + (high - low) * ((h % 1000) / 999.0)
+
+
+def synthetic_probe_trace(
+    region: str,
+    *,
+    start: datetime | None = None,
+    hours: float = 168.0,
+    step_hours: float = 1.0,
+    uptime: float | None = None,
+) -> list[SpotObservation]:
+    """Deterministic Bernoulli probe trace for ``region`` on a fixed hourly grid.
+
+    Hourly steps keep inferred lifetimes on an integer-hour grid, which is what
+    the discrete Nelson-Aalen sum in ``spot/lifetime.py`` assumes.
+    """
+    t0 = _as_utc(start or datetime(2026, 1, 1, tzinfo=UTC))
+    p_up = synthetic_uptime(region) if uptime is None else uptime
+    rng = random.Random(int(hashlib.md5(region.encode("utf-8")).hexdigest()[:8], 16))
+    n = max(1, int(hours / step_hours))
+    return [
+        SpotObservation(
+            t=t0 + timedelta(hours=step_hours * i),
+            region=region,
+            outcome=1 if rng.random() < p_up else 0,
+        )
+        for i in range(n)
+    ]
+
+
+__all__ = [
+    "AvailabilityTracker",
+    "SpotObservation",
+    "VirtualInstance",
+    "synthetic_probe_trace",
+    "synthetic_uptime",
+]
