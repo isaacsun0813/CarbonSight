@@ -93,6 +93,13 @@ Relevant code:
 
 - CLI implementation: `carbonsight/apps/cli/carbonsight_cli/commands/mappings.py`
 
+### 4b) Refresh WattTime mappings (`carbonsight mappings refresh`)
+
+- **Input**: mapping registry JSON (default seeded file, or `--registry`); requires WattTime credentials
+- **Behavior**: calls `region-from-loc` per site, rebuilds `wt_regions` (including mixtures), sets `last_verified_at` and `s_recency` on success
+- **Default**: dry-run (prints per-region diffs only)
+- **`--write`**: persist JSON to `--registry` path or `--out` (refuses to overwrite bundled `seed_registry.json` without `--out`)
+
 ### 5) Backtest harness (`carbonsight backtest run`)
 
 - **Purpose**: a reproducible synthetic experiment that reports:

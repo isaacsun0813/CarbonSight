@@ -1,4 +1,4 @@
-"""CarbonSight CLI entrypoint. Commands: advise, train, run, history, report, dashboard, mappings validate, backtest run."""
+"""CarbonSight CLI entrypoint. Commands: advise, train, run, history, report, dashboard, mappings validate/refresh, backtest run."""
 
 import typer
 
