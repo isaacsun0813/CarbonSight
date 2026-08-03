@@ -25,7 +25,6 @@ from carbonsight_core.spot.progress import (
     ProgressState,
     carbon_usd_per_hr,
     compute_safety_net_total_cost,
-    select_cheapest_od_region,
 )
 from carbonsight_core.spot.unified_model import (
     CandidateState,
@@ -63,7 +62,6 @@ __all__ = [
     "expected_remaining",
     "predict_remaining_lifetime",
     "rank_candidates",
-    "select_cheapest_od_region",
     "synthetic_probe_trace",
     "synthetic_uptime",
     "total_cost_per_hr",

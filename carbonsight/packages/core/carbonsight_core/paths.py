@@ -1,9 +1,24 @@
-"""Locate packaged files (registry JSON) from CLI cwd and package root."""
+"""Locate packaged files (registry JSON) from the installed package, cwd, or source tree."""
 
+from importlib import resources
 from pathlib import Path
 
 # Under `carbonsight/` repo (sibling to `apps/`, `packages/`)
 REGISTRY_JSON_SEGMENTS = ("packages", "core", "carbonsight_core", "mapping", "seed_registry.json")
+
+
+def packaged_registry_json_file() -> Path | None:
+    """The registry as shipped inside the installed ``carbonsight_core`` package.
+
+    Every other lookup here is relative to the *source* layout, so an installed
+    wheel could not find the file even though the wheel contains it.
+    """
+    try:
+        candidate = resources.files("carbonsight_core") / "mapping" / "seed_registry.json"
+        path = Path(str(candidate))
+    except (ModuleNotFoundError, TypeError, AttributeError):
+        return None
+    return path if path.is_file() else None
 
 
 def registry_json_path(carbonsight_package_root: Path) -> Path:
@@ -26,11 +41,13 @@ def resolve_registry_json_file(
     candidate = explicit_path or default
     if candidate.exists():
         return candidate
+    packaged = packaged_registry_json_file()
     for fallback in (
         cwd.joinpath("carbonsight", *REGISTRY_JSON_SEGMENTS),
         cwd.joinpath(*REGISTRY_JSON_SEGMENTS),
+        packaged,
     ):
-        if fallback.exists():
+        if fallback is not None and fallback.exists():
             return fallback
     return candidate
 

@@ -6,7 +6,8 @@ WORKDIR /app
 COPY packages/core /app/packages/core
 COPY apps/api /app/apps/api
 COPY apps/worker /app/apps/worker
-COPY pyproject.toml /app/
+# pyproject declares readme = "README.md"; without it `pip install -e .` fails.
+COPY pyproject.toml README.md /app/
 
 RUN pip install --no-cache-dir -e ".[api]" && \
     pip install uvicorn[standard]

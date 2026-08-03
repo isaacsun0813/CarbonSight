@@ -46,7 +46,7 @@ uv run uvicorn carbonsight_api.main:app --host 0.0.0.0 --port 8001
 |----------|--------|
 | `GET /v1/carbon/forecast?region=CAISO_NORTH` | Cached MOER series |
 | `GET /v1/regions` | Cloud/grid regions (non-empty) |
-| `GET /v1/recommendations` | **17** ranked rows (synthetic OK) |
+| `GET /v1/recommendations` | `{action, decision, value_v, deadline_passed, regions}` — one row per mapped region (21 today), greenest first |
 
 Docker: `infra/docker/docker-compose.yml` (API **:8001**, worker, Postgres `grid_signal_cache`).
 

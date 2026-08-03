@@ -4,6 +4,7 @@ Per design: carbon savings %, cost savings %, regret, rank accuracy (top-1, top-
 MVP: synthetic MOER and cost series in-memory; no parquet required.
 """
 
+import hashlib
 import random
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -29,16 +30,27 @@ class BacktestResult:
     details: list[dict] = field(default_factory=list)
 
 
+
+def _region_seed(region: str) -> int:
+    """Stable per-region offset.
+
+    ``hash(str)`` is salted per process, so the same seed gave different results
+    across runs: carbon savings moved from -10.4 to -50.7 purely with
+    PYTHONHASHSEED.
+    """
+    return int(hashlib.md5(region.encode("utf-8")).hexdigest()[:8], 16)
+
+
 def _synthetic_moer(region: str, t: datetime, seed: int) -> float:
     """Synthetic MOER (lb/MWh) per region and time for reproducibility."""
-    r = random.Random(seed + hash(region) + t.date().toordinal())
+    r = random.Random(seed + _region_seed(region) + t.date().toordinal())
     base = {"eu-north-1": 180, "us-east-1": 420}.get(region, 350)
     return base + r.gauss(0, 40)
 
 
 def _synthetic_price(region: str, t: datetime, seed: int) -> float:
     """Synthetic $/hr per region and time."""
-    r = random.Random(seed + hash(region) + t.date().toordinal())
+    r = random.Random(seed + _region_seed(region) + t.date().toordinal())
     base = {"eu-north-1": 3.2, "us-east-1": 2.8}.get(region, 3.0)
     return max(0.5, base + r.gauss(0, 0.3))
 

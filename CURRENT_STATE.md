@@ -31,7 +31,7 @@ Key behavior from the code:
   - `--nvidia-smi` (samples local `nvidia-smi` utilization)
   - YAML `carbonsight.gpu_utilization`
 - **Registry required**: the CLI loads a mapping registry JSON (defaults to a seeded file if present).
-- **Credentials required for recommendations**: if WattTime credentials aren’t in env, the CLI prints an empty list (`--json`) or a message.
+- **Credentials for `advise`**: without `WATTTIME_*` *and* without `CARBONSIGHT_API_URL` the CLI prints `[]` (`--json`) or a message. With `CARBONSIGHT_API_URL` set it uses the API's central cache and needs no personal credentials.
 
 Relevant code:
 
@@ -111,7 +111,10 @@ The API mirrors the CLI “advise” flow and exposes minimal endpoints.
   - `uvicorn carbonsight_api.main:app --reload`
 - **Endpoints**:
   - `GET /health`
-  - `POST /v1/recommendations`: ranks regions like `carbonsight advise` (requires WattTime env vars; returns `[]` without them)
+  - `POST /v1/recommendations`: returns `{action, decision, value_v, deadline_passed, regions}`.
+    `action` is `rank` | `thrifty` | `safety_net` | `empty`, and `decision` is the
+    SkyNomadPolicy output — a job past its deadline is told to go on-demand rather than
+    handed spot rows. Works without WattTime credentials (synthetic MOER).
   - `GET /v1/regions`: returns regions from the registry plus confidence + WattTime mixture weights
   - `POST /v1/mappings/revalidate`: currently a stub trigger message (no worker wired)
   - `POST /v1/runs` / `GET /v1/runs/{run_id}`: in-memory “runs store” (no Postgres wired yet)

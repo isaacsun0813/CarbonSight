@@ -27,7 +27,7 @@ from pathlib import Path
 
 from carbonsight_core.mapping.registry import Registry, mapping_confidence
 from carbonsight_core.models import EstimateResult, JobSpec
-from carbonsight_core.paths import registry_json_path
+from carbonsight_core.paths import packaged_registry_json_file, registry_json_path
 from carbonsight_core.providers.carbon import CarbonIntensityProvider, get_carbon_provider
 from carbonsight_core.providers.spot import (
     SpotPriceProvider,
@@ -102,7 +102,11 @@ def default_registry() -> Registry | None:
     """Load the packaged seed registry; ``None`` when it is not on disk."""
     path = registry_json_path(Path(__file__).resolve().parents[4])
     if not path.exists():
-        return None
+        # Installed wheel: the source-relative walk above does not exist there.
+        packaged = packaged_registry_json_file()
+        if packaged is None:
+            return None
+        path = packaged
     reg = Registry()
     reg.load_json(path)
     return reg

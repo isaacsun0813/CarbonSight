@@ -26,7 +26,6 @@ Carbon is dollarised the same way everywhere: kg/hr / 1000 * $/ton * weight.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
 from dataclasses import dataclass
 
 
@@ -144,28 +143,9 @@ def compute_safety_net_total_cost(
     return per_hr * duration + candidate.migration_cost
 
 
-def select_cheapest_od_region(
-    candidates: Iterable[ODCandidate],
-    remaining_work: float,
-    cold_start_hr: float,
-    carbon_price_usd_per_ton: float = 50.0,
-    carbon_weight: float = 1.0,
-) -> tuple[ODCandidate, float] | None:
-    """argmin_r total cost to finish on on-demand. None when there are no candidates."""
-    best: tuple[ODCandidate, float] | None = None
-    for cand in candidates:
-        cost = compute_safety_net_total_cost(
-            cand, remaining_work, cold_start_hr, carbon_price_usd_per_ton, carbon_weight
-        )
-        if best is None or cost < best[1]:
-            best = (cand, cost)
-    return best
-
-
 __all__ = [
     "ODCandidate",
     "ProgressState",
     "carbon_usd_per_hr",
     "compute_safety_net_total_cost",
-    "select_cheapest_od_region",
 ]

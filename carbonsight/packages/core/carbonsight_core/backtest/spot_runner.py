@@ -57,6 +57,7 @@ from carbonsight_core.spot.unified_model import (
     CandidateState,
     MigrationCostEstimator,
     candidate_utility,
+    total_cost_per_hr,
 )
 
 DEFAULT_REGIONS = [
@@ -368,7 +369,13 @@ def _run_skynomad(
             )
         candidates.append(CandidateState("idle", "idle", 0.0, 0.0, 0.0, 0.0))
 
-        c_od_min = min(prices[r][1] for r in regions)
+        # Same definition as scheduler_service: the cheapest on-demand *total*,
+        # carbon included. Omitting carbon here made the anchor diverge from the
+        # scheduler's as soon as the carbon price rose above zero.
+        c_od_min = min(
+            total_cost_per_hr(prices[r][1], carbon[r], carbon_price, carbon_weight)
+            for r in regions
+        )
         value_v = progress.future_progress_value(c_od_min)
 
         # Utility of staying put, for the delta rule. Unavailable spot means the
@@ -611,6 +618,7 @@ AGGREGATED_METRICS = (
     "idle_hours_mean",
     "carbon_kg_mean",
     "up_multi_carbon_kg_mean",
+    "up_single_rotating_cost_mean",
 )
 
 
