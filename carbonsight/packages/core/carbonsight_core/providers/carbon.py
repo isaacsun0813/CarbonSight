@@ -54,8 +54,18 @@ FALLBACK_MOER = 400.0
 class CarbonIntensityProvider(Protocol):
     """Mixture- and job-aware MOER access."""
 
-    def get_forecast(self, region: str, *, horizon_hours: int = 24) -> list[dict[str, Any]]:
-        """MOER points ``{point_time, value}`` (lb/MWh) for one grid region."""
+    def get_forecast(
+        self,
+        region: str,
+        *,
+        horizon_hours: int = 24,
+        anchor: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """MOER points ``{point_time, value}`` (lb/MWh) for one grid region.
+
+        ``anchor`` is the window start. Live providers ignore it; synthetic
+        curves anchor on it so results do not drift with the calendar.
+        """
         ...
 
     def get_moer_lb_per_mwh(
@@ -111,9 +121,20 @@ def facility_mwh_per_hr(job: JobSpec, *, samples: int = 64, seed: int = 0) -> fl
 
 
 class _ForecastBackedProvider:
-    """Shared mixture/job math; subclasses only supply ``get_forecast``."""
+    """Shared mixture/job math; subclasses only supply ``get_forecast``.
 
-    def get_forecast(self, region: str, *, horizon_hours: int = 24) -> list[dict[str, Any]]:
+    ``anchor`` is the start of the window being asked about. Live providers
+    ignore it — they return whatever the grid actually reported. Synthetic
+    curves anchor on it so a query is reproducible on any calendar date.
+    """
+
+    def get_forecast(
+        self,
+        region: str,
+        *,
+        horizon_hours: int = 24,
+        anchor: datetime | None = None,
+    ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
     def list_regions(self) -> list[str]:
@@ -122,9 +143,10 @@ class _ForecastBackedProvider:
     def get_moer_lb_per_mwh(
         self, wt_regions: list[tuple[str, float]], start: datetime, end: datetime
     ) -> float:
+        anchor = _utc(start)
         series = [
             (points, weight)
-            for points, weight in ((self.get_forecast(r), w) for r, w in wt_regions)
+            for points, weight in ((self.get_forecast(r, anchor=anchor), w) for r, w in wt_regions)
             if points
         ]
         if not series:
@@ -159,7 +181,7 @@ class _ForecastBackedProvider:
         """Single-region convenience: time-weighted MOER over ``[t, t+Lbar]``."""
         start = _utc(window_start or datetime.now(UTC))
         end = start + timedelta(hours=max(lbar_hours, 1e-6))
-        return time_weighted_moer(self.get_forecast(region), start, end)
+        return time_weighted_moer(self.get_forecast(region, anchor=start), start, end)
 
 
 class SyntheticCarbonProvider(_ForecastBackedProvider):
@@ -173,12 +195,21 @@ class SyntheticCarbonProvider(_ForecastBackedProvider):
         self._regions = list(regions or DEFAULT_CARBON_REGIONS)
         self._cache = ForecastCache()
 
-    def get_forecast(self, region: str, *, horizon_hours: int = 24) -> list[dict[str, Any]]:
-        cached = self._cache.get(region)
+    def get_forecast(
+        self,
+        region: str,
+        *,
+        horizon_hours: int = 24,
+        anchor: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        # Key on the anchor too: the curve is a function of (region, window),
+        # so a pinned `now` gives the same series on any calendar date.
+        key = region if anchor is None else f"{region}@{_utc(anchor).isoformat()}"
+        cached = self._cache.get(key)
         if cached is not None:
             return cached
-        pts = build_synthetic_forecast(region, horizon_hours=horizon_hours)
-        self._cache.set(region, pts)
+        pts = build_synthetic_forecast(region, horizon_hours=horizon_hours, now=anchor)
+        self._cache.set(key, pts)
         return pts
 
     def list_regions(self) -> list[str]:
@@ -202,7 +233,14 @@ class WattTimeCarbonProvider(_ForecastBackedProvider):
         self._client = client or WattTimeClient(self._config, allow_synthetic=True)
         self._cache = cache or ForecastCache(ttl_seconds=self._config.cache_ttl_seconds)
 
-    def get_forecast(self, region: str, *, horizon_hours: int = 24) -> list[dict[str, Any]]:
+    def get_forecast(
+        self,
+        region: str,
+        *,
+        horizon_hours: int = 24,
+        anchor: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        del anchor  # live data is whatever the grid reported; window is applied downstream
         cached = self._cache.get(region)
         if cached is not None:
             return cached
@@ -242,13 +280,21 @@ class ApiCarbonProvider(_ForecastBackedProvider):
         """Provenance of the most recent forecast for ``region``."""
         return self.sources.get(region)
 
-    def get_forecast(self, region: str, *, horizon_hours: int = 24) -> list[dict[str, Any]]:
+    def get_forecast(
+        self,
+        region: str,
+        *,
+        horizon_hours: int = 24,
+        anchor: datetime | None = None,
+    ) -> list[dict[str, Any]]:
         cached = self._cache.get(region)
         if cached is not None:
             return cached
         if not self._base:
             self.sources[region] = "local_synthetic"
-            return self._fallback.get_forecast(region, horizon_hours=horizon_hours)
+            return self._fallback.get_forecast(
+                region, horizon_hours=horizon_hours, anchor=anchor
+            )
         source = "local_synthetic"
         try:
             with httpx.Client(timeout=self._timeout) as client:
@@ -270,7 +316,9 @@ class ApiCarbonProvider(_ForecastBackedProvider):
             pts = []
         if not pts:
             self.sources[region] = "local_synthetic"
-            return self._fallback.get_forecast(region, horizon_hours=horizon_hours)
+            return self._fallback.get_forecast(
+                region, horizon_hours=horizon_hours, anchor=anchor
+            )
         self.sources[region] = source
         self._cache.set(region, pts)
         return pts

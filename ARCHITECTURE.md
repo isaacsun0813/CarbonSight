@@ -100,6 +100,7 @@ from carbonsight_core.spot.scheduler_service import ranked_as_json, schedule_job
 job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0, deadline_hours=45.0,
               checkpoint_size_gb=100.0, cold_start_minutes=6.0, current_region="us-east-1")
 res = schedule_job(job, now=datetime(2026, 7, 31, 12, 0, tzinfo=UTC))
+rows = ranked_as_json(res, job)   # 43 rows, ranked by U_s descending
 ```
 
 (`carbonsight schedule --deadline-hours 45 --checkpoint-size-gb 100 --current-region us-east-1
@@ -113,8 +114,8 @@ cheapest on-demand total. Top four, plus the `us-east-*` pair:
 | 1 | ap-northeast-1 | spot | 14.70h | 0.980 | 1.72 | 0.289 | \$0.136 | **2.148** |
 | 2 | ap-south-1 | spot | 8.65h | 0.965 | 1.58 | 0.090 | \$0.231 | 2.148 |
 | 3 | eu-west-1 | spot | 9.66h | 0.969 | 1.65 | 0.086 | \$0.207 | 2.115 |
-| 4 | us-east-1 | spot | 2.13h | 0.859 | 1.43 | 0.084 | \$0.000 | 2.086 |
-| 8 | us-east-2 | spot | 3.65h | 0.918 | 1.43 | 0.164 | \$0.548 | 1.776 |
+| 4 | us-east-1 | spot | 2.13h | 0.859 | 1.43 | 0.088 | \$0.000 | 2.086 |
+| 8 | us-east-2 | spot | 3.65h | 0.918 | 1.43 | 0.168 | \$0.548 | 1.776 |
 
 Three things this shows that a carbon-only ranking cannot:
 
