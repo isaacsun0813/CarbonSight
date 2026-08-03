@@ -40,7 +40,7 @@ Flow that’s in my head:
 - **Power model** answers: *how many watts is this job probably drawing?* (we don’t know utilization, so we randomize — more on that below)
 - **carbon_model** multiplies energy × MOER, converts units, runs Monte Carlo for a range
 
-Optional: **boto** checks AWS quotas before `run` so we don’t recommend a region you can’t launch in. **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
+Optional: **boto** checks AWS quotas and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Offerings use `ec2:DescribeInstanceTypeOfferings` (read-only, fail-open on API errors). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
 
 ---
 
@@ -67,7 +67,7 @@ Implementation: `carbonsight/apps/cli/carbonsight_cli/commands/train.py`.
 
 ## `run` — same ranking, then actually launch
 
-Same loop as advise, plus optional **quota check** per region. Pick the **greenest** row that still passes the cost filter, **inject `cloud` and `region` into the YAML**, write a temp file, call SkyPilot.
+Same loop as advise, plus optional **quota check** and **instance offerings check** per region (when preflight is enabled). Pick the **greenest** row that still passes the cost filter, **inject `cloud` and `region` into the YAML**, write a temp file, call SkyPilot.
 
 If the subprocess exits 0, we try **post-run actual CO₂** via **`JobCarbonEstimator.compute_actual_run`**: pull **historical** MOER for the job window from WattTime, time-weight it, compare to the pre-run estimate. The module-level **`compute_actual_co2`** remains a thin wrapper for tests and scripts. Start/end times are **wall clock around the local SkyPilot process** — MVP scope.
 
