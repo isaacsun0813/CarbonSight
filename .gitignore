@@ -22,3 +22,7 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# pytest verification suite
+carbonsight/misc/
+

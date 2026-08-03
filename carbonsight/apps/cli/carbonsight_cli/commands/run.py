@@ -27,6 +27,7 @@ from carbonsight_core.paths import (
     carbonsight_package_root_from_cli_command_file,
     resolve_registry_json_file,
 )
+from carbonsight_core.preflight.availability import InstanceAvailabilityChecker
 from carbonsight_core.preflight.quota import QuotaChecker
 from carbonsight_core.region_ranking import AwsRegionRankingService
 from carbonsight_core.scheduler import pick_lowest_carbon_start
@@ -145,9 +146,18 @@ def run_launch(
 
     watt_time = WattTimeClient(config)
     quota_checker = QuotaChecker() if not skip_preflight else None
-    ranking = AwsRegionRankingService(reg, watt_time, quota_checker=quota_checker)
+    availability_checker = InstanceAvailabilityChecker(config) if not skip_preflight else None
+    ranking = AwsRegionRankingService(
+        reg,
+        watt_time,
+        quota_checker=quota_checker,
+        availability_checker=availability_checker,
+    )
 
     def _quota_skip(region_code: str, reason: str) -> None:
+        typer.echo(f"  Skipping {region_code}: {reason}", err=True)
+
+    def _availability_skip(region_code: str, reason: str) -> None:
         typer.echo(f"  Skipping {region_code}: {reason}", err=True)
 
     def _estimate_warn(region_code: str, err: BaseException) -> None:
@@ -157,11 +167,12 @@ def run_launch(
         job,
         use_spot=use_spot,
         on_quota_skip=_quota_skip,
+        on_availability_skip=_availability_skip,
         on_estimate_error=_estimate_warn,
     )
 
     if not estimates:
-        typer.echo("No regions available after quota and WattTime checks.", err=True)
+        typer.echo("No regions available after quota, availability, and WattTime checks.", err=True)
         raise typer.Exit(1)
 
     best = AwsRegionRankingService.pick_best_region_for_launch(estimates, max_cost_premium)
