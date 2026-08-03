@@ -17,6 +17,7 @@ reliability. This command never launches anything.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import typer
@@ -32,6 +33,27 @@ from rich.console import Console
 from rich.table import Table
 
 from carbonsight_cli.commands.advise import apply_gpu_telemetry_cli, job_spec_from_sky_yaml
+
+
+def _json(payload: object) -> str:
+    """Serialise with infinities mapped to null.
+
+    Once the deadline has passed V is infinite and so is every utility derived
+    from it. ``json.dumps`` would emit a bare ``Infinity`` token, which is not
+    JSON: any strict reader (including Python's own ``json.loads`` with
+    ``parse_constant``) rejects it. The API path already did this; the CLI did not.
+    """
+
+    def clean(value: object) -> object:
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [clean(v) for v in value]
+        return value
+
+    return json.dumps(clean(payload), indent=2, allow_nan=False)
 
 
 def run_schedule(
@@ -116,7 +138,7 @@ def run_schedule(
             "value_v": result.value_v,
         }
         typer.echo(
-            json.dumps(payload, indent=2)
+            _json(payload)
             if json_out
             else f"Thrifty: p={progress.p}h >= P={progress.P}h, job done — release the instance."
         )
@@ -132,7 +154,7 @@ def run_schedule(
             "value_v": result.value_v,
         }
         if json_out:
-            typer.echo(json.dumps(payload, indent=2))
+            typer.echo(_json(payload))
         else:
             typer.echo(
                 f"Safety net: remaining time {progress.remaining_time:.2f}h < "
@@ -144,7 +166,7 @@ def run_schedule(
 
     rows = ranked_as_json(result, job)
     if json_out:
-        typer.echo(json.dumps(rows, indent=2))
+        typer.echo(_json(rows))
         return
 
     table = Table(

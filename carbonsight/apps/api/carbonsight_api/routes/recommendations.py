@@ -76,15 +76,17 @@ def _run_recommendations(req: RecommendationRequest, request: Request) -> dict:
             "estimated_total_cost_usd": result.decision.estimated_total_cost_usd,
         }
 
-    # V is infinite once the deadline has passed, which is not representable in
-    # JSON — send null and let ``action``/``decision`` carry the situation.
+    # V is infinite once the deadline has actually passed, which is not
+    # representable in JSON — send null and let action/decision carry it.
+    # deadline_passed is read off the progress state, not inferred from V, so a
+    # healthy job can never be reported as out of time.
     value_v = result.value_v if math.isfinite(result.value_v) else None
 
     return {
         "action": result.action,
         "decision": decision,
         "value_v": value_v,
-        "deadline_passed": value_v is None,
+        "deadline_passed": result.progress.deadline_passed,
         "regions": [e.model_dump(mode="json") for e in result.estimates],
     }
 

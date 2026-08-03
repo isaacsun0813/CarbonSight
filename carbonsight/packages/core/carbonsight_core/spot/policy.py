@@ -206,10 +206,36 @@ class SkyNomadPolicy:
             return Action.stay(f"no candidates{probe_note}", rule="no_candidates")
 
         best, best_u = ranked[0]
+
+        # Idle winning means every real candidate is value-destroying at this V.
+        # That is a wait, not a launch of a region called "idle", and the delta
+        # rule must not gate it: delta exists to stop churn between two placements
+        # that both earn their keep, and idle is the hard-zero baseline rather
+        # than a migration target. Gating it kept the job paying for compute the
+        # policy had itself scored below zero.
+        if best.is_idle:
+            return Action.idle(
+                f"every candidate scores <= 0 at V; waiting (best real U="
+                f"{next((u for c, u in ranked if not c.is_idle), float('nan')):.4f})"
+                f"{probe_note}",
+                rule="rank",
+            )
+
         if best.region == state.current_region and best.mode == state.current_mode:
             return Action.stay(
                 f"already in best {best.region}/{best.mode} U={best_u:.4f}{probe_note}"
             )
+
+        # Nothing is running, so there is no incumbent to protect and no egress
+        # being avoided by waiting. "Stay" here would be a null recommendation.
+        if not state.current_region:
+            return Action.launch(
+                best.region,
+                best.mode,
+                f"no current placement; launching best {best.region}/{best.mode} "
+                f"U={best_u:.4f}{probe_note}",
+            )
+
         if best_u > state.current_utility + self.delta:
             return Action.launch(
                 best.region,

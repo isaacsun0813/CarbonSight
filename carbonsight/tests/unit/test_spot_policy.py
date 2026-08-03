@@ -312,3 +312,125 @@ class TestRankAndDecideAPI:
         _, action = policy.rank_and_decide(state, [], progress, v=5.0)
         assert isinstance(action.reason, str)
         assert len(action.reason) > 0
+
+
+# ---------------------------------------------------------------------------
+# 6. Waiting is an idle action, not a launch into a region called "idle"
+# ---------------------------------------------------------------------------
+
+
+class TestIdleAction:
+    def _cands(self, price: float):
+        return [
+            _make_candidate("r1", Lbar=5.0, price=price),
+            CandidateState("idle", "idle", 0.0, 0.0, 0.0),
+        ]
+
+    def test_idle_winner_is_emitted_as_an_idle_action(self):
+        """It used to come back as launch(region="idle") — 602 times in one seed."""
+        state = PolicyState(
+            p=1, P=10, t=1, T=20, r0="r1", cold_start_hr=0.1,
+            current_region="r1", current_mode="spot", current_utility=0.0,
+        )
+        action = SkyNomadPolicy().decide(state, self._cands(99.0), _progress(1, 10, 1, 20), v=1.0)
+        assert action.kind == "idle"
+        assert action.region is None
+        assert action.rule == "rank"
+
+    def test_delta_does_not_gate_the_idle_baseline(self):
+        """224 hours had idle top-ranked and still returned stay, because
+        0.0 <= current_utility + delta. Delta guards migrations between two
+        placements that both earn their keep; idle is not a migration target."""
+        state = PolicyState(
+            p=1, P=10, t=1, T=20, r0="r1", cold_start_hr=0.1,
+            current_region="elsewhere", current_mode="spot", current_utility=0.0,
+        )
+        action = SkyNomadPolicy(delta=1e6).decide(
+            state, self._cands(99.0), _progress(1, 10, 1, 20), v=1.0
+        )
+        assert action.kind == "idle"
+
+    def test_a_profitable_candidate_still_beats_idle(self):
+        state = PolicyState(
+            p=1, P=10, t=1, T=20, r0="", cold_start_hr=0.1, current_utility=0.0
+        )
+        action = SkyNomadPolicy().decide(state, self._cands(1.0), _progress(1, 10, 1, 20), v=10.0)
+        assert action.kind == "launch"
+        assert action.region == "r1"
+
+    def test_all_four_action_kinds_are_reachable(self):
+        """ARCHITECTURE advertises launch | stay | idle | terminate; the rank
+        branch could previously only ever emit launch or stay."""
+        policy = SkyNomadPolicy(delta=0.05, probe_interval_hr=100)
+        kinds = set()
+        # thrifty -> idle
+        kinds.add(policy.decide(
+            PolicyState(p=10, P=10, t=5, T=20, r0="r1"), self._cands(1.0),
+            _progress(10, 10, 5, 20), v=5.0).kind)
+        # safety net -> launch
+        kinds.add(policy.decide(
+            PolicyState(p=5, P=10, t=8, T=10, r0="r1", cold_start_hr=0.1),
+            [_make_candidate("r1", mode="on_demand", Lbar=math.inf, price=4.0)],
+            _progress(5, 10, 8, 10), v=20.0).kind)
+        # rank, incumbent retained -> stay
+        kinds.add(policy.decide(
+            PolicyState(p=1, P=10, t=1, T=20, r0="r9", cold_start_hr=0.1,
+                        current_region="r9", current_mode="spot", current_utility=5.0),
+            self._cands(1.0), _progress(1, 10, 1, 20), v=5.0).kind)
+        # rank, nothing worth paying for -> idle
+        kinds.add(policy.decide(
+            PolicyState(p=1, P=10, t=1, T=20, r0="r1", cold_start_hr=0.1,
+                        current_region="r1", current_mode="spot"),
+            self._cands(99.0), _progress(1, 10, 1, 20), v=1.0).kind)
+        assert {"launch", "stay", "idle"} <= kinds
+
+
+# ---------------------------------------------------------------------------
+# 7. An unplaced job must be given somewhere to go
+# ---------------------------------------------------------------------------
+
+
+class TestUnplacedJob:
+    def test_unplaced_job_launches_even_below_delta(self):
+        """No caller passes current_utility, so the delta rule degenerated into
+        "launch only if U > $0.05/hr" and a job running nowhere got stay/None."""
+        cand = _make_candidate("r1", Lbar=5.0, price=1.0)
+        idle = CandidateState("idle", "idle", 0.0, 0.0, 0.0)
+        state = PolicyState(
+            p=1, P=10, t=1, T=20, r0="", cold_start_hr=0.1,
+            current_region="", current_utility=0.0,
+        )
+        # U is positive but well under the 0.05 delta.
+        from carbonsight_core.spot.unified_model import candidate_utility
+
+        assert 0.0 < candidate_utility(cand, 1.05, 0.1) < 0.05
+        action = SkyNomadPolicy(delta=0.05).decide(
+            state, [cand, idle], _progress(1, 10, 1, 20), v=1.05
+        )
+        assert action.kind == "launch"
+        assert action.region == "r1"
+
+    def test_a_placed_job_is_still_protected_by_delta(self):
+        cand = _make_candidate("r1", Lbar=5.0, price=1.0)
+        idle = CandidateState("idle", "idle", 0.0, 0.0, 0.0)
+        state = PolicyState(
+            p=1, P=10, t=1, T=20, r0="r9", cold_start_hr=0.1,
+            current_region="r9", current_mode="spot", current_utility=0.0,
+        )
+        action = SkyNomadPolicy(delta=0.05).decide(
+            state, [cand, idle], _progress(1, 10, 1, 20), v=1.05
+        )
+        assert action.kind == "stay"
+
+    def test_no_action_ever_names_idle_as_a_region(self):
+        policy = SkyNomadPolicy()
+        for v in (0.5, 1.0, 5.0, 50.0):
+            for price in (0.5, 5.0, 99.0):
+                action = policy.decide(
+                    PolicyState(p=1, P=10, t=1, T=20, r0="r1", cold_start_hr=0.1,
+                                current_region="r1", current_mode="spot"),
+                    [_make_candidate("r1", Lbar=5.0, price=price),
+                     CandidateState("idle", "idle", 0.0, 0.0, 0.0)],
+                    _progress(1, 10, 1, 20), v=v,
+                )
+                assert action.region != "idle"

@@ -101,18 +101,49 @@ class TestFutureProgressValue:
     def test_v_is_zero_when_the_work_is_done(self):
         assert ProgressState(p=10.0, P=10.0, t=5.0, T=20.0).future_progress_value(4.0) == 0.0
 
-    def test_zero_progress_after_real_elapsed_time_is_maximum_pressure(self):
-        """p=0 with t>0 means the achieved rate is 0, so V must diverge.
+    def test_zero_progress_is_priced_against_the_plan_not_as_infinite(self):
+        """p=0 at t>0 must stay finite while slack remains.
 
-        Falling back to P/T here would quietly reward a job that has done
-        nothing with the same V as one exactly on plan.
+        Returning inf here made every candidate tie at U=inf with 45 of 50 hours
+        left, and the stable sort then picked by registry insertion order. The
+        P/T fallback prices the job against its plan instead: V = C_od*T/(T-t).
         """
         stalled = ProgressState(p=0.0, P=10.0, t=10.0, T=20.0)
         assert stalled.avg_progress == 0.0
-        assert math.isinf(stalled.future_progress_value(4.0))
+        # theta = 10/10 = 1.0; theta~ falls back to P/T = 0.5 -> V = 2 * C_od
+        assert stalled.future_progress_value(4.0) == pytest.approx(8.0, rel=1e-12)
+        assert stalled.deadline_passed is False
+
+    @pytest.mark.parametrize(
+        ("t", "expected"),
+        [(1.0, 4.0 * 20 / 19), (10.0, 4.0 * 20 / 10), (19.0, 4.0 * 20 / 1)],
+    )
+    def test_a_stalled_job_still_escalates_as_the_deadline_nears(self, t, expected):
+        """The P/T fallback already penalises stalling, and does so divergently:
+        V = C_od * T/(T-t) at p=0, so it grows without bound as t -> T."""
+        stalled = ProgressState(p=0.0, P=10.0, t=t, T=20.0)
+        assert stalled.future_progress_value(4.0) == pytest.approx(expected, rel=1e-12)
+
+    def test_a_stalled_job_outbids_a_healthy_one(self):
+        stalled = ProgressState(p=0.0, P=10.0, t=10.0, T=20.0)
+        on_plan = ProgressState(p=5.0, P=10.0, t=10.0, T=20.0)
+        assert stalled.future_progress_value(4.0) > on_plan.future_progress_value(4.0)
+
+    def test_v_is_infinite_only_once_the_clock_has_actually_run_out(self):
+        assert ProgressState(p=0.0, P=10.0, t=19.99, T=20.0).future_progress_value(4.0) < math.inf
+        assert math.isinf(ProgressState(p=1.0, P=10.0, t=20.0, T=20.0).future_progress_value(4.0))
+
+    def test_deadline_passed_is_independent_of_v(self):
+        """It must not be inferred from ``not isfinite(V)``: that reported a job
+        with 45 hours of slack as out of time."""
+        healthy = ProgressState(p=0.0, P=10.0, t=5.0, T=50.0)
+        assert healthy.deadline_passed is False
+        assert math.isfinite(healthy.future_progress_value(4.0))
+        assert ProgressState(p=1.0, P=10.0, t=25.0, T=20.0).deadline_passed is True
+        assert ProgressState(p=10.0, P=10.0, t=25.0, T=20.0).deadline_passed is False  # done
 
     def test_t_zero_still_anchors_at_c_od(self):
-        """Only t=0 gets the P/T fallback, because no rate has been observed yet."""
+        """t=0 with p=0 is exactly on plan, so V is the cheapest on-demand rate."""
         assert ProgressState(p=0.0, P=10.0, t=0.0, T=20.0).future_progress_value(4.0) == 4.0
 
 

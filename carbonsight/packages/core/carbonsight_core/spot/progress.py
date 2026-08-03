@@ -79,22 +79,36 @@ class ProgressState:
             return math.inf
         return self.remaining_work / self.remaining_time
 
+    @property
+    def deadline_passed(self) -> bool:
+        """Work remains but the clock has run out. The only source of an infinite V."""
+        return self.remaining_work > 0 and self.remaining_time <= 1e-12
+
     def future_progress_value(self, c_od_per_hr: float) -> float:
-        """V(t) = C_od * theta / theta_tilde — what an hour of progress is worth."""
+        """V(t) = C_od * theta / theta_tilde — what an hour of progress is worth.
+
+        Infinite only when the deadline has actually passed. A job that has made
+        no progress yet is *not* that case: theta_tilde falls back to the planned
+        rate P/T, which already grows without bound as t approaches T
+        (V = C_od*T/(T-t) at p=0, so 1.02x C_od one hour in and 45x at t=44 of 45).
+        Returning inf on p==0 instead made 42 of 43 candidates tie at U=inf with
+        45 hours of slack left, and the stable sort then handed the decision to
+        registry insertion order.
+        """
         theta = self.deadline_pressure
         if math.isinf(theta):
             return math.inf
         if theta <= 0:
             return 0.0
         tilde = self.avg_progress
-        if tilde > 1e-12:
-            return c_od_per_hr * theta / tilde
-        # theta_tilde == 0. At t=0 that can only mean a degenerate P or T, since
-        # avg_progress returns P/T there — anchor at C_od. At t>0 it means the
-        # job has genuinely done nothing in the time it has had, which is maximal
-        # pressure, not "on plan": falling back to P/T here would let a stalled
-        # job bid the same as a healthy one.
-        return c_od_per_hr if self.t <= 1e-12 else math.inf
+        if tilde <= 1e-12:
+            # No measurable throughput yet (t == 0, or p == 0 at t > 0). Price
+            # against the plan; the safety net, not V, is what catches a job that
+            # has genuinely run out of room.
+            tilde = self.target_rate
+        if tilde <= 1e-12:
+            return c_od_per_hr  # degenerate P or T
+        return c_od_per_hr * theta / tilde
 
     def is_thrifty(self) -> bool:
         """p >= P: nothing left to do."""

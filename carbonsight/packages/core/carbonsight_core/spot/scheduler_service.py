@@ -340,7 +340,7 @@ def candidates_to_estimates(result: ScheduleResult, job: JobSpec) -> list[Estima
         prev = best_utility.get(cand.region)
         if prev is None or u > prev:
             best_utility[cand.region] = u
-    deadline_passed = not math.isfinite(result.value_v)
+    deadline_passed = result.progress.deadline_passed
 
     out: list[EstimateResult] = []
     for region, inp in result.inputs.items():
