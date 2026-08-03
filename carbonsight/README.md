@@ -32,8 +32,8 @@ uv run carbonsight schedule \
 # Classic advise (falls back to joint/synthetic without WattTime)
 uv run carbonsight advise --yaml tests/fixtures/train_minimal.yaml --json
 
-# Spot-aware backtest
-uv run carbonsight backtest run --spot --n 200 --json
+# Spot-aware backtest (8 seeds by default, so the spread is real)
+uv run carbonsight backtest run --spot --n 50
 ```
 
 ## API

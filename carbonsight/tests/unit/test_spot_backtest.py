@@ -13,17 +13,21 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from carbonsight_core.backtest.spot_runner import (
+    CARBON_BREAKEVEN_USD_PER_TON,
     DEFAULT_REGIONS,
+    DEFAULT_SEEDS,
     PATTERNS,
     _build_traces,
     _lifetimes,
     _run_skynomad,
     _run_up_multi,
     _run_up_single,
+    _run_wait_enabled_pin,
     default_pinned_region,
     run_spot_backtest,
     run_spot_backtest_multi,
 )
+from carbonsight_core.spot.lifetime import MIN_LIFETIME_HR
 from carbonsight_core.spot.unified_model import MigrationCostEstimator
 
 START = datetime(2026, 1, 1, tzinfo=UTC)
@@ -284,3 +288,121 @@ def test_deadline_met_is_a_percentage():
     r = run_spot_backtest(n=4, days=4, seed=1)
     assert 0.0 <= r.deadline_met_pct <= 100.0
     assert 0.0 <= r.up_multi_deadline_met_pct <= 100.0
+
+
+# --- the wait-enabled pin: the honest floor ---------------------------------
+
+
+class TestWaitEnabledPin:
+    """UP-single and UP-multi run every hour unconditionally, so they buy $4.10
+    on-demand whenever spot is down and never touch their slack. SkyNomad may
+    idle for free. That asymmetry, not region selection, produced the old
+    headline. This pin closes it while staying strictly less informed."""
+
+    def test_pin_waits_instead_of_buying_on_demand(self, harness):
+        regions, trackers, prices, carbon, _lt = harness
+        cost, _kg, idle, met = _run_wait_enabled_pin(
+            "r-flaky", trackers, prices, carbon, START, WORK, SLACK_DEADLINE
+        )
+        always_on, _kg2, _met2 = _run_up_single(
+            "r-flaky", trackers, prices, carbon, START, WORK, SLACK_DEADLINE
+        )
+        assert idle > 0
+        assert met is True
+        assert cost < always_on
+
+    def test_with_ample_slack_the_pin_reaches_the_pure_spot_floor(self, harness):
+        """Given enough slack it never touches on-demand, so cost is exactly
+        work_hours x spot price — a provable floor, identical on every seed."""
+        regions, trackers, prices, carbon, _lt = harness
+        cost, _kg, _idle, met = _run_wait_enabled_pin(
+            "r-good", trackers, prices, carbon, START, WORK, SLACK_DEADLINE
+        )
+        assert met is True
+        assert cost == pytest.approx(prices["r-good"][0] * WORK)
+
+    def test_pin_still_buys_on_demand_when_the_safety_net_fires(self, harness):
+        """It waits, but not off a cliff: a tight deadline forces on-demand."""
+        regions, trackers, prices, carbon, _lt = harness
+        cost, _kg, _idle, met = _run_wait_enabled_pin(
+            "r-dead", trackers, prices, carbon, START, WORK, WORK + 1.0
+        )
+        assert met is True
+        assert cost > prices["r-dead"][0] * WORK  # some hours billed at OD
+
+    def test_pin_is_reported_and_is_the_headline(self):
+        r = run_spot_backtest(n=4, days=4, seed=1)
+        assert r.wait_pin_cost_mean > 0
+        assert r.cost_savings_vs_wait_pin_pct == pytest.approx(
+            (1 - r.skynomad_cost_mean / r.wait_pin_cost_mean) * 100
+        )
+
+    def test_pin_is_a_tighter_baseline_than_the_always_on_pins(self):
+        """If it were not, it would not be worth reporting."""
+        r = run_spot_backtest(n=8, days=6, seed=3)
+        assert r.wait_pin_cost_mean <= r.up_single_default_cost_mean + 1e-9
+        assert r.cost_savings_vs_wait_pin_pct <= r.cost_savings_vs_up_single_default_pct + 1e-9
+
+
+# --- causal lifetime fitting ------------------------------------------------
+
+
+class TestCausalLifetimeFit:
+    def test_fit_ignores_history_after_the_cutoff(self):
+        trackers = _build_traces(["a", "b", "c"], days=6, seed=4, start=START)
+        early = _lifetimes(trackers, cutoff=START + timedelta(hours=24))
+        full = _lifetimes(trackers)
+        assert early != full
+
+    def test_a_workload_at_hour_zero_gets_no_signal(self):
+        """No history means the floor, not a lifetime read off the future."""
+        trackers = _build_traces(["a", "b", "c"], days=6, seed=4, start=START)
+        cold = _lifetimes(trackers, cutoff=START)
+        assert set(cold.values()) == {MIN_LIFETIME_HR}
+
+    def test_more_history_sharpens_the_estimate(self):
+        trackers = _build_traces(["a", "b", "c"], days=8, seed=4, start=START)
+        short = _lifetimes(trackers, cutoff=START + timedelta(hours=12))
+        long = _lifetimes(trackers, cutoff=START + timedelta(hours=168))
+        # The high-uptime region should separate from the low-uptime one once
+        # there is enough history to see it.
+        assert long["a"] > long["c"]
+        assert (long["a"] - long["c"]) > (short["a"] - short["c"])
+
+
+# --- seed selection ---------------------------------------------------------
+
+
+def test_default_seeds_are_a_contiguous_range():
+    """A hand-picked tuple that beats other seed sets 5/5 is selection bias."""
+    assert DEFAULT_SEEDS == tuple(range(1, len(DEFAULT_SEEDS) + 1))
+    assert len(DEFAULT_SEEDS) >= 8
+
+
+# --- carbon breakeven -------------------------------------------------------
+
+
+def test_carbon_breakeven_price():
+    """Derives CARBON_BREAKEVEN_USD_PER_TON rather than trusting the constant.
+
+    Carbon can only change a migration decision once the dollarised spread
+    between the dirtiest and cleanest region exceeds the anti-flapping delta.
+    """
+    from datetime import UTC
+
+    from carbonsight_core.models import JobSpec
+    from carbonsight_core.providers.carbon import SyntheticCarbonProvider
+
+    job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=30.0)
+    provider = SyntheticCarbonProvider()
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    kg = [
+        provider.get_kg_per_hr(job, [(r, 1.0)], t0, t0 + timedelta(hours=45))
+        for r in DEFAULT_REGIONS
+    ]
+    spread = max(kg) - min(kg)
+    delta = 0.05
+    breakeven = delta * 1000.0 / spread
+    assert breakeven == pytest.approx(CARBON_BREAKEVEN_USD_PER_TON, rel=0.02)
+    # And confirm the consequence: at the shipped default the lever is inert.
+    assert spread / 1000.0 * 50.0 < delta

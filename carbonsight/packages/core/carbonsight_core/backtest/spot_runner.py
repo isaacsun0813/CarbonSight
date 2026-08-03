@@ -74,7 +74,17 @@ DEFAULT_REGIONS = [
 PATTERNS = [(0.95, "generally"), (0.70, "frequent"), (0.20, "unavailable")]
 
 COLD_START_HR = 0.1
-DEFAULT_SEEDS = (11, 22, 33, 42, 55, 66, 77, 88)
+# A contiguous range, not a hand-picked tuple. The previous (11, 22, ..., 88)
+# beat three other seed sets 5/5, which is exactly the shape selection bias
+# takes; there is no defensible reason for the seeds to be non-obvious.
+DEFAULT_SEED_COUNT = 8
+DEFAULT_SEEDS = tuple(range(1, DEFAULT_SEED_COUNT + 1))
+
+# Below this carbon price the entire dirtiest-to-cleanest spread across the
+# region set is smaller than the default $0.05/hr anti-flapping delta, so the
+# carbon lever provably cannot change a migration decision. Derived in
+# tests/unit/test_spot_backtest.py::test_carbon_breakeven_price.
+CARBON_BREAKEVEN_USD_PER_TON = 174.0
 
 CARBON_CAVEAT = (
     "carbon intensity is constant per region across the window, so temporal "
@@ -91,22 +101,28 @@ class SpotBacktestResult:
     seed: int
     deadline_ratio: float
     checkpoint_gb: float
+    delta: float
     skynomad_cost_mean: float
+    wait_pin_cost_mean: float
     up_single_default_cost_mean: float
     up_single_best_cost_mean: float
     up_single_rotating_cost_mean: float
     up_multi_cost_mean: float
     up_single_default_region: str
     up_single_best_region: str
+    cost_savings_vs_wait_pin_pct: float
     cost_savings_vs_up_single_default_pct: float
     cost_savings_vs_up_single_best_pct: float
     cost_savings_vs_up_multi_pct: float
     deadline_met_pct: float
     up_multi_deadline_met_pct: float
+    wait_pin_deadline_met_pct: float
     migrations_mean: float
     egress_cost_pct_mean: float
     idle_hours_mean: float
+    wait_pin_idle_hours_mean: float
     carbon_kg_mean: float
+    wait_pin_carbon_kg_mean: float
     up_multi_carbon_kg_mean: float
     caveats: list[str] = field(default_factory=lambda: [CARBON_CAVEAT])
     details: list[dict] = field(default_factory=list)
@@ -152,11 +168,24 @@ def _build_traces(
     return trackers
 
 
-def _lifetimes(trackers: dict[str, AvailabilityTracker]) -> dict[str, float]:
-    """Lbar(0) per region from the trace history, via Nelson-Aalen."""
+def _lifetimes(
+    trackers: dict[str, AvailabilityTracker], cutoff: datetime | None = None
+) -> dict[str, float]:
+    """Lbar(0) per region via Nelson-Aalen, fitted only on history before ``cutoff``.
+
+    Without the cutoff the fit sees the whole trace, including the hours the
+    workload is about to run through — the policy would be predicting lifetimes
+    from preemptions that have not happened yet. Passing the workload's start
+    makes it causal; a workload starting at hour 0 correctly gets no signal at
+    all and falls back to the floor.
+    """
     out: dict[str, float] = {}
     for region, tracker in trackers.items():
-        stats = LifetimeStats.from_observations(tracker.observed_lifetimes(region))
+        observations = tracker.get_observations(region)
+        if cutoff is not None:
+            observations = [o for o in observations if o.t < cutoff]
+        history = AvailabilityTracker(observations)
+        stats = LifetimeStats.from_observations(history.observed_lifetimes(region))
         out[region] = max(MIN_LIFETIME_HR, predict_remaining_lifetime(stats, age=0.0))
     return out
 
@@ -195,6 +224,46 @@ def _run_up_single(
         kg += carbon[region]
         done += 1.0
     return cost, kg, done >= work_hours
+
+
+def _run_wait_enabled_pin(
+    region: str,
+    trackers: dict[str, AvailabilityTracker],
+    prices: dict[str, tuple[float, float]],
+    carbon: dict[str, float],
+    start: datetime,
+    work_hours: float,
+    deadline_hours: float,
+) -> tuple[float, float, int, bool]:
+    """One region, never migrates — but allowed to wait for spot.
+
+    This is the honest floor, and it is strictly *less* informed than SkyNomad:
+    no multi-region search, no lifetime model, no effectiveness term, no carbon
+    lever, no hindsight. The single thing it can do that UP-single and UP-multi
+    cannot is decline to buy an hour. Those two run every hour unconditionally
+    and so buy on-demand at $4.10 whenever spot is down, never touching their
+    slack — which is what made SkyNomad's stall privilege look like skill.
+
+    It falls back to on-demand only when the same safety-net rule the policy uses
+    says the deadline is at risk.
+    """
+    spot_px, od_px = prices[region]
+    cost = kg = done = 0.0
+    idle_hours = 0
+    for hour in range(int(deadline_hours)):
+        if done >= work_hours:
+            break
+        progress = ProgressState(p=done, P=work_hours, t=float(hour), T=deadline_hours)
+        if trackers[region].is_available(region, start + timedelta(hours=hour)):
+            cost += spot_px
+        elif progress.is_safety_net(COLD_START_HR):
+            cost += od_px
+        else:
+            idle_hours += 1
+            continue
+        kg += carbon[region]
+        done += 1.0
+    return cost, kg, idle_hours, done >= work_hours
 
 
 def _run_up_multi(
@@ -375,13 +444,13 @@ def run_spot_backtest(
     regions: list[str] | None = None,
     work_hours: float = 30.0,
     carbon_price_usd_per_ton: float = 50.0,
+    delta: float = 0.05,
 ) -> SpotBacktestResult:
     """Run every policy over ``n`` workloads for one seed."""
     regions = regions or DEFAULT_REGIONS
     deadline_hours = work_hours * deadline_ratio
     trace_start = datetime(2026, 1, 1, tzinfo=UTC)
     trackers = _build_traces(regions, days, seed, trace_start)
-    lifetimes = _lifetimes(trackers)
 
     spot_provider = StaticSpotPriceProvider()
     carbon_provider = SyntheticCarbonProvider()
@@ -403,6 +472,9 @@ def run_spot_backtest(
     default_region = default_pinned_region(regions, prices)
 
     sky_costs: list[float] = []
+    wait_costs: list[float] = []
+    wait_kg: list[float] = []
+    wait_idle: list[int] = []
     single_costs: dict[str, list[float]] = {r: [] for r in regions}
     rotating_costs: list[float] = []
     multi_costs: list[float] = []
@@ -411,7 +483,7 @@ def run_spot_backtest(
     migrations: list[int] = []
     idle_hours: list[int] = []
     egress_pcts: list[float] = []
-    met = {"sky": 0, "multi": 0}
+    met = {"sky": 0, "multi": 0, "wait": 0}
     details: list[dict] = []
 
     rng = random.Random(seed)
@@ -429,6 +501,9 @@ def run_spot_backtest(
             single_costs[region].append(cost)
         rotating_costs.append(single_costs[regions[i % len(regions)]][-1])
 
+        w_cost, w_kg, w_idle, w_met = _run_wait_enabled_pin(
+            default_region, trackers, prices, carbon_kg, start, work_hours, deadline_hours
+        )
         m_cost, m_kg, m_migr, m_met = _run_up_multi(
             regions, trackers, prices, carbon_kg, start, work_hours, deadline_hours, migration_flat
         )
@@ -437,17 +512,21 @@ def run_spot_backtest(
             trackers,
             prices,
             carbon_kg,
-            lifetimes,
+            _lifetimes(trackers, cutoff=start),
             start,
             work_hours,
             deadline_hours,
             migration_est,
             checkpoint_gb,
             carbon_price_usd_per_ton,
+            delta=delta,
         )
 
         total_sky = sky.cost + sky.egress
         sky_costs.append(total_sky)
+        wait_costs.append(w_cost)
+        wait_kg.append(w_kg)
+        wait_idle.append(w_idle)
         multi_costs.append(m_cost)
         sky_kg.append(sky.carbon_kg)
         multi_kg.append(m_kg)
@@ -456,10 +535,12 @@ def run_spot_backtest(
         egress_pcts.append(sky.egress / total_sky * 100 if total_sky > 0 else 0.0)
         met["sky"] += int(sky.met_deadline)
         met["multi"] += int(m_met)
+        met["wait"] += int(w_met)
         if i < 10:
             details.append(
                 {
                     "skynomad": total_sky,
+                    "wait_enabled_pin": w_cost,
                     "up_single_default": single_costs[default_region][-1],
                     "up_multi": m_cost,
                     "skynomad_migrations": sky.migrations,
@@ -485,22 +566,28 @@ def run_spot_backtest(
         seed=seed,
         deadline_ratio=deadline_ratio,
         checkpoint_gb=checkpoint_gb,
+        delta=delta,
         skynomad_cost_mean=sky_mean,
+        wait_pin_cost_mean=mean(wait_costs),
         up_single_default_cost_mean=per_region_mean[default_region],
         up_single_best_cost_mean=per_region_mean[best_region],
         up_single_rotating_cost_mean=mean(rotating_costs),
         up_multi_cost_mean=mean(multi_costs),
         up_single_default_region=default_region,
         up_single_best_region=best_region,
+        cost_savings_vs_wait_pin_pct=savings(mean(wait_costs)),
         cost_savings_vs_up_single_default_pct=savings(per_region_mean[default_region]),
         cost_savings_vs_up_single_best_pct=savings(per_region_mean[best_region]),
         cost_savings_vs_up_multi_pct=savings(mean(multi_costs)),
         deadline_met_pct=100.0 * met["sky"] / n if n else 0.0,
         up_multi_deadline_met_pct=100.0 * met["multi"] / n if n else 0.0,
+        wait_pin_deadline_met_pct=100.0 * met["wait"] / n if n else 0.0,
         migrations_mean=mean(migrations),
         egress_cost_pct_mean=mean(egress_pcts),
         idle_hours_mean=mean(idle_hours),
+        wait_pin_idle_hours_mean=mean(wait_idle),
         carbon_kg_mean=mean(sky_kg),
+        wait_pin_carbon_kg_mean=mean(wait_kg),
         up_multi_carbon_kg_mean=mean(multi_kg),
         details=details,
     )
@@ -508,6 +595,10 @@ def run_spot_backtest(
 
 AGGREGATED_METRICS = (
     "skynomad_cost_mean",
+    "wait_pin_cost_mean",
+    "cost_savings_vs_wait_pin_pct",
+    "wait_pin_idle_hours_mean",
+    "wait_pin_carbon_kg_mean",
     "up_single_default_cost_mean",
     "up_single_best_cost_mean",
     "up_multi_cost_mean",

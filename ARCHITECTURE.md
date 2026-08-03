@@ -285,3 +285,42 @@ Carbon lever unit test: `test_watttime_provider_green_vs_dirty_lever` uses **\$2
 - Operational electricity carbon only (MOER × power model).
 - WattTime ToS: central proxy may need a paid/org tier for redistribution; demos use **synthetic** when unpaid.
 - Synthetic Lbar + small MWh ⇒ need high \$/t to flip ranks in tests.
+
+### 8.1 The backtest does not currently justify the scheduler
+
+`backtest run --spot` (8 seeds × 50 workloads, 30h job / 45h deadline, 100 GB checkpoint):
+
+| Policy | Cost | vs SkyNomad |
+|---|---|---|
+| **wait-enabled pin** (`us-east-1`) | **\$43.05 ± 0.00** | SkyNomad **−5.76% ± 1.27**, losing on **8/8 seeds** |
+| SkyNomad | \$45.53 ± 0.55 | — |
+| UP-single pinned `us-east-1` | \$46.87 ± 1.08 | +2.83% ± 1.43 |
+| UP-single best (hindsight) | \$46.43 ± 0.84 | +1.93% ± 1.16 |
+| UP-multi | \$48.41 ± 1.44 | +5.89% ± 2.01 |
+
+**The wait-enabled pin beats SkyNomad, and it is strictly less informed:** one region, never
+migrates, no lifetime model, no effectiveness term, no carbon lever, no hindsight. The only
+thing it can do that `UP-single`/`UP-multi` cannot is *decline to buy an hour* — those two run
+every hour unconditionally and so pay \$4.10 on-demand whenever spot is down, never touching
+their 15h of slack. \$43.05 is 30h × \$1.435, the provable floor, and it hits it on every seed.
+
+So the `+2.83%` and `+5.89%` rows are artifacts of baselines that are forbidden to wait, not
+evidence for the model. Disabling SkyNomad's idle candidate collapses the best-pin delta from
++1.93% to ≈+0.4%, which is not distinguishable from zero — meaning region selection, $\bar L$,
+$\eta$ and the carbon lever, i.e. everything the paper is about, currently contribute close to
+nothing on this harness.
+
+Three known reasons the harness cannot show what the model is for, all of which have to be
+fixed before any of these numbers mean anything:
+
+- **No preemption penalty is ever charged.** A spot instance that dies costs nothing and loses
+  no work, so $\bar L$ and $\eta$ are decorative — the whole point of preferring a long-lived
+  slot is unpriced.
+- **Carbon is constant per region across the window**, so temporal shifting is untestable and
+  only the spatial lever is exercised.
+- **Carbon cannot move a migration at the default price.** The entire dirtiest-to-cleanest
+  spread is \$0.0143/hr at \$50/ton, 3.5× smaller than the \$0.05/hr anti-flapping delta.
+  Breakeven is ≈\$174/ton (`test_carbon_breakeven_price` derives it).
+
+Reported as-is rather than tuned. `backtest run --spot` prints the verdict line in the same
+terms.
