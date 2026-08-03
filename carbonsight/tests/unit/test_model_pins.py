@@ -4,8 +4,12 @@ Mutation testing found these unprotected: the functional form of V (an
 inequality passes for V = C_od*(theta/theta_tilde)**2 too), ``carbon_weight``
 being ignored outright, the safety-net threshold being 1d instead of 2d, and
 each of the three terms of the safety-net cost being deleted independently.
-Every assertion here is a closed-form value derived from the definitions, not
-from the implementation's own output.
+Assertions in the first four classes are closed-form values derived from the
+definitions, independent of the implementation. ``TestArchitectureWorkedExample``
+at the bottom is deliberately not: it is a characterisation test whose expected
+values were generated from ``schedule_job``, and it exists only to stop
+ARCHITECTURE.md drifting away from the code. It cannot detect a wrong model,
+only a changed one.
 """
 
 from __future__ import annotations
@@ -191,19 +195,53 @@ class TestCarbonWeight:
         assert heavy == pytest.approx((1.0 + 5.0) * 2.0)
 
     def test_weight_reaches_schedule_job_end_to_end(self):
-        """Ignoring job.carbon_weight anywhere in the chain must fail here."""
-        common = dict(gpu_type="A100", gpu_count=1, duration_hours=1.0, deadline_hours=45.0)
+        """Pins the exact algebra, so dropping the weight at any single site fails.
+
+        A mere ``light != heavy`` assertion was too weak — several individual
+        mutation sites survived it. The weight enters U twice, so both have to
+        move together:
+
+            U = V*eta - (price + kg/1000 * cost * weight) - E/Lbar
+
+        and V itself is anchored on the cheapest on-demand *total*, which also
+        carries the weight. So for every spot region:
+
+            U_light - U_heavy == d_carbon(region) - eta(region) * (V_heavy - V_light)
+
+        Dropping the weight at the candidate, at the anchor, or at either end
+        alone breaks this.
+        """
+        common = dict(
+            gpu_type="A100", gpu_count=1, duration_hours=1.0, deadline_hours=45.0
+        )
         light = schedule_job(JobSpec(**common, carbon_weight=1.0), now=NOW)
         heavy = schedule_job(JobSpec(**common, carbon_weight=500.0), now=NOW)
-        by_region_light = {c.region: u for c, u in light.ranked if c.is_spot}
-        by_region_heavy = {c.region: u for c, u in heavy.ranked if c.is_spot}
-        assert by_region_light != by_region_heavy
-        # A dirtier region must be punished more than a cleaner one.
-        dirty = max(light.inputs, key=lambda r: light.inputs[r].carbon_kg_per_hr)
-        clean = min(light.inputs, key=lambda r: light.inputs[r].carbon_kg_per_hr)
-        assert (by_region_light[dirty] - by_region_heavy[dirty]) > (
-            by_region_light[clean] - by_region_heavy[clean]
+        u_light = {c.region: u for c, u in light.ranked if c.is_spot}
+        u_heavy = {c.region: u for c, u in heavy.ranked if c.is_spot}
+
+        assert u_light and set(u_light) == set(u_heavy)
+        # The anchor moved, because the cheapest OD total is now carbon-weighted.
+        delta_v = heavy.value_v - light.value_v
+        assert delta_v > 0
+
+        for region, inputs in light.inputs.items():
+            eta = effectiveness(inputs.mean_lifetime_hr, light.cold_start_hr)
+            extra_carbon = inputs.carbon_kg_per_hr / 1000.0 * 50.0 * (500.0 - 1.0)
+            expected = extra_carbon - eta * delta_v
+            assert u_light[region] - u_heavy[region] == pytest.approx(expected, abs=1e-9)
+            assert extra_carbon > 0
+
+    def test_weight_reaches_the_safety_net_through_schedule_job(self):
+        """The safety-net branch prices carbon too, and takes the weight with it."""
+        common = dict(
+            gpu_type="A100", gpu_count=1, duration_hours=1.0, deadline_hours=1.0
         )
+        light = schedule_job(JobSpec(**common, carbon_weight=1.0), now=NOW)
+        heavy = schedule_job(JobSpec(**common, carbon_weight=100_000.0), now=NOW)
+        assert light.action == heavy.action == "safety_net"
+        assert heavy.safety_net_total_cost > light.safety_net_total_cost
+        # A heavy enough weight must change which region the rule picks.
+        assert heavy.safety_net_region != light.safety_net_region
 
 
 # --- safety net -------------------------------------------------------------
@@ -319,9 +357,12 @@ class TestUtilityTerms:
 class TestArchitectureWorkedExample:
     """Pins the ARCHITECTURE.md worked example so the docs cannot drift silently.
 
-    The table there was hand-constructed once and went stale invisibly: it
-    claimed L-bar 12.0h for us-east-1 (actual 2.13h) and "identical carbon" for
-    two regions that differ 2x. If any of these change, update both.
+    Unlike the rest of this module these expectations were *generated from*
+    ``schedule_job`` rather than derived independently, so this is a
+    characterisation test: it catches the docs going stale (the old table
+    claimed L-bar 12.0h for us-east-1 against an actual 2.13h, and "identical
+    carbon" for two regions differing 2x) but it cannot tell you the model is
+    right. If a change here is intentional, regenerate the table too.
     """
 
     EXPECTED = [

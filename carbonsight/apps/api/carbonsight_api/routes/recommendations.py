@@ -15,26 +15,41 @@ router = APIRouter()
 
 
 class RecommendationRequest(BaseModel):
-    gpu_type: str = "A100"
-    gpu_count: int = 1
-    duration_hours: float = 1.0
-    cpu_count: int | None = None
-    mem_gib: float | None = None
+    """Mirrors the constraints on ``JobSpec``.
+
+    Without them the JobSpec was built inside the handler, so a bad
+    ``duration_hours`` surfaced as a plain-text 500 (or an OverflowError for
+    1e400) instead of a 422 naming the field.
+    """
+
+    gpu_type: str = Field("A100", min_length=1)
+    gpu_count: int = Field(1, ge=0, le=4096)
+    duration_hours: float = Field(1.0, gt=0, le=8760, allow_inf_nan=False)
+    cpu_count: int | None = Field(None, ge=0)
+    mem_gib: float | None = Field(None, ge=0, allow_inf_nan=False)
     gpu_utilization: float | None = Field(
-        default=None,
-        description="Optional GPU utilization in [0, 1] to fix the power model (same as CLI --gpu-util).",
+        None,
+        ge=0,
+        le=1,
+        description="Optional GPU utilization in [0, 1] to fix the power model (CLI --gpu-util).",
     )
-    max_cost_premium: float = Field(
-        0.20,
-        description="Max fractional cost above cheapest region (0.2 = 20%%); same as CLI --max-cost-premium.",
+    deadline_hours: float = Field(
+        48.0, gt=0, le=8760, allow_inf_nan=False, description="Deadline horizon T (hours)."
     )
-    deadline_hours: float = Field(48.0, description="SkyNomad deadline horizon (hours).")
-    checkpoint_size_gb: float = 0.0
-    cold_start_minutes: float = 5.0
-    carbon_price_usd_per_ton: float = Field(50.0, description="Social cost of carbon for joint U.")
-    carbon_weight: float = Field(1.0, description="Weight on the carbon lever vs dollars.")
-    progress_hours_done: float = Field(0.0, description="Compute-hours already done (p).")
-    elapsed_hours: float = Field(0.0, description="Wall-clock hours since the job started (t).")
+    checkpoint_size_gb: float = Field(0.0, ge=0, allow_inf_nan=False)
+    cold_start_minutes: float = Field(5.0, ge=0, allow_inf_nan=False)
+    carbon_price_usd_per_ton: float = Field(
+        50.0, ge=0, allow_inf_nan=False, description="Social cost of carbon for joint U."
+    )
+    carbon_weight: float = Field(
+        1.0, ge=0, allow_inf_nan=False, description="Weight on the carbon lever vs dollars."
+    )
+    progress_hours_done: float = Field(
+        0.0, ge=0, allow_inf_nan=False, description="Compute-hours already done (p)."
+    )
+    elapsed_hours: float = Field(
+        0.0, ge=0, allow_inf_nan=False, description="Wall-clock hours since job start (t)."
+    )
     current_region: str = Field("", description="Region holding the checkpoint (r0).")
 
 

@@ -106,11 +106,31 @@ def test_default_pin_is_a_high_uptime_region_not_a_dud():
     assert PATTERNS[idx % len(PATTERNS)][0] == 0.95
 
 
-def test_default_pin_breaks_ties_deterministically():
+def test_default_pin_is_the_cheapest_of_the_best_uptime_regions():
+    """min -> max in default_pinned_region must fail here.
+
+    ``assert f(x) == f(x)`` proved nothing; this recomputes the intended choice
+    independently. The pin selects the headline baseline, so getting it wrong
+    silently changes what the whole backtest is measured against.
+    """
+    prices = {r: (1.0, 5.0 - i * 0.1) for i, r in enumerate(DEFAULT_REGIONS)}
+    best_uptime = [
+        r for i, r in enumerate(DEFAULT_REGIONS) if PATTERNS[i % len(PATTERNS)][0] == 0.95
+    ]
+    expected = min(best_uptime, key=lambda r: (prices[r][1], r))
+    chosen = default_pinned_region(DEFAULT_REGIONS, prices)
+    assert chosen == expected
+    assert prices[chosen][1] == min(prices[r][1] for r in best_uptime)
+    # and it must not just be the global cheapest, which is on a worse pattern
+    assert prices[chosen][1] > min(prices[r][1] for r in DEFAULT_REGIONS)
+
+
+def test_default_pin_breaks_ties_by_name():
     prices = {r: (1.0, 2.0) for r in DEFAULT_REGIONS}
-    assert default_pinned_region(DEFAULT_REGIONS, prices) == default_pinned_region(
-        DEFAULT_REGIONS, prices
-    )
+    best_uptime = [
+        r for i, r in enumerate(DEFAULT_REGIONS) if PATTERNS[i % len(PATTERNS)][0] == 0.95
+    ]
+    assert default_pinned_region(DEFAULT_REGIONS, prices) == min(best_uptime)
 
 
 def test_up_single_pays_on_demand_when_spot_is_down(harness):
@@ -199,11 +219,12 @@ def test_idling_is_bounded_by_the_deadline(harness):
 
 
 def test_progress_only_accrues_on_hours_actually_run(harness):
+    """The ``if run.met_deadline:`` guard let this skip silently; assert it."""
     run = _sky(harness)
-    if run.met_deadline:
-        # Cost is charged per running hour, so it cannot be below the cheapest
-        # spot rate times the work actually required.
-        assert run.cost >= 0.5 * WORK * 0.999
+    assert run.met_deadline is True
+    # Cost is charged per running hour, so it cannot be below the cheapest spot
+    # rate times the work actually required.
+    assert run.cost >= 0.5 * WORK * 0.999
 
 
 def test_carbon_tracks_the_regions_chosen(harness):

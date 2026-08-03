@@ -107,14 +107,34 @@ def test_recommendations_past_the_deadline_stays_valid_json(client):
 
 
 def test_recommendations_honours_carbon_weight(client):
+    """Hardcoding carbon_weight=1.0 in the handler must fail this.
+
+    Asserting only ``light_u != heavy_u`` was vacuous: the response is anchored
+    on the wall clock, so two *identical* requests already differ. This measures
+    the effect instead — under a heavy weight the dirtiest region must lose far
+    more utility than the cleanest, by an amount set by their kg/hr gap.
+    """
     light = _recommend(client, carbon_weight=1.0)
-    heavy = _recommend(client, carbon_weight=1000.0)
-    assert [r["cloud_region"] for r in light["regions"]] == [
-        r["cloud_region"] for r in heavy["regions"]
-    ]  # ordering is by CO2, which the weight does not change
-    light_u = {r["cloud_region"]: r["utility_score"] for r in light["regions"]}
+    heavy = _recommend(client, carbon_weight=100_000.0)
+
+    light_rows = {r["cloud_region"]: r for r in light["regions"]}
     heavy_u = {r["cloud_region"]: r["utility_score"] for r in heavy["regions"]}
-    assert light_u != heavy_u
+    # regions arrive greenest-first, so these are the extremes of the spread
+    cleanest = light["regions"][0]["cloud_region"]
+    dirtiest = light["regions"][-1]["cloud_region"]
+
+    def drop(code: str) -> float:
+        return light_rows[code]["utility_score"] - heavy_u[code]
+
+    assert drop(dirtiest) > drop(cleanest)
+    # The penalty is (kg/hr)/1000 * price * (w_heavy - w_light); the extra weight
+    # dwarfs any wall-clock jitter in the underlying MOER.
+    kg_gap = (
+        light_rows[dirtiest]["expected_co2_kg_mean"]
+        - light_rows[cleanest]["expected_co2_kg_mean"]
+    )
+    expected = kg_gap / 1000.0 * 50.0 * (100_000.0 - 1.0)
+    assert drop(dirtiest) - drop(cleanest) == pytest.approx(expected, rel=0.05)
 
 
 def test_recommendations_honours_deadline_pressure(client):
@@ -152,3 +172,56 @@ def test_carbon_regions_lists_grid_codes(client):
 
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+# --- input validation -------------------------------------------------------
+
+
+class TestRequestValidation:
+    """Bad input must be a 422 naming the field, not a plain-text 500.
+
+    JobSpec was constructed inside the handler, so its constraints surfaced as
+    unhandled exceptions; 1e400 was worse still, because FastAPI's default
+    handler echoed the offending ``inf`` into an error body that then failed to
+    serialise.
+    """
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"duration_hours": 0},
+            {"duration_hours": -1},
+            {"deadline_hours": 0},
+            {"deadline_hours": -5},
+            {"gpu_count": -3},
+            {"gpu_utilization": 5},
+            {"gpu_utilization": -0.1},
+            {"carbon_weight": -1},
+            {"carbon_price_usd_per_ton": -10},
+            {"checkpoint_size_gb": -1},
+            {"progress_hours_done": -1},
+            {"elapsed_hours": -1},
+            {"gpu_type": ""},
+        ],
+    )
+    def test_invalid_input_is_422(self, client, body):
+        response = client.post("/v1/recommendations", json={"duration_hours": 1.0, **body})
+        assert response.status_code == 422
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.json()["detail"]
+
+    @pytest.mark.parametrize("literal", ["1e400", "-1e400"])
+    def test_non_finite_input_is_422_with_a_serialisable_body(self, client, literal):
+        response = client.post(
+            "/v1/recommendations",
+            content='{"duration_hours": %s}' % literal,
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 422
+        assert response.headers["content-type"].startswith("application/json")
+        detail = response.json()["detail"]
+        assert detail[0]["loc"] == ["body", "duration_hours"]
+        assert "Infinity" not in response.text and "NaN" not in response.text
+
+    def test_valid_input_still_works(self, client):
+        assert client.post("/v1/recommendations", json={"duration_hours": 1.0}).status_code == 200
