@@ -70,7 +70,8 @@ Optional: `--gpu-util 0.72` or `--nvidia-smi` to anchor GPU power; optional YAML
 | `carbonsight train SCRIPT.py [--json] [--launch ...]` | Build a SkyPilot task from `python SCRIPT.py`, then same as advise or run |
 | `carbonsight advise --yaml FILE [--json] [--max-cost-premium P]` | Rank regions by CO₂ (and cost), filter expensive outliers |
 | `carbonsight run FILE [--dry-run] [--no-exec] [--skip-preflight]` | Advise + optional AWS quota check + patch YAML + `sky launch` / `sky jobs launch` |
-| `carbonsight mappings validate` | Compare registry coords to WattTime `region-from-loc` (needs credentials) |
+| `carbonsight mappings validate [--json]` | Compare stored `wt_regions` to live `region-from-loc` (mixture-aware); exit `1` on drift; skipped without creds |
+| `carbonsight mappings refresh [--write]` | Re-resolve WattTime regions from site coords; dry-run by default |
 | `carbonsight backtest run [--json]` | Synthetic MOER/price policy experiment |
 
 ## API (optional)
@@ -82,6 +83,13 @@ uvicorn carbonsight_api.main:app --reload
 
 - `GET /health`
 - `POST /v1/recommendations` — same inputs as a `JobSpec` (see OpenAPI at `/docs`)
+- `POST /v1/mappings/revalidate` — drift check against bundled registry (needs WattTime creds)
+
+Validate mappings (CI-friendly without creds):
+
+```bash
+carbonsight mappings validate --json   # status: skipped without creds; ok or drift with creds
+```
 
 ## Tests
 
