@@ -85,13 +85,15 @@ Relevant code:
 ### 4) Mapping registry drift checks (`carbonsight mappings validate`)
 
 - **Input**: mapping registry JSON (default seeded file, or `--registry`)
-- **Behavior**: for each region + site (lat/lon), calls WattTime `region-from-loc` and compares the returned region code to what’s stored
-- **Output**: prints `DRIFT: ...` lines and a count, or `OK: no drift detected`
-- **Credentials**: if WattTime creds are missing, it exits successfully and prints that drift checks are skipped
+- **Behavior**: for each region, calls WattTime `region-from-loc` per site, builds mixture `wt_regions` (same logic as refresh), compares to stored values; reports **mapping confidence** per region
+- **Output**: human `OK` / `DRIFT` lines with confidence, or `--json` with `status` (`ok`, `drift`, or `skipped`)
+- **Exit codes**: `0` if no drift (or creds missing → skipped); `1` if drift detected
+- **Credentials**: if WattTime creds are missing, exits `0` with `status: skipped`
 
 Relevant code:
 
-- CLI implementation: `carbonsight/apps/cli/carbonsight_cli/commands/mappings.py`
+- Core: `carbonsight/packages/core/carbonsight_core/mapping/validate.py`
+- CLI: `carbonsight/apps/cli/carbonsight_cli/commands/mappings.py`
 
 ### 4b) Refresh WattTime mappings (`carbonsight mappings refresh`)
 
@@ -123,7 +125,7 @@ The API mirrors the CLI “advise” flow and exposes minimal endpoints.
   - `GET /health`
   - `POST /v1/recommendations`: ranks regions like `carbonsight advise` (requires WattTime env vars; returns `[]` without them)
   - `GET /v1/regions`: returns regions from the registry plus confidence + WattTime mixture weights
-  - `POST /v1/mappings/revalidate`: currently a stub trigger message (no worker wired)
+  - `POST /v1/mappings/revalidate`: runs mapping drift validation (same core as CLI `mappings validate`); returns JSON with `status` (`ok` / `drift`); `503` without WattTime creds
   - `POST /v1/runs` / `GET /v1/runs/{run_id}`: in-memory “runs store” (no Postgres wired yet)
 
 Relevant code:
@@ -142,7 +144,7 @@ Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and per
 ## What it does *not* do yet (important limitations)
 
 - **No persistent DB for API**: API runs are stored in memory only (`_runs_store`), not Postgres. CLI runs are persisted in SQLite.
-- **No mapping auto-revalidation**: API `/mappings/revalidate` doesn’t actually revalidate; CLI `mappings validate` does live checks.
+- **No mapping auto-refresh via API**: `POST /v1/mappings/revalidate` validates drift only; use CLI `mappings refresh --write` to update the registry JSON.
 - **Not compliance-grade accounting**: this is an operational estimate from marginal emissions + a simplified power model.
 - **Scheduling is advisory**: `--max-delay` recommends a start time but does not actually wait before launching.
 
@@ -158,5 +160,6 @@ Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and per
 - **Checkpoint core**: `carbonsight/packages/core/carbonsight_core/checkpoint.py`
 - **Checkpoint shim**: `carbonsight/packages/core/carbonsight_core/checkpoint_shim.py`
 - **Mapping registry**: `carbonsight/packages/core/carbonsight_core/mapping/registry.py`
+- **Mapping validate**: `carbonsight/packages/core/carbonsight_core/mapping/validate.py`
 - **WattTime client**: `carbonsight/packages/core/carbonsight_core/watttime.py`
 

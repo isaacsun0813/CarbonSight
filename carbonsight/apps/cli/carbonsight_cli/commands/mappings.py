@@ -1,17 +1,23 @@
 """carbonsight mappings validate / refresh"""
 
+import json
 from pathlib import Path
 
 import typer
 from carbonsight_core.config import Config
 from carbonsight_core.mapping.refresh import refresh_registry_mappings
 from carbonsight_core.mapping.registry import Registry, write_registry_json
+from carbonsight_core.mapping.validate import (
+    skipped_validate_result_to_dict,
+    validate_registry_mappings,
+    validate_result_to_dict,
+)
 from carbonsight_core.paths import (
     carbonsight_package_root_from_cli_command_file,
     registry_json_path,
     resolve_registry_json_file,
 )
-from carbonsight_core.watttime import WattTimeClient, WattTimeError
+from carbonsight_core.watttime import WattTimeClient
 
 mappings_group = typer.Typer(help="Mapping registry and drift checks")
 
@@ -21,6 +27,29 @@ def _format_wt_regions(wt_regions: list[tuple[str, float]]) -> str:
         return "[]"
     parts = [f"{wt}:{weight:g}" for wt, weight in wt_regions]
     return "[" + ", ".join(parts) + "]"
+
+
+def _print_validate_result(result) -> None:
+    for region in result.regions:
+        label = f"{region.provider}/{region.region_code}"
+        wt_fmt = _format_wt_regions(region.live_wt_regions)
+        conf = f"confidence={region.mapping_confidence:.2f} ({region.confidence_label})"
+        if region.drift:
+            stored_fmt = _format_wt_regions(region.stored_wt_regions)
+            typer.echo(f"DRIFT {label}: stored={stored_fmt} live={wt_fmt} {conf}")
+        else:
+            typer.echo(f"OK {label}: {wt_fmt} {conf}")
+    for warning in result.warnings:
+        typer.echo(f"Warning: {warning}", err=True)
+    if result.has_drift:
+        typer.echo(
+            f"Summary: {result.regions_drift} drift(s), {result.regions_ok} ok, "
+            f"{len(result.warnings)} warning(s)",
+        )
+    else:
+        typer.echo(
+            f"Summary: no drift ({result.regions_ok} ok), {len(result.warnings)} warning(s)",
+        )
 
 
 def _print_refresh_result(result) -> None:
@@ -43,9 +72,9 @@ def _print_refresh_result(result) -> None:
 @mappings_group.command("validate")
 def validate(
     registry_path: Path | None = typer.Option(None, "--registry", help="Path to mapping registry JSON"),
+    json_out: bool = typer.Option(False, "--json", help="Output machine-readable JSON"),
 ) -> None:
     """Run drift checks (region-from-loc vs stored); print diff and confidence."""
-    reg = Registry()
     package_root = carbonsight_package_root_from_cli_command_file(Path(__file__))
     rpath = resolve_registry_json_file(
         registry_path, carbonsight_package_root=package_root, cwd=Path.cwd()
@@ -53,37 +82,31 @@ def validate(
     if not rpath.exists():
         typer.echo("No registry found. Use --registry.", err=True)
         raise typer.Exit(1)
-    reg.load_json(rpath)
 
     config = Config.from_env()
     if not config.watttime_username or not config.watttime_password:
-        typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD to validate against live API.", err=True)
-        typer.echo("OK (no drift check without credentials).")
+        skip_msg = (
+            "Set WATTTIME_USERNAME and WATTTIME_PASSWORD to validate against live API."
+        )
+        if json_out:
+            typer.echo(json.dumps(skipped_validate_result_to_dict(skip_msg)))
+        else:
+            typer.echo(skip_msg, err=True)
+            typer.echo("OK (no drift check without credentials).")
         raise typer.Exit(0)
 
+    reg = Registry()
+    reg.load_json(rpath)
     wt = WattTimeClient(config)
-    drift_count = 0
-    for entry in reg.all_regions():
-        for site in entry.sites:
-            try:
-                data = wt.region_from_loc(site.lat, site.lon, signal_type="co2_moer")
-                current_wt = data.get("region") or data.get("abbrev") or str(data)
-                stored = next((r for r, _ in entry.wt_regions), None) if entry.wt_regions else None
-                if stored and current_wt != stored:
-                    typer.echo(
-                        f"DRIFT: {entry.provider}/{entry.region_code} site {site.site_id}: "
-                        f"stored={stored} live={current_wt}",
-                    )
-                    drift_count += 1
-            except WattTimeError as e:
-                typer.echo(f"Warning: {entry.region_code} {site.site_id}: {e}", err=True)
-            except Exception as e:
-                typer.echo(f"Warning: {entry.region_code} {site.site_id}: {e}", err=True)
+    result = validate_registry_mappings(reg, wt)
 
-    if drift_count == 0:
-        typer.echo("OK: no drift detected (all region-from-loc match stored).")
+    if json_out:
+        typer.echo(json.dumps(validate_result_to_dict(result)))
     else:
-        typer.echo(f"Found {drift_count} drift(s). Update registry or revalidate.")
+        _print_validate_result(result)
+
+    if result.has_drift:
+        raise typer.Exit(1)
 
 
 @mappings_group.command("refresh")

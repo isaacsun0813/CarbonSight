@@ -97,10 +97,10 @@ Implementation: `carbonsight/packages/core/carbonsight_core/checkpoint.py` (core
 ## Other entrypoints (short)
 
 - **`train`** — convenience wrapper: script path → temp YAML → advise or run (see above).
-- **`mappings validate`** — hits WattTime `region_from_loc` with our lat/lons and checks we didn’t drift from what’s in the registry. I should run this when I touch `seed_registry.json`.
+- **`mappings validate`** — hits WattTime `region_from_loc` per site, builds mixture-aware `wt_regions`, compares to stored registry; reports **mapping confidence**; `--json` for scripts; **exit 1 on drift** (exit 0 if creds missing). Core: `mapping/validate.py`.
 - **`mappings refresh`** — re-resolves WattTime grid codes from site coordinates and updates `wt_regions` in the registry JSON; **dry-run by default**; `--write` persists (use `--out` to avoid overwriting bundled seed).
 - **`backtest`** — synthetic MOER/price; tests policy without live API.
-- **API** — same ideas over REST; run storage is still stubby.
+- **API** — `POST /v1/mappings/revalidate` runs the same validate core as CLI; run storage is still stubby.
 
 ---
 
