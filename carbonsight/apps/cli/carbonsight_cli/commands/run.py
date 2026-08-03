@@ -28,6 +28,7 @@ from carbonsight_core.paths import (
     resolve_registry_json_file,
 )
 from carbonsight_core.preflight.availability import InstanceAvailabilityChecker
+from carbonsight_core.preflight.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.preflight.quota import QuotaChecker
 from carbonsight_core.region_ranking import AwsRegionRankingService
 from carbonsight_core.scheduler import pick_lowest_carbon_start
@@ -147,12 +148,17 @@ def run_launch(
     watt_time = WattTimeClient(config)
     quota_checker = QuotaChecker() if not skip_preflight else None
     availability_checker = InstanceAvailabilityChecker(config) if not skip_preflight else None
+    enabled_regions_provider = EnabledRegionsProvider(config) if not skip_preflight else None
     ranking = AwsRegionRankingService(
         reg,
         watt_time,
         quota_checker=quota_checker,
         availability_checker=availability_checker,
+        enabled_regions_provider=enabled_regions_provider,
     )
+
+    def _enabled_region_skip(region_code: str, reason: str) -> None:
+        typer.echo(f"  Skipping {region_code}: {reason}", err=True)
 
     def _quota_skip(region_code: str, reason: str) -> None:
         typer.echo(f"  Skipping {region_code}: {reason}", err=True)
@@ -166,13 +172,17 @@ def run_launch(
     estimates = ranking.collect_estimates(
         job,
         use_spot=use_spot,
+        on_enabled_region_skip=_enabled_region_skip,
         on_quota_skip=_quota_skip,
         on_availability_skip=_availability_skip,
         on_estimate_error=_estimate_warn,
     )
 
     if not estimates:
-        typer.echo("No regions available after quota, availability, and WattTime checks.", err=True)
+        typer.echo(
+            "No regions available after enabled-region, quota, availability, and WattTime checks.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     best = AwsRegionRankingService.pick_best_region_for_launch(estimates, max_cost_premium)
@@ -339,7 +349,11 @@ def run_cmd(
     yaml_path: Path = typer.Argument(..., help="Path to SkyPilot-style job YAML"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print patched YAML only, do not launch"),
     no_exec: bool = typer.Option(False, "--no-exec", help="Pick region and patch YAML but skip launch"),
-    skip_preflight: bool = typer.Option(False, "--skip-preflight", help="Skip AWS GPU quota check"),
+    skip_preflight: bool = typer.Option(
+        False,
+        "--skip-preflight",
+        help="Skip AWS preflight (enabled regions, GPU quota, instance offerings)",
+    ),
     managed: bool = typer.Option(False, "--managed", help="Use sky jobs launch (managed spot) instead of sky launch"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Pass --yes to SkyPilot (skip confirmation prompt)"),
     max_cost_premium: float = typer.Option(

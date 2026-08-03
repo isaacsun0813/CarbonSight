@@ -40,7 +40,7 @@ Flow that’s in my head:
 - **Power model** answers: *how many watts is this job probably drawing?* (we don’t know utilization, so we randomize — more on that below)
 - **carbon_model** multiplies energy × MOER, converts units, runs Monte Carlo for a range
 
-Optional: **boto** checks AWS quotas and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Offerings use `ec2:DescribeInstanceTypeOfferings` (read-only, fail-open on API errors). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
+Optional: **boto** checks account-enabled regions (`describe_regions`), GPU quotas, and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Offerings use `ec2:DescribeInstanceTypeOfferings`; enabled regions use one `ec2:DescribeRegions` intersected with the registry (run preflight only). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
 
 ---
 

@@ -58,7 +58,7 @@ Key behavior from the code:
 - **Run tracking**: each run is persisted to a SQLite ledger (`~/.carbonsight/runs.db` by default, overridable with `--db` or `CARBONSIGHT_DB`). Baseline is `us-east-1` on-demand/spot (matching `--spot`).
 - **Dry run**: `--dry-run` prints patched YAML and exits
 - **No exec**: `--no-exec` prints patched YAML and exits (after choosing region)
-- **AWS preflight**: enabled by default (`--skip-preflight` to disable); checks GPU Service Quotas and EC2 instance type offerings per region
+- **AWS preflight**: enabled by default (`--skip-preflight` to disable); intersects registry with account-enabled regions, checks GPU Service Quotas, and EC2 instance type offerings per region
 - **After a successful SkyPilot launch**: attempts to compute **actual CO₂** using **historical MOER** over the wall-clock run window and compares to the estimate.
 
 Relevant code:
@@ -66,6 +66,7 @@ Relevant code:
 - CLI implementation: `carbonsight/apps/cli/carbonsight_cli/commands/run.py`
 - Quota checker: `carbonsight/packages/core/carbonsight_core/preflight/quota.py`
 - Instance availability: `carbonsight/packages/core/carbonsight_core/preflight/availability.py`
+- Enabled regions: `carbonsight/packages/core/carbonsight_core/preflight/enabled_regions.py`
 - Actual-run carbon: `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py`
 - Scheduler: `carbonsight/packages/core/carbonsight_core/scheduler.py`
 - Run ledger: `carbonsight/packages/core/carbonsight_core/tracking.py`
