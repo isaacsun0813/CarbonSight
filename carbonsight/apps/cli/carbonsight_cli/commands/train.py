@@ -89,7 +89,11 @@ def train_cmd(
     json_out: bool = typer.Option(False, "--json", help="[advise] Machine-readable JSON"),
     dry_run: bool = typer.Option(False, "--dry-run", help="[launch] Print patched YAML only"),
     no_exec: bool = typer.Option(False, "--no-exec", help="[launch] Patch YAML but do not call sky"),
-    skip_preflight: bool = typer.Option(False, "--skip-preflight", help="[launch] Skip AWS GPU quota check"),
+    skip_preflight: bool = typer.Option(
+        False,
+        "--skip-preflight",
+        help="[launch] Skip AWS preflight (enabled regions, GPU quota, instance offerings)",
+    ),
     managed: bool = typer.Option(False, "--managed", help="[launch] Use sky jobs launch"),
     yes: bool = typer.Option(False, "--yes", "-y", help="[launch] Pass --yes to SkyPilot"),
     registry_path: Path | None = typer.Option(None, "--registry", help="Path to mapping registry JSON"),

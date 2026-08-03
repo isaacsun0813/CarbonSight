@@ -1,7 +1,8 @@
 """
 Single orchestration path for ranking AWS regions by estimated carbon.
 
-CLI and API use :class:`AwsRegionRankingService` so region loops, quota, availability, and confidence rules stay in sync.
+CLI and API use :class:`AwsRegionRankingService` so region loops, enabled-region,
+quota, availability, and confidence rules stay in sync.
 Sequential WattTime calls: the client token cache is not thread-safe for parallel forecasts.
 """
 
@@ -11,14 +12,23 @@ from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
 from carbonsight_core.mapping.registry import Registry, mapping_confidence
 from carbonsight_core.models import EstimateResult, JobSpec
 from carbonsight_core.preflight.availability import InstanceAvailabilityChecker
+from carbonsight_core.preflight.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.preflight.quota import QuotaChecker
 from carbonsight_core.watttime import WattTimeClient, WattTimeError
+
+_ENABLED_REGION_SKIP_REASON = "region not enabled for this AWS account"
 
 
 class AwsRegionRankingService:
     """Load registry + WattTime once; enumerate AWS regions and build :class:`EstimateResult` rows."""
 
-    __slots__ = ("_registry", "_quota_checker", "_availability_checker", "_estimator")
+    __slots__ = (
+        "_registry",
+        "_quota_checker",
+        "_availability_checker",
+        "_enabled_regions_provider",
+        "_estimator",
+    )
 
     def __init__(
         self,
@@ -27,10 +37,12 @@ class AwsRegionRankingService:
         *,
         quota_checker: QuotaChecker | None = None,
         availability_checker: InstanceAvailabilityChecker | None = None,
+        enabled_regions_provider: EnabledRegionsProvider | None = None,
     ) -> None:
         self._registry = registry
         self._quota_checker = quota_checker
         self._availability_checker = availability_checker
+        self._enabled_regions_provider = enabled_regions_provider
         self._estimator = JobCarbonEstimator(watt_time)
 
     def collect_estimates(
@@ -38,18 +50,27 @@ class AwsRegionRankingService:
         job: JobSpec,
         *,
         use_spot: bool = False,
+        on_enabled_region_skip: Callable[[str, str], None] | None = None,
         on_quota_skip: Callable[[str, str], None] | None = None,
         on_availability_skip: Callable[[str, str], None] | None = None,
         on_estimate_error: Callable[[str, BaseException], None] | None = None,
     ) -> list[EstimateResult]:
         """
-        One pass over registry: optional quota + availability filters, then WattTime + Monte Carlo.
+        One pass over registry: optional enabled-region, quota, availability filters, then estimate.
 
         Callbacks are optional I/O hooks (e.g. typer.echo); core stays free of CLI dependencies.
         """
+        enabled_regions: frozenset[str] | None = None
+        if self._enabled_regions_provider is not None:
+            enabled_regions = self._enabled_regions_provider.enabled_region_codes()
+
         estimates: list[EstimateResult] = []
         for entry in self._registry.all_regions():
             if not entry.wt_regions or entry.provider.lower() != "aws":
+                continue
+            if enabled_regions is not None and entry.region_code not in enabled_regions:
+                if on_enabled_region_skip is not None:
+                    on_enabled_region_skip(entry.region_code, _ENABLED_REGION_SKIP_REASON)
                 continue
             if self._quota_checker is not None:
                 quota_result = self._quota_checker.check_gpu_quota(
@@ -129,6 +150,8 @@ def collect_aws_region_estimates(
     *,
     quota_checker: QuotaChecker | None = None,
     availability_checker: InstanceAvailabilityChecker | None = None,
+    enabled_regions_provider: EnabledRegionsProvider | None = None,
+    on_enabled_region_skip: Callable[[str, str], None] | None = None,
     on_quota_skip: Callable[[str, str], None] | None = None,
     on_availability_skip: Callable[[str, str], None] | None = None,
     on_estimate_error: Callable[[str, BaseException], None] | None = None,
@@ -139,8 +162,10 @@ def collect_aws_region_estimates(
         watt_time,
         quota_checker=quota_checker,
         availability_checker=availability_checker,
+        enabled_regions_provider=enabled_regions_provider,
     ).collect_estimates(
         job,
+        on_enabled_region_skip=on_enabled_region_skip,
         on_quota_skip=on_quota_skip,
         on_availability_skip=on_availability_skip,
         on_estimate_error=on_estimate_error,
