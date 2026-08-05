@@ -20,7 +20,9 @@ All the real Python is under **`carbonsight/`** (that’s where `pyproject.toml`
 carbonsight/
   apps/cli/carbonsight_cli/     # Typer: advise, run, mappings, backtest
   apps/api/carbonsight_api/     # FastAPI if we want HTTP
-  packages/core/carbonsight_core/   # This is the brain — WattTime, registry, math
+  packages/core/carbonsight_core/   # Brain — WattTime, registry, math, cloud adapters
+    cloud/                      # Provider Protocols; AWS base + GPU catalog
+    estimator/aws_estimation/   # Live EC2 spot + Pricing API on-demand
   tests/
   infra/                        # SQL schemas; Postgres not fully wired yet
 ```
@@ -40,7 +42,7 @@ Flow that’s in my head:
 - **Power model** answers: *how many watts is this job probably drawing?* (we don’t know utilization, so we randomize — more on that below)
 - **carbon_model** multiplies energy × MOER, converts units, runs Monte Carlo for a range
 
-Optional: **boto** checks account-enabled regions (`describe_regions`), GPU quotas, and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Offerings use `ec2:DescribeInstanceTypeOfferings`; enabled regions use one `ec2:DescribeRegions` intersected with the registry (run preflight only). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
+Optional: **boto** checks account-enabled regions (`describe_regions`), GPU quotas, and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Live spot/on-demand pricing and preflight availability/enabled-regions share **`BaseAWSProvider`** (`cloud/aws/base.py`) for session/client setup; quota checks still use raw boto3. Offerings use `ec2:DescribeInstanceTypeOfferings`; enabled regions use one `ec2:DescribeRegions` intersected with the registry (run preflight only). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
 
 ---
 
@@ -150,6 +152,9 @@ We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per re
 | CO₂ math, Monte Carlo, post-run | `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py` |
 | Watt curves, PUE sampling | `.../estimator/power_model.py` |
 | $ estimates, spot/on-demand pricing | `.../estimator/pricing.py`, `.../estimator/aws_estimation/`, `.../cloud/aws/gpu_catalog.py` |
+| AWS shared boto plumbing | `.../cloud/aws/base.py` |
+| Mapping drift / refresh | `.../mapping/validate.py`, `.../mapping/refresh.py` |
+| Preflight (quota, offerings, enabled regions) | `.../preflight/` (availability/enabled_regions use `BaseAWSProvider`) |
 | Region → grid JSON | `.../mapping/seed_registry.json` |
 | WattTime client / auth / retries | `.../watttime.py` |
 | Time-shift scheduling | `.../scheduler.py` |

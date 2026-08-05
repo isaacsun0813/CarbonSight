@@ -58,7 +58,7 @@ Key behavior from the code:
 - **Run tracking**: each run is persisted to a SQLite ledger (`~/.carbonsight/runs.db` by default, overridable with `--db` or `CARBONSIGHT_DB`). Baseline is `us-east-1` on-demand/spot (matching `--spot`).
 - **Dry run**: `--dry-run` prints patched YAML and exits
 - **No exec**: `--no-exec` prints patched YAML and exits (after choosing region)
-- **AWS preflight**: enabled by default (`--skip-preflight` to disable); intersects registry with account-enabled regions, checks GPU Service Quotas, and EC2 instance type offerings per region
+- **AWS preflight**: enabled by default (`--skip-preflight` to disable); intersects registry with account-enabled regions, checks GPU Service Quotas, and EC2 instance type offerings per region. Instance availability and enabled-regions checks extend `BaseAWSProvider` (`cloud/aws/base.py`); quota checks use raw boto3.
 - **After a successful SkyPilot launch**: attempts to compute **actual CO₂** using **historical MOER** over the wall-clock run window and compares to the estimate.
 
 Relevant code:
@@ -101,6 +101,11 @@ Relevant code:
 - **Behavior**: calls `region-from-loc` per site, rebuilds `wt_regions` (including mixtures), sets `last_verified_at` and `s_recency` on success
 - **Default**: dry-run (prints per-region diffs only)
 - **`--write`**: persist JSON to `--registry` path or `--out` (refuses to overwrite bundled `seed_registry.json` without `--out`)
+
+Relevant code:
+
+- Core: `carbonsight/packages/core/carbonsight_core/mapping/refresh.py`
+- CLI: `carbonsight/apps/cli/carbonsight_cli/commands/mappings.py`
 
 ### 5) Backtest harness (`carbonsight backtest run`)
 
@@ -153,13 +158,16 @@ Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and per
 - **CLI entrypoint**: `carbonsight/apps/cli/carbonsight_cli/main.py`
 - **Core orchestration**: `carbonsight/packages/core/carbonsight_core/region_ranking.py`
 - **Estimator**: `carbonsight/packages/core/carbonsight_core/estimator/`
-- **Live spot pricing**: `carbonsight/packages/core/carbonsight_core/estimator/aws_spot_pricing.py`
-- **Live on-demand pricing**: `carbonsight/packages/core/carbonsight_core/estimator/aws_ondemand_pricing.py`
+- **Live AWS pricing**: `carbonsight/packages/core/carbonsight_core/estimator/aws_estimation/` (`SpotPriceProvider`, `OnDemandPriceProvider`; re-exported from `aws_estimation/__init__.py`)
+- **AWS GPU instance catalog**: `carbonsight/packages/core/carbonsight_core/cloud/aws/gpu_catalog.py`
+- **AWS provider base**: `carbonsight/packages/core/carbonsight_core/cloud/aws/base.py` (`BaseAWSProvider` — shared session/client for spot, on-demand, preflight)
+- **Cloud protocols**: `carbonsight/packages/core/carbonsight_core/cloud/base.py`
 - **Scheduler**: `carbonsight/packages/core/carbonsight_core/scheduler.py`
 - **Run ledger**: `carbonsight/packages/core/carbonsight_core/tracking.py`
 - **Checkpoint core**: `carbonsight/packages/core/carbonsight_core/checkpoint.py`
 - **Checkpoint shim**: `carbonsight/packages/core/carbonsight_core/checkpoint_shim.py`
 - **Mapping registry**: `carbonsight/packages/core/carbonsight_core/mapping/registry.py`
 - **Mapping validate**: `carbonsight/packages/core/carbonsight_core/mapping/validate.py`
+- **Mapping refresh**: `carbonsight/packages/core/carbonsight_core/mapping/refresh.py`
 - **WattTime client**: `carbonsight/packages/core/carbonsight_core/watttime.py`
 
