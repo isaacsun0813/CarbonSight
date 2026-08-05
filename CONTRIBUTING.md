@@ -17,6 +17,8 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
+The `dev` extra includes FastAPI, SQLAlchemy, and `boto3` so `pytest tests/unit tests/e2e` and CI match without also installing `.[api]` or `.[aws]`.
+
 ## Checks
 
 From `carbonsight/`:
