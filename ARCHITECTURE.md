@@ -149,7 +149,7 @@ We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per re
 |-------------------|------|
 | CO₂ math, Monte Carlo, post-run | `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py` |
 | Watt curves, PUE sampling | `.../estimator/power_model.py` |
-| $ estimates, spot/on-demand pricing | `.../estimator/pricing.py`, `.../estimator/aws_spot_pricing.py`, `.../estimator/aws_ondemand_pricing.py`, `.../estimator/aws_pricing_locations.py`, `.../estimator/gpu_catalog.py` |
+| $ estimates, spot/on-demand pricing | `.../estimator/pricing.py`, `.../estimator/aws_estimation/`, `.../cloud/aws/gpu_catalog.py` |
 | Region → grid JSON | `.../mapping/seed_registry.json` |
 | WattTime client / auth / retries | `.../watttime.py` |
 | Time-shift scheduling | `.../scheduler.py` |

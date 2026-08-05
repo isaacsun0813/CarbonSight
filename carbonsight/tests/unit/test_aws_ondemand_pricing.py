@@ -5,13 +5,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from carbonsight_core.config import Config
-from carbonsight_core.estimator.aws_ondemand_pricing import (
+from carbonsight_core.estimator.aws_estimation.aws_ondemand_pricing import (
     OnDemandPriceProvider,
     parse_ondemand_instance_price_usd,
 )
-from carbonsight_core.estimator.aws_pricing_locations import pricing_location_for_region
+from carbonsight_core.estimator.aws_estimation.aws_pricing_locations import (
+    pricing_location_for_region,
+)
 from carbonsight_core.estimator.pricing import (
     configure_pricing,
     estimate_cost_usd,
@@ -50,7 +51,7 @@ class TestParseOndemandInstancePrice:
 
 
 class TestOnDemandPriceProvider:
-    @patch("carbonsight_core.estimator.aws_ondemand_pricing.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_get_products_returns_per_gpu_hour(
         self, mock_boto3: MagicMock, get_products_fixture: dict,
     ) -> None:
