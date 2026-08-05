@@ -3,7 +3,6 @@
 from unittest.mock import MagicMock, patch
 
 from botocore.exceptions import ClientError
-
 from carbonsight_core.mapping.registry import CloudRegionEntry, Registry
 from carbonsight_core.models import EstimateResult, JobSpec
 from carbonsight_core.preflight.enabled_regions import EnabledRegionsProvider
@@ -30,7 +29,7 @@ def _two_region_registry() -> Registry:
 
 
 class TestEnabledRegionsProvider:
-    @patch("carbonsight_core.preflight.enabled_regions.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_returns_enabled_region_codes(self, mock_boto3: MagicMock) -> None:
         ec2 = MagicMock()
         ec2.describe_regions.return_value = {
@@ -48,7 +47,7 @@ class TestEnabledRegionsProvider:
         assert codes == frozenset({"us-east-1", "us-west-2"})
         ec2.describe_regions.assert_called_once_with(AllRegions=False)
 
-    @patch("carbonsight_core.preflight.enabled_regions.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_empty_regions_returns_empty_frozenset(self, mock_boto3: MagicMock) -> None:
         ec2 = MagicMock()
         ec2.describe_regions.return_value = {"Regions": []}
@@ -59,7 +58,7 @@ class TestEnabledRegionsProvider:
         provider = EnabledRegionsProvider()
         assert provider.enabled_region_codes() == frozenset()
 
-    @patch("carbonsight_core.preflight.enabled_regions.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_client_error_fails_open(self, mock_boto3: MagicMock) -> None:
         ec2 = MagicMock()
         ec2.describe_regions.side_effect = ClientError(
@@ -73,7 +72,7 @@ class TestEnabledRegionsProvider:
         provider = EnabledRegionsProvider()
         assert provider.enabled_region_codes() is None
 
-    @patch("carbonsight_core.preflight.enabled_regions.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_cache_avoids_repeat_api_calls(self, mock_boto3: MagicMock) -> None:
         ec2 = MagicMock()
         ec2.describe_regions.return_value = {

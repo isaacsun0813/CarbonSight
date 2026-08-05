@@ -45,7 +45,7 @@ def _mock_ec2_clients(us_offerings: list, ap_offerings: list) -> MagicMock:
 
 
 class TestInstanceAvailabilityChecker:
-    @patch("carbonsight_core.preflight.availability.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_offering_present_is_available(self, mock_boto3: MagicMock) -> None:
         mock_boto3.Session.return_value = _mock_ec2_clients(
             [{"InstanceType": "p4d.24xlarge"}], [],
@@ -55,7 +55,7 @@ class TestInstanceAvailabilityChecker:
         assert result.available is True
         assert result.instance_type == "p4d.24xlarge"
 
-    @patch("carbonsight_core.preflight.availability.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_empty_offerings_not_available(self, mock_boto3: MagicMock) -> None:
         mock_boto3.Session.return_value = _mock_ec2_clients([], [])
         checker = InstanceAvailabilityChecker()
@@ -70,7 +70,7 @@ class TestInstanceAvailabilityChecker:
         assert result.available is True
         assert "unknown GPU" in result.reason
 
-    @patch("carbonsight_core.preflight.availability.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_client_error_fails_open(self, mock_boto3: MagicMock) -> None:
         ec2 = MagicMock()
         ec2.describe_instance_type_offerings.side_effect = ClientError(
@@ -86,7 +86,7 @@ class TestInstanceAvailabilityChecker:
         assert result.available is True
         assert "UnauthorizedOperation" in result.reason
 
-    @patch("carbonsight_core.preflight.availability.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_cache_avoids_repeat_api_calls(self, mock_boto3: MagicMock) -> None:
         session = _mock_ec2_clients([{"InstanceType": "p4d.24xlarge"}], [])
         mock_boto3.Session.return_value = session
@@ -101,7 +101,7 @@ class TestInstanceAvailabilityChecker:
 
 class TestRankingAvailabilitySkip:
     @patch("carbonsight_core.estimator.carbon_model.JobCarbonEstimator.estimate_region")
-    @patch("carbonsight_core.preflight.availability.boto3")
+    @patch("carbonsight_core.cloud.aws.base.boto3")
     def test_collect_estimates_skips_unavailable_regions(
         self, mock_boto3: MagicMock, mock_estimate: MagicMock,
     ) -> None:
