@@ -22,3 +22,7 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Local reference material (not for the public repo)
+nsdi24-wu-zhanghao.pdf
+*.pdf
