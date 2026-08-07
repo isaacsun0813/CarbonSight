@@ -26,3 +26,7 @@ htmlcov/
 # pytest verification suite
 carbonsight/misc/
 
+
+# Local reference material (not for the public repo)
+nsdi24-wu-zhanghao.pdf
+*.pdf
