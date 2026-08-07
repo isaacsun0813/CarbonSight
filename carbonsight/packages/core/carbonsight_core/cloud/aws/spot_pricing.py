@@ -1,8 +1,6 @@
 """Live EC2 spot pricing via describe_spot_price_history."""
 
-from botocore.exceptions import ClientError
-
-from carbonsight_core.cloud.aws.base import HAS_BOTO, BaseAWSProvider
+from carbonsight_core.cloud.aws.base import HAS_BOTO, BaseAWSProvider, ClientError
 from carbonsight_core.cloud.aws.gpu_catalog import aws_gpu_instance_spec
 
 SPOT_HISTORY_MAX_RESULTS = 50

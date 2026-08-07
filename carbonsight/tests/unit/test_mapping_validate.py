@@ -9,8 +9,8 @@ import pytest
 from carbonsight_cli.commands.mappings import mappings_group
 from carbonsight_core.mapping.registry import CloudRegionEntry, CloudSite, Registry
 from carbonsight_core.mapping.validate import (
-    validate_registry_mappings,
     drift_report_to_dict,
+    validate_registry_mappings,
 )
 from carbonsight_core.watttime import WattTimeError
 from typer.testing import CliRunner
