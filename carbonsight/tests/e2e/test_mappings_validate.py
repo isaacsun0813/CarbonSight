@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import pytest
 from carbonsight_core.mapping.registry import Registry
-from carbonsight_core.mapping.validate import validate_registry_mappings, validate_result_to_dict
+from carbonsight_core.mapping.validate import validate_registry_mappings, drift_report_to_dict
 from carbonsight_core.watttime import WattTimeClient
 
 
@@ -107,6 +107,6 @@ def test_validate_in_process_mocked(tmp_path: Path) -> None:
     wt = WattTimeClient(Config.from_env())
     with patch.object(wt, "region_from_loc", return_value={"region": "PJM_DC"}):
         result = validate_registry_mappings(reg, wt)
-    payload = validate_result_to_dict(result)
+    payload = drift_report_to_dict(result)
     assert payload["status"] == "ok"
     assert payload["regions_ok"] == 1

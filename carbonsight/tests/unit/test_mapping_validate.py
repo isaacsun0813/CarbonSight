@@ -10,7 +10,7 @@ from carbonsight_cli.commands.mappings import mappings_group
 from carbonsight_core.mapping.registry import CloudRegionEntry, CloudSite, Registry
 from carbonsight_core.mapping.validate import (
     validate_registry_mappings,
-    validate_result_to_dict,
+    drift_report_to_dict,
 )
 from carbonsight_core.watttime import WattTimeError
 from typer.testing import CliRunner
@@ -153,7 +153,7 @@ class TestValidateRegistryMappings:
         assert result.regions[0].live_wt_regions == [("PJM_DC", 1.0)]
 
 
-class TestValidateResultToDict:
+class TestDriftReportToDict:
     def test_json_shape(self) -> None:
         reg = Registry()
         entry = _single_site_entry("us-east-1", "s1", 1.0, 2.0)
@@ -164,7 +164,7 @@ class TestValidateResultToDict:
         wt.region_from_loc.return_value = {"region": "PJM_DC"}
 
         result = validate_registry_mappings(reg, wt)
-        payload = validate_result_to_dict(result)
+        payload = drift_report_to_dict(result)
         assert payload["status"] == "ok"
         assert payload["regions_ok"] == 1
         assert payload["regions_drift"] == 0

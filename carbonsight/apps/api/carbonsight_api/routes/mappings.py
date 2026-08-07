@@ -4,7 +4,7 @@ from pathlib import Path
 
 from carbonsight_core.config import Config
 from carbonsight_core.mapping.registry import Registry
-from carbonsight_core.mapping.validate import validate_registry_mappings, validate_result_to_dict
+from carbonsight_core.mapping.validate import drift_report_to_dict, validate_registry_mappings
 from carbonsight_core.watttime import WattTimeClient
 from fastapi import APIRouter, HTTPException, Request
 
@@ -21,12 +21,12 @@ def post_mappings_revalidate(request: Request) -> dict:
             detail="WattTime credentials required (WATTTIME_USERNAME, WATTTIME_PASSWORD).",
         )
 
-    rpath: Path | None = getattr(request.app.state, "registry_path", None)
-    if not rpath or not rpath.exists():
+    registry_path: Path | None = getattr(request.app.state, "registry_path", None)
+    if not registry_path or not registry_path.exists():
         raise HTTPException(status_code=404, detail="Registry file not found.")
 
-    reg = Registry()
-    reg.load_json(rpath)
-    wt = WattTimeClient(config)
-    result = validate_registry_mappings(reg, wt)
-    return validate_result_to_dict(result)
+    registry = Registry()
+    registry.load_json(registry_path)
+    watt_time = WattTimeClient(config)
+    drift_report = validate_registry_mappings(registry, watt_time)
+    return drift_report_to_dict(drift_report)
