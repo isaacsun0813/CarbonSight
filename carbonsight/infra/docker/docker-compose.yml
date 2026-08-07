@@ -4,10 +4,17 @@
 #   docker compose -f carbonsight/infra/docker/docker-compose.yml \
 #                  --env-file carbonsight/.env up -d
 #
-# `--env-file` is required: with `-f`, compose looks for `.env` next to the
-# compose file, not in carbonsight/. POSTGRES_PASSWORD, WATTTIME_USERNAME and
-# WATTTIME_PASSWORD have no defaults, so compose refuses to start without them.
-# See carbonsight/.env.example.
+# `--env-file` matters: with `-f`, compose looks for `.env` next to the compose
+# file, not in carbonsight/. Three variables have no defaults and compose will
+# refuse to start without them:
+#
+#   POSTGRES_PASSWORD   no default because port 5432 is published to the host
+#   WATTTIME_USERNAME   the ONE central credential
+#   WATTTIME_PASSWORD
+#
+# Optional, with the defaults shown below: POSTGRES_USER, POSTGRES_DB,
+# WORKER_INTERVAL_SECONDS, GRID_SIGNAL_RETENTION_HOURS,
+# CARBONSIGHT_FORECAST_CACHE_TTL, LOG_LEVEL.
 #
 # This is the central-credential deployment. ONE WattTime login lives here, on the
 # worker; CLI users set CARBONSIGHT_API_URL=http://<host>:8000 and need none of
