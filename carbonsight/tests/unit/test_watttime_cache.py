@@ -143,7 +143,7 @@ def test_concurrent_set_and_get_are_safe() -> None:
     barrier = threading.Barrier(8)
 
     def hammer(worker: int) -> int:
-        barrier.wait()
+        barrier.wait(timeout=5)
         for _ in range(200):
             cache.set(f"R{worker % 3}", _points(START, [float(worker)]))
             cache.get(f"R{worker % 3}")

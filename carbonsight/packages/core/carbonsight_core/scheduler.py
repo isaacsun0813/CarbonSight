@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from carbonsight_core.estimator.carbon_model import _time_weighted_moer
+from carbonsight_core.watttime import time_weighted_moer
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,11 +45,11 @@ def pick_lowest_carbon_start(
         t = _parse_utc(p["point_time"])
         if t > deadline:
             break
-        moer = _time_weighted_moer(sorted_pts, t, t + window)
+        moer = time_weighted_moer(sorted_pts, t, t + window)
         candidates.append((t, moer))
 
     if not candidates:
-        candidates.append((t0, _time_weighted_moer(sorted_pts, t0, t0 + window)))
+        candidates.append((t0, time_weighted_moer(sorted_pts, t0, t0 + window)))
 
     best_start, best_moer = min(candidates, key=lambda c: (c[1], c[0]))
     now_moer = candidates[0][1]

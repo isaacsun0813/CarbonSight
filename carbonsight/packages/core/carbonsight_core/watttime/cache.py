@@ -30,13 +30,14 @@ def time_weighted_moer(
 ) -> float:
     """Time-weighted average MOER (lb/MWh) over [window_start, window_end].
 
-    Each point covers [t_i, t_{i+1}). If the window extends past the last point, the
-    last value is held constant (fill-forward).
+    Each point covers [t_i, t_{i+1}); the final point is held constant out to
+    ``window_end``, so a window extending past the end of the series fills forward.
 
     The weighted sum is divided by the seconds actually **covered** by points, not by
     the full window length. Dividing by the window length silently understates MOER
     whenever the head of the window has no forecast coverage, which would make an
-    uncovered region look greener than a covered one.
+    uncovered region look greener than a covered one. Callers integrate from wall-clock
+    starts against a 5-minute point grid, so that head gap is the normal case.
     """
     if not points:
         return 0.0
@@ -44,15 +45,6 @@ def time_weighted_moer(
         return float(points[0].get("value", 0.0))
 
     sorted_points = sorted(points, key=lambda point: _parse_utc(point["point_time"]))
-    # Extend coverage past the last point so the tail of the window is filled forward.
-    last_point = sorted_points[-1]
-    if _parse_utc(last_point["point_time"]) < window_end:
-        sorted_points = sorted_points + [
-            {
-                "point_time": (window_end + timedelta(seconds=1)).isoformat(),
-                "value": float(last_point["value"]),
-            }
-        ]
 
     weighted_sum = 0.0
     covered_seconds = 0.0

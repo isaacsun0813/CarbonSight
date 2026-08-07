@@ -3,9 +3,11 @@ WattTime v3 API client.
 Design doc: /login (basic auth), token cache, /v3/my-access, /v3/region-from-loc,
 /v3/forecast, /v3/historical, /v3/signal-index. Units: lbs_co2_per_mwh. 401 refresh, 429 backoff.
 
-Forecast and historical calls also work with no credentials at all: they fall back to a
+Forecast and historical calls also work with no credentials at all: they serve a
 per-region deterministic synthetic MOER curve so demos and tests never require secrets.
-The unit gate is never bypassed by that fallback — a WattTimeError always propagates.
+That substitution happens *only* when no credentials are configured. A configured client
+that fails — expired password, WattTime outage — raises, because a fabricated ranking that
+looks real is worse than no ranking. The lbs_co2_per_mwh unit gate likewise fails closed.
 """
 
 import hashlib
@@ -230,38 +232,34 @@ class WattTimeClient:
     ) -> dict[str, Any]:
         """GET /v3/forecast. Returns data with units (must be lbs_co2_per_mwh for kg).
 
-        Without credentials — or on a transport failure when ``allow_synthetic`` is set —
-        returns a synthetic payload in the same ``{"data": [...], "units": ...}`` envelope,
-        so callers never branch on where the forecast came from.
+        With **no credentials configured** this returns a synthetic payload in the same
+        ``{"data": [...], "units": ...}`` envelope, so a demo run needs no secrets.
+
+        A configured client that then *fails* — expired password, WattTime outage, DNS —
+        raises. Synthetic MOER is hash-derived, not physical: it ranks Sweden dirtier than
+        India. That is fine as an obviously-unconfigured demo and dangerous as a silent
+        fallback, because the caller cannot tell the two apart.
         """
         if not self.has_credentials:
             if not self._allow_synthetic:
                 raise WattTimeError("WattTime credentials not configured")
             return build_synthetic_forecast_payload(region, horizon_hours=horizon_hours)
 
-        try:
-            with client or httpx.Client() as http_client:
-                response = self._request(
-                    "GET",
-                    "/v3/forecast",
-                    http_client,
-                    params={
-                        "region": region,
-                        "signal_type": signal_type,
-                        "horizon_hours": horizon_hours,
-                    },
-                )
-                response.raise_for_status()
-                forecast_payload = response.json()
-                self._assert_moer_units(forecast_payload)
-                return forecast_payload
-        except WattTimeError:
-            # The unit gate fails closed; synthetic data must never paper over it.
-            raise
-        except Exception:
-            if self._allow_synthetic:
-                return build_synthetic_forecast_payload(region, horizon_hours=horizon_hours)
-            raise
+        with client or httpx.Client() as http_client:
+            response = self._request(
+                "GET",
+                "/v3/forecast",
+                http_client,
+                params={
+                    "region": region,
+                    "signal_type": signal_type,
+                    "horizon_hours": horizon_hours,
+                },
+            )
+            response.raise_for_status()
+            forecast_payload = response.json()
+            self._assert_moer_units(forecast_payload)
+            return forecast_payload
 
     def get_historical(
         self,

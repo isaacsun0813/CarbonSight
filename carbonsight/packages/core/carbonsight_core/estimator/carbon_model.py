@@ -4,58 +4,26 @@ Design: CO2_kg = (E_facility_MWh * MOER_lb_per_MWh) * 0.45359237; support mixtur
 """
 
 import random
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from carbonsight_core.estimator.power_model import sample_power_params
 from carbonsight_core.estimator.pricing import estimate_cost_usd, estimate_job_cost
 from carbonsight_core.models import ActualRunResult, EstimateResult, JobSpec
-from carbonsight_core.watttime import SUPPORTED_MOER_UNIT, WattTimeClient, WattTimeError
+from carbonsight_core.watttime import (
+    LB_TO_KG,
+    SUPPORTED_MOER_UNIT,
+    WattTimeClient,
+    WattTimeError,
+    time_weighted_moer,
+)
 
-LB_TO_KG = 0.45359237
 MONTE_CARLO_SAMPLES = 1000
 
 
 def _facility_mwh_per_hour(p_it_w: float, pue: float) -> float:
     """E_facility_MWh for one hour = (P_IT_W/1000)*1*hour*PUE/1000."""
     return (p_it_w / 1000.0) * 1.0 * (pue / 1000.0)
-
-
-def _time_weighted_moer(
-    points: list[dict[str, Any]],
-    actual_start: datetime,
-    actual_end: datetime,
-) -> float:
-    """Compute time-weighted average MOER (lb/MWh) over [actual_start, actual_end].
-
-    Each data point covers the interval from its timestamp to the next point's
-    timestamp. The first and last intervals are clipped to actual_start/actual_end.
-    If only one point, its value is used directly.
-    """
-    if len(points) == 1:
-        return float(points[0]["value"])
-
-    total_seconds = (actual_end - actual_start).total_seconds()
-    sorted_points = sorted(points, key=lambda p: p["point_time"])
-
-    def _parse_utc(ts: str) -> datetime:
-        dt = datetime.fromisoformat(ts)
-        return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
-
-    weighted_sum = 0.0
-    for i, p in enumerate(sorted_points):
-        t_i = _parse_utc(p["point_time"])
-        t_next = (
-            _parse_utc(sorted_points[i + 1]["point_time"])
-            if i + 1 < len(sorted_points)
-            else actual_end
-        )
-        interval_start = max(t_i, actual_start)
-        interval_end = min(t_next, actual_end)
-        overlap = max(0.0, (interval_end - interval_start).total_seconds())
-        weighted_sum += float(p["value"]) * overlap
-
-    return weighted_sum / total_seconds
 
 
 class JobCarbonEstimator:
@@ -161,7 +129,13 @@ class JobCarbonEstimator:
         *,
         historical_moer_override: list[dict[str, Any]] | None = None,
     ) -> ActualRunResult:
-        """Integrate historical MOER over the run window; compare to the pre-run estimate mean."""
+        """Integrate historical MOER over the run window; compare to the pre-run estimate mean.
+
+        ``actual_start`` is wall-clock while WattTime points land on a 5-minute grid, so the
+        head of the window is normally uncovered. :func:`time_weighted_moer` divides by the
+        seconds it actually covered — dividing by the window length instead under-reports
+        actual CO₂ (up to ~28% on a 10-minute job) and inflates the savings-vs-estimate line.
+        """
         if actual_end <= actual_start:
             raise ValueError(
                 f"actual_end must be after actual_start: "
@@ -174,7 +148,7 @@ class JobCarbonEstimator:
         if historical_moer_override is not None:
             if not historical_moer_override:
                 raise ValueError("historical_moer_override must not be empty")
-            avg_moer_lb = _time_weighted_moer(historical_moer_override, actual_start, actual_end)
+            avg_moer_lb = time_weighted_moer(historical_moer_override, actual_start, actual_end)
         else:
             avg_moer_lb = 0.0
             for region, weight in watttime_regions:
@@ -184,7 +158,7 @@ class JobCarbonEstimator:
                         f"No historical MOER data returned for region {region!r} "
                         f"between {actual_start.isoformat()} and {actual_end.isoformat()}"
                     )
-                avg_moer_lb += weight * _time_weighted_moer(points, actual_start, actual_end)
+                avg_moer_lb += weight * time_weighted_moer(points, actual_start, actual_end)
 
         rng = random.Random(0)
         samples_mwh: list[float] = []

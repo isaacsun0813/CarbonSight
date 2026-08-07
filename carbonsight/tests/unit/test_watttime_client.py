@@ -26,6 +26,10 @@ from carbonsight_core.watttime import (
 FORECAST_POINT = {"point_time": "2026-01-01T00:00:00Z", "value": 321.0}
 
 
+def _parse_point_time(point: dict) -> datetime:
+    return datetime.fromisoformat(point["point_time"].replace("Z", "+00:00"))
+
+
 def _config_with_credentials(**overrides: object) -> Config:
     defaults: dict[str, object] = {
         "watttime_username": "user",
@@ -284,28 +288,46 @@ def test_forecast_without_credentials_returns_the_live_envelope_shape() -> None:
     assert payload["data"][0]["value"] > 0
 
 
-def test_transport_failure_falls_back_to_synthetic() -> None:
+def _dead_network_client() -> httpx.Client:
     def _explode(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v2/login":
             return _login_ok()
         raise httpx.ConnectError("network down", request=request)
 
+    return httpx.Client(transport=httpx.MockTransport(_explode))
+
+
+def test_transport_failure_raises_rather_than_fabricating_a_ranking() -> None:
+    """A configured client that fails must not silently serve synthetic MOER.
+
+    The synthetic curve is hash-derived, not physical — it ranks Sweden dirtier than
+    India. Serving it during a WattTime outage would hand the user a confident,
+    inverted answer with nothing marking it as fake.
+    """
     client = WattTimeClient(_config_with_credentials())
-    payload = client.get_forecast(
-        "PJM_DC", client=httpx.Client(transport=httpx.MockTransport(_explode))
-    )
-    assert payload["meta"]["source"] == "synthetic"
-
-
-def test_transport_failure_raises_when_synthetic_is_disabled() -> None:
-    def _explode(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v2/login":
-            return _login_ok()
-        raise httpx.ConnectError("network down", request=request)
-
-    client = WattTimeClient(_config_with_credentials(), allow_synthetic=False)
+    assert client.allow_synthetic is True
     with pytest.raises(httpx.ConnectError):
-        client.get_forecast("PJM_DC", client=httpx.Client(transport=httpx.MockTransport(_explode)))
+        client.get_forecast("PJM_DC", client=_dead_network_client())
+
+
+def test_expired_credentials_raise_rather_than_fabricating_a_ranking() -> None:
+    """Credentials that exist but no longer work are a failure, not a demo."""
+    transport = _RecordingTransport({"/v2/login": [httpx.Response(403, json={"error": "expired"})]})
+    client = WattTimeClient(_config_with_credentials())
+    with pytest.raises(httpx.HTTPStatusError):
+        client.get_forecast("PJM_DC", client=transport.new_client())
+
+
+def test_http_error_from_forecast_raises() -> None:
+    transport = _RecordingTransport(
+        {
+            "/v2/login": [_login_ok()],
+            "/v3/forecast": [httpx.Response(500, json={"error": "boom"})],
+        }
+    )
+    client = WattTimeClient(_config_with_credentials())
+    with pytest.raises(httpx.HTTPStatusError):
+        client.get_forecast("PJM_DC", client=transport.new_client())
 
 
 def test_unit_gate_is_never_masked_by_the_synthetic_fallback() -> None:
@@ -324,6 +346,18 @@ def test_unit_gate_is_never_masked_by_the_synthetic_fallback() -> None:
         client.get_forecast("PJM_DC", client=transport.new_client())
 
 
+def test_synthetic_forecast_honours_the_requested_horizon() -> None:
+    """run.py sizes the scheduling horizon from max-delay; ignoring it truncates the search."""
+    client = WattTimeClient(_config_without_credentials())
+    six_hours = client.get_forecast("PJM_DC", horizon_hours=6)["data"]
+    default_horizon = client.get_forecast("PJM_DC")["data"]
+
+    assert len(six_hours) == 6 * 12  # 5-minute resolution
+    assert len(default_horizon) == 24 * 12
+    span = _parse_point_time(six_hours[-1]) - _parse_point_time(six_hours[0])
+    assert span == timedelta(hours=6) - timedelta(minutes=5)
+
+
 def test_historical_without_credentials_spans_the_requested_window() -> None:
     start = datetime(2026, 3, 1, 6, 0, tzinfo=UTC)
     points = WattTimeClient(_config_without_credentials()).get_historical(
@@ -331,6 +365,15 @@ def test_historical_without_credentials_spans_the_requested_window() -> None:
     )
     assert points[0]["point_time"].startswith("2026-03-01T06:00")
     assert len(points) == 3 * 12  # 3h at 5-minute resolution
+
+
+def test_historical_without_credentials_tracks_the_window_length() -> None:
+    """A longer window must produce a longer series, not the 24h default."""
+    start = datetime(2026, 3, 1, tzinfo=UTC)
+    client = WattTimeClient(_config_without_credentials())
+    assert len(client.get_historical("SE", start, start + timedelta(hours=8))) == 8 * 12
+    # Sub-hour windows still yield at least one hour of points rather than nothing.
+    assert len(client.get_historical("SE", start, start + timedelta(minutes=20))) == 12
 
 
 def test_synthetic_moer_is_deterministic_per_region() -> None:
@@ -374,6 +417,12 @@ def test_synthetic_forecast_horizon_never_yields_an_empty_series() -> None:
     assert len(build_synthetic_forecast("FR", horizon_hours=0)) == 1
 
 
+@pytest.mark.parametrize("horizon_hours", [1, 3, 12, 24, 48])
+def test_synthetic_payload_honours_the_requested_horizon(horizon_hours: int) -> None:
+    payload = build_synthetic_forecast_payload("FR", horizon_hours=horizon_hours)
+    assert len(payload["data"]) == horizon_hours * 12
+
+
 def test_synthetic_payload_and_series_agree() -> None:
     start = datetime(2026, 5, 1, tzinfo=UTC)
     payload = build_synthetic_forecast_payload("KOR", horizon_hours=1, now=start)
@@ -392,7 +441,9 @@ def test_normalize_forecast_payload_accepts_both_shapes() -> None:
 
 
 def test_moer_to_kg_uses_the_pound_conversion() -> None:
-    assert WattTimeClient.moer_lb_per_mwh_to_kg_co2(1000.0, 2.0) == pytest.approx(2000 * LB_TO_KG)
+    # 2000 lb CO2 in kg, hardcoded: deriving it from LB_TO_KG would pass for any constant.
+    assert WattTimeClient.moer_lb_per_mwh_to_kg_co2(1000.0, 2.0) == pytest.approx(907.18474)
+    assert LB_TO_KG == pytest.approx(0.45359237)
 
 
 # --- flat-module import surface ----------------------------------------------
