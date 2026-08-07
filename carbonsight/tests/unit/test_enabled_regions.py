@@ -3,9 +3,9 @@
 from unittest.mock import MagicMock, patch
 
 from botocore.exceptions import ClientError
+from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.mapping.registry import CloudRegionEntry, Registry
 from carbonsight_core.models import EstimateResult, JobSpec
-from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.region_ranking import AwsRegionRankingService
 
 

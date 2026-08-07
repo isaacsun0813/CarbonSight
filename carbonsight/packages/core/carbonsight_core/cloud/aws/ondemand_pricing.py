@@ -2,9 +2,7 @@
 
 import json
 
-from botocore.exceptions import ClientError
-
-from carbonsight_core.cloud.aws.base import HAS_BOTO, BaseAWSProvider
+from carbonsight_core.cloud.aws.base import HAS_BOTO, BaseAWSProvider, ClientError
 from carbonsight_core.cloud.aws.gpu_catalog import aws_gpu_instance_spec
 from carbonsight_core.cloud.aws.pricing_locations import (
     pricing_location_for_region,

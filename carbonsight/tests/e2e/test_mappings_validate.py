@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import pytest
 from carbonsight_core.mapping.registry import Registry
-from carbonsight_core.mapping.validate import validate_registry_mappings, drift_report_to_dict
+from carbonsight_core.mapping.validate import drift_report_to_dict, validate_registry_mappings
 from carbonsight_core.watttime import WattTimeClient
 
 

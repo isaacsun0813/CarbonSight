@@ -1,8 +1,6 @@
 """EC2 instance type offerings preflight."""
 
-from botocore.exceptions import ClientError
-
-from carbonsight_core.cloud.aws.base import HAS_BOTO, BaseAWSProvider
+from carbonsight_core.cloud.aws.base import HAS_BOTO, BaseAWSProvider, ClientError
 from carbonsight_core.cloud.aws.gpu_catalog import aws_instance_type_for_gpu
 from carbonsight_core.cloud.base import AvailabilityResult
 from carbonsight_core.config import Config
