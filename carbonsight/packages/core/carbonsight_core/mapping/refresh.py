@@ -22,7 +22,7 @@ class RegionRefreshChange:
 
 
 @dataclass
-class RefreshResult:
+class RefreshReport:
     """Aggregate outcome of refresh_registry_mappings."""
 
     changes: list[RegionRefreshChange] = field(default_factory=list)
@@ -31,12 +31,12 @@ class RefreshResult:
     regions_unchanged: int = 0
 
 
-def parse_wt_region_code(data: dict) -> str:
+def parse_wt_region_code(loc_response: dict) -> str:
     """Extract WattTime region code from region-from-loc JSON."""
-    code = data.get("region") or data.get("abbrev")
-    if not code:
+    wt_region = loc_response.get("region") or loc_response.get("abbrev")
+    if not wt_region:
         raise ValueError("region-from-loc response missing region/abbrev")
-    return str(code)
+    return str(wt_region)
 
 
 def build_wt_regions_from_site_codes(codes: list[str]) -> list[tuple[str, float]]:
@@ -44,13 +44,13 @@ def build_wt_regions_from_site_codes(codes: list[str]) -> list[tuple[str, float]
     if not codes:
         return []
     counts = Counter(codes)
-    n = len(codes)
+    site_count = len(codes)
     if len(counts) == 1:
         return [(next(iter(counts)), 1.0)]
-    return [(region, count / n) for region, count in sorted(counts.items())]
+    return [(region, count / site_count) for region, count in sorted(counts.items())]
 
 
-def refresh_registry_mappings(registry: Registry, watt_time: WattTimeClient) -> RefreshResult:
+def refresh_registry_mappings(registry: Registry, watt_time: WattTimeClient) -> RefreshReport:
     """
     Re-resolve wt_regions from WattTime region-from-loc for each site; mutate registry in place.
 
@@ -58,11 +58,11 @@ def refresh_registry_mappings(registry: Registry, watt_time: WattTimeClient) -> 
     wt_regions for that region are left unchanged.
     """
     today = date.today().isoformat()
-    result = RefreshResult()
+    refresh_report = RefreshReport()
 
     for entry in registry.all_regions():
         if not entry.sites:
-            result.warnings.append(f"{entry.provider}/{entry.region_code}: no sites; skipped")
+            refresh_report.warnings.append(f"{entry.provider}/{entry.region_code}: no sites; skipped")
             continue
 
         site_codes: list[str] = []
@@ -70,22 +70,24 @@ def refresh_registry_mappings(registry: Registry, watt_time: WattTimeClient) -> 
 
         for site in entry.sites:
             try:
-                data = watt_time.region_from_loc(site.lat, site.lon, signal_type="co2_moer")
-                site_codes.append(parse_wt_region_code(data))
+                loc_response = watt_time.region_from_loc(
+                    site.lat, site.lon, signal_type="co2_moer",
+                )
+                site_codes.append(parse_wt_region_code(loc_response))
                 succeeded_site_ids.add(site.site_id)
             except WattTimeError as err:
-                result.warnings.append(f"{entry.region_code} {site.site_id}: {err}")
+                refresh_report.warnings.append(f"{entry.region_code} {site.site_id}: {err}")
             except Exception as err:
-                result.warnings.append(f"{entry.region_code} {site.site_id}: {err}")
+                refresh_report.warnings.append(f"{entry.region_code} {site.site_id}: {err}")
 
         if not site_codes:
-            result.warnings.append(
+            refresh_report.warnings.append(
                 f"{entry.provider}/{entry.region_code}: no successful region-from-loc; wt_regions unchanged",
             )
             continue
 
         if len(site_codes) != len(entry.sites):
-            result.warnings.append(
+            refresh_report.warnings.append(
                 f"{entry.provider}/{entry.region_code}: partial site success "
                 f"({len(site_codes)}/{len(entry.sites)}); mixture from successful sites only",
             )
@@ -102,7 +104,7 @@ def refresh_registry_mappings(registry: Registry, watt_time: WattTimeClient) -> 
         if len(site_codes) == len(entry.sites):
             entry.s_recency = 1.0
 
-        result.changes.append(
+        refresh_report.changes.append(
             RegionRefreshChange(
                 provider=entry.provider,
                 region_code=entry.region_code,
@@ -112,8 +114,8 @@ def refresh_registry_mappings(registry: Registry, watt_time: WattTimeClient) -> 
             )
         )
         if changed:
-            result.regions_updated += 1
+            refresh_report.regions_updated += 1
         else:
-            result.regions_unchanged += 1
+            refresh_report.regions_unchanged += 1
 
-    return result
+    return refresh_report

@@ -104,13 +104,13 @@ class InstanceAvailabilityChecker(BaseAWSProvider):
                 reason=f"{instance_type} not offered in {region}",
             )
         except ClientError as e:
-            code = e.response.get("Error", {}).get("Code", "Unknown")
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
             return AvailabilityResult(
                 region=region,
                 available=True,
                 instance_type=instance_type,
                 gpu_type=normalized_gpu,
-                reason=f"EC2 API error: {code}; skipping availability check",
+                reason=f"EC2 API error: {error_code}; skipping availability check",
             )
         except Exception as e:
             return AvailabilityResult(

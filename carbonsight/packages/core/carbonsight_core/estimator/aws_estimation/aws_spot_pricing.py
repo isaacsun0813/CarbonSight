@@ -13,9 +13,17 @@ class SpotPriceProvider(BaseAWSProvider):
 
     def spot_price_per_gpu_hour(self, gpu_type: str, region: str) -> float | None:
         """
-        Return minimum recent spot $/GPU/hr in the region, or None if unavailable.
+        Return the cheapest recent spot $/GPU/hr in the region, or None if unavailable.
 
-        Uses min SpotPrice across AZs (conservative for cost ranking).
+        Takes ``min`` over the returned history, i.e. the lowest price seen in any AZ
+        at any point in the window. This is **optimistic**, not conservative: the
+        quoted figure is a best case you may not get, since you cannot choose which
+        AZ you land in. No ``StartTime`` is passed, so the window is however far back
+        ``MaxResults`` points happen to reach.
+
+        Fine for ranking regions against each other (the bias is broadly similar
+        across regions); read the absolute number with that caveat in mind. A median,
+        or the most recent price per AZ, would be a defensible alternative.
         """
         if not HAS_BOTO:
             return None

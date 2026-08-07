@@ -15,8 +15,6 @@ try:
 except ImportError:
     HAS_BOTO = False
 
-_HAS_BOTO = HAS_BOTO
-
 
 class BaseAWSProvider:
     """Boto3 session/client management and generic TTL cache."""
