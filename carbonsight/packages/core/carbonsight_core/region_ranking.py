@@ -12,7 +12,7 @@ from carbonsight_core.carbon import CarbonProviderError
 from carbonsight_core.cloud.aws.availability import InstanceAvailabilityChecker
 from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.cloud.aws.quota import QuotaChecker
-from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
+from carbonsight_core.estimator.carbon_model import CarbonDataUnavailableError, JobCarbonEstimator
 from carbonsight_core.mapping.registry import Registry, mapping_confidence
 from carbonsight_core.models import EstimateResult, JobSpec
 from carbonsight_core.watttime import WattTimeClient, WattTimeError
@@ -104,10 +104,10 @@ class AwsRegionRankingService:
                         use_spot=use_spot,
                     )
                 )
-            except CarbonProviderError:
-                # A configured carbon source is down. That is not a per-region
-                # problem -- every region would fail the same way -- so fail the
-                # whole run rather than returning a silently truncated ranking.
+            except (CarbonProviderError, CarbonDataUnavailableError):
+                # The carbon data source is down. That is not a per-region problem
+                # -- every region fails the same way -- so fail the whole run rather
+                # than returning a silently truncated (or invented) ranking.
                 raise
             except WattTimeError as err:
                 if on_estimate_error is not None:

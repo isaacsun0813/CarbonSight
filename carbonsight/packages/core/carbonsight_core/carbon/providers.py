@@ -21,7 +21,11 @@ from typing import Any
 
 import httpx
 
-from carbonsight_core.carbon.base import ForecastBackedProvider, as_utc
+from carbonsight_core.carbon.base import (
+    CarbonProviderError,
+    ForecastBackedProvider,
+    as_utc,
+)
 from carbonsight_core.config import Config
 from carbonsight_core.watttime import (
     SYNTHETIC_WATTTIME_REGIONS,
@@ -32,9 +36,13 @@ from carbonsight_core.watttime import (
     synthetic_moer_for_region,
 )
 
-
-class CarbonProviderError(RuntimeError):
-    """A configured carbon source could not be reached or returned nothing usable."""
+__all__ = [
+    "ApiCarbonProvider",
+    "CarbonProviderError",  # re-exported: defined in base.py with the Protocol
+    "SyntheticCarbonProvider",
+    "WattTimeCarbonProvider",
+    "get_carbon_provider",
+]
 
 
 class SyntheticCarbonProvider(ForecastBackedProvider):

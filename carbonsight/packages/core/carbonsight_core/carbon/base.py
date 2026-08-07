@@ -26,13 +26,20 @@ from carbonsight_core.estimator.power_model import sample_power_params
 from carbonsight_core.models import JobSpec
 from carbonsight_core.watttime import LB_TO_KG, mixture_weighted_moer, time_weighted_moer
 
-# Used when a mixture resolves to no usable series at all. Matches the estimator's
-# long-standing fallback so the two agree.
-FALLBACK_MOER_LB_PER_MWH = 400.0
-
 # How many draws to average when estimating facility power. A single draw samples
 # the utilisation and PUE distributions rather than their mean.
 POWER_MODEL_SAMPLES = 64
+
+
+class CarbonProviderError(RuntimeError):
+    """A configured carbon source could not be reached or returned nothing usable.
+
+    Part of the provider contract, so it lives beside the Protocol rather than with
+    any one implementation. Deliberately fatal: there used to be a
+    ``FALLBACK_MOER_LB_PER_MWH = 400.0`` here that stood in whenever a mixture
+    resolved to no usable series, which turned "the data source is down" into a
+    confident-looking carbon number with nothing marking it invented.
+    """
 
 
 @runtime_checkable
@@ -136,10 +143,20 @@ class ForecastBackedProvider:
             )
             if points
         ]
+        named = ", ".join(region for region, _ in wt_regions) or "(none)"
+        if sum(max(0.0, weight) for _, weight in wt_regions) <= 0.0:
+            # A registry bug, not an outage: mixture_weighted_moer divides by
+            # `total_weight or 1.0`, so all-zero weights blend to a flat 0 lb/MWh and
+            # rank this region as the cleanest place on earth.
+            raise ValueError(f"Mixture [{named}] has no positive weights.")
         if not series:
-            return FALLBACK_MOER_LB_PER_MWH
-        blended = mixture_weighted_moer(series, as_utc(start), as_utc(end))
-        return blended or FALLBACK_MOER_LB_PER_MWH
+            # Every provider raises before handing back empty points, so reaching here
+            # means the source is answering with nothing usable. There is no number to
+            # report; the 400 lb/MWh that used to be returned was invented.
+            raise CarbonProviderError(
+                f"No forecast points for any grid region in the mixture [{named}]."
+            )
+        return mixture_weighted_moer(series, as_utc(start), as_utc(end))
 
     def get_kg_per_hr(
         self, job: JobSpec, wt_regions: list[tuple[str, float]], start: datetime, end: datetime
