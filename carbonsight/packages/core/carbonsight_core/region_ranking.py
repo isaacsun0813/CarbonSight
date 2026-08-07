@@ -112,7 +112,7 @@ class AwsRegionRankingService:
             except WattTimeError as err:
                 if on_estimate_error is not None:
                     on_estimate_error(entry.region_code, err)
-            except Exception as err:
+            except Exception as err:  # noqa: BLE001 - one bad region must not stop the ranking
                 if on_estimate_error is not None:
                     on_estimate_error(entry.region_code, err)
         return estimates

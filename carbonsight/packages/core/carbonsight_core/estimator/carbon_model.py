@@ -78,7 +78,12 @@ class JobCarbonEstimator:
                     total += weight * 400.0  # fallback default lb/MWh
             except WattTimeError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - see FALLBACK note below
+                # Substitutes a neutral 400 lb/MWh for this leg. Unlike a synthetic
+                # curve this cannot invert a ranking (it makes the region look
+                # average rather than clean or dirty), but it IS unlabelled: the
+                # caller cannot tell an estimate from a real reading. Tracked as the
+                # last remaining silent substitution; prefer surfacing it in notes.
                 total += weight * 400.0
         return total
 

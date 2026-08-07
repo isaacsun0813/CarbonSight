@@ -51,6 +51,7 @@ def read_points_from_db(region: str, *, database_url: str | None = None) -> list
         return []
     try:
         import sqlalchemy as sa
+        from sqlalchemy.exc import SQLAlchemyError
 
         engine = sa.create_engine(dsn)
         with engine.connect() as connection:
@@ -63,7 +64,7 @@ def read_points_from_db(region: str, *, database_url: str | None = None) -> list
             }
             for row in rows
         ]
-    except Exception as err:
+    except (SQLAlchemyError, ImportError) as err:
         logger.warning("grid_signal_cache read failed for %s: %s", region, err)
         return []
 

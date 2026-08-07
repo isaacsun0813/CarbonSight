@@ -129,7 +129,7 @@ def fetch_all_regions(
         try:
             payload = watt_time.get_forecast(region, horizon_hours=horizon_hours)
             points = WattTimeClient.normalize_forecast_payload(payload)
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - one bad region must not stop the pass
             report.regions_failed += 1
             report.failures.append(f"{region}: {err}")
             logger.warning("refresh failed for %s: %s", region, err)
@@ -158,6 +158,7 @@ def persist_rows(rows: list[dict[str, Any]], *, database_url: str | None = None)
         return 0
     try:
         import sqlalchemy as sa
+        from sqlalchemy.exc import SQLAlchemyError
 
         engine = sa.create_engine(dsn)
         with engine.begin() as connection:
@@ -165,7 +166,9 @@ def persist_rows(rows: list[dict[str, Any]], *, database_url: str | None = None)
             # ~21 regions x 288 points = 6k statements per pass.
             connection.execute(sa.text(_UPSERT_SQL), rows)
         return len(rows)
-    except Exception as err:
+    except (SQLAlchemyError, ImportError) as err:
+        # ImportError: the Postgres driver (psycopg2) is an optional install, so a
+        # deployment without it must degrade to cache-only, not crash the worker.
         logger.warning("persist skipped: %s", err)
         return 0
 
@@ -181,12 +184,13 @@ def prune_expired_rows(
     cutoff = datetime.now(UTC) - timedelta(hours=hours)
     try:
         import sqlalchemy as sa
+        from sqlalchemy.exc import SQLAlchemyError
 
         engine = sa.create_engine(dsn)
         with engine.begin() as connection:
             result = connection.execute(sa.text(_PRUNE_SQL), {"cutoff": cutoff.isoformat()})
         return int(result.rowcount or 0)
-    except Exception as err:
+    except (SQLAlchemyError, ImportError) as err:
         logger.warning("prune skipped: %s", err)
         return 0
 
