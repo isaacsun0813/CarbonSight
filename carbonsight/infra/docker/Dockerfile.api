@@ -5,11 +5,12 @@ WORKDIR /app
 # Copy project root (carbonsight monorepo)
 COPY packages/core /app/packages/core
 COPY apps/api /app/apps/api
-COPY pyproject.toml /app/
+COPY apps/worker /app/apps/worker
+COPY pyproject.toml README.md /app/
 
 RUN pip install --no-cache-dir -e ".[api]" && \
     pip install uvicorn[standard]
 
-ENV PYTHONPATH=/app/packages/core:/app/apps/api
+ENV PYTHONPATH=/app/packages/core:/app/apps/api:/app/apps
 
 CMD ["uvicorn", "carbonsight_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
