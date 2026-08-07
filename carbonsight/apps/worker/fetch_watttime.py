@@ -25,11 +25,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from carbonsight_core.config import Config
-from carbonsight_core.watttime import (
-    SYNTHETIC_WATTTIME_REGIONS,
-    WattTimeClient,
-    get_global_forecast_cache,
-)
+from carbonsight_core.mapping.registry import default_grid_regions
+from carbonsight_core.watttime import WattTimeClient, get_global_forecast_cache
 
 logger = logging.getLogger("carbonsight.worker.fetch_watttime")
 
@@ -128,7 +125,7 @@ def fetch_all_regions(
     report = RefreshReport()
     rows: list[dict[str, Any]] = []
 
-    for region in regions or SYNTHETIC_WATTTIME_REGIONS:
+    for region in regions if regions is not None else default_grid_regions():
         try:
             payload = watt_time.get_forecast(region, horizon_hours=horizon_hours)
             points = WattTimeClient.normalize_forecast_payload(payload)

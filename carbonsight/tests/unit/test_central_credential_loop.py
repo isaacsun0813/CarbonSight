@@ -209,10 +209,10 @@ class TestRegionNamespacesAreNotInterchangeable:
     def test_every_returned_code_is_usable_for_a_forecast(
         self, credentialless_client: ApiCarbonProvider
     ) -> None:
-        """The point of list_regions: each code must be a valid forecast key."""
-        from carbonsight_core.watttime import SYNTHETIC_WATTTIME_REGIONS
+        """The point of list_regions: each code must be one the worker refreshes."""
+        from carbonsight_core.mapping.registry import default_grid_regions
 
-        assert set(credentialless_client.list_regions()) <= set(SYNTHETIC_WATTTIME_REGIONS)
+        assert set(credentialless_client.list_regions()) == set(default_grid_regions())
 
     def test_the_two_endpoints_really_do_disagree(self) -> None:
         """Guards the guard: if they ever returned the same thing, the tests above are vacuous."""

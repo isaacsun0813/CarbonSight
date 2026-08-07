@@ -22,7 +22,8 @@ import os
 from typing import Any
 
 from carbonsight_core.config import Config
-from carbonsight_core.watttime import SYNTHETIC_WATTTIME_REGIONS, get_global_forecast_cache
+from carbonsight_core.mapping.registry import default_grid_regions
+from carbonsight_core.watttime import get_global_forecast_cache
 from fastapi import APIRouter, HTTPException, Query
 
 logger = logging.getLogger("carbonsight.api.carbon")
@@ -116,7 +117,7 @@ def list_carbon_regions() -> dict[str, Any]:
     return {
         "regions": [
             {"wt_region": region, "cached": region in warm}
-            for region in SYNTHETIC_WATTTIME_REGIONS
+            for region in default_grid_regions()
         ],
         "cached_count": len(warm),
     }

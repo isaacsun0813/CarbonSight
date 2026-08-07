@@ -71,12 +71,19 @@ class TestRefreshPass:
         )
         assert report.points_written == 5
 
-    def test_defaults_to_the_full_region_list(self) -> None:
-        from carbonsight_core.watttime import SYNTHETIC_WATTTIME_REGIONS
+    def test_defaults_to_every_grid_region_the_registry_needs(self) -> None:
+        """Not a hardcoded list: the registry decides what must be kept warm.
+
+        Four regions (BHR, HKG, JP_KN, ZAF) were referenced by the registry but
+        absent from the old hardcoded tuple, so they were never refreshed and the
+        cloud regions mapping to them would 503 forever.
+        """
+        from carbonsight_core.mapping.registry import default_grid_regions
 
         client = FakeWattTime()
         worker.fetch_all_regions(CREDENTIALLED, client=client)
-        assert client.calls == list(SYNTHETIC_WATTTIME_REGIONS)
+        assert client.calls == default_grid_regions()
+        assert {"BHR", "HKG", "JP_KN", "ZAF"} <= set(client.calls)
 
     def test_requires_credentials(self) -> None:
         """The worker exists to hold the one shared login; without it there's nothing to do."""
