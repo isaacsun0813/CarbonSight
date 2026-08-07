@@ -1,26 +1,14 @@
 """EC2 instance type offerings preflight."""
 
-from dataclasses import dataclass
-
 from botocore.exceptions import ClientError
 
 from carbonsight_core.cloud.aws.base import HAS_BOTO, BaseAWSProvider
 from carbonsight_core.cloud.aws.gpu_catalog import aws_instance_type_for_gpu
+from carbonsight_core.cloud.base import AvailabilityResult
 from carbonsight_core.config import Config
 
 PREFLIGHT_CACHE_TTL_SECONDS = 15 * 60
 OFFERINGS_MAX_RESULTS = 1
-
-
-@dataclass
-class AvailabilityResult:
-    """Result of an instance-type offering check for one region."""
-
-    region: str
-    available: bool
-    instance_type: str
-    gpu_type: str
-    reason: str = ""
 
 
 class InstanceAvailabilityChecker(BaseAWSProvider):

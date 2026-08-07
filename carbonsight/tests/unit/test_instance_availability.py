@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError
 from carbonsight_core.mapping.registry import CloudRegionEntry, Registry
 from carbonsight_core.models import EstimateResult, JobSpec
-from carbonsight_core.preflight.availability import InstanceAvailabilityChecker
+from carbonsight_core.cloud.aws.availability import InstanceAvailabilityChecker
 from carbonsight_core.region_ranking import AwsRegionRankingService
 
 
