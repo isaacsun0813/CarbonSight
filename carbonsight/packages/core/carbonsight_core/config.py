@@ -16,6 +16,9 @@ class Config:
     cache_tokens: bool = True
     request_timeout: int = 15
     max_retries: int = 3
+    live_aws_pricing: bool = False
+    pricing_cache_ttl_seconds: int = 3600
+    aws_profile: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -31,4 +34,7 @@ class Config:
             cache_tokens=str_to_bool(os.environ.get("CACHE_TOKENS", "true")),
             request_timeout=int(os.environ.get("REQUEST_TIMEOUT", "15")),
             max_retries=int(os.environ.get("MAX_RETRIES", "3")),
+            live_aws_pricing=str_to_bool(os.environ.get("CARBONSIGHT_LIVE_AWS_PRICING", "false")),
+            pricing_cache_ttl_seconds=int(os.environ.get("CARBONSIGHT_PRICING_CACHE_TTL", "3600")),
+            aws_profile=os.environ.get("AWS_PROFILE") or None,
         )

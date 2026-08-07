@@ -1,0 +1,5 @@
+{
+  "PriceList": [
+    "{\"product\":{\"attributes\":{\"instanceType\":\"p4d.24xlarge\",\"location\":\"US East (N. Virginia)\"}},\"terms\":{\"OnDemand\":{\"JRTCKXETXF\":{\"priceDimensions\":{\"JRTCKXETXF\":{\"unit\":\"Hrs\",\"pricePerUnit\":{\"USD\":\"32.7726\"}}}}}}}"
+  ]
+}

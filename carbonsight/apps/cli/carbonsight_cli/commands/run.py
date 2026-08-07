@@ -19,15 +19,17 @@ from carbonsight_core.checkpoint import (
     extract_script_path_from_run_command,
     shim_local_path,
 )
+from carbonsight_core.cloud.aws.availability import InstanceAvailabilityChecker
+from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
+from carbonsight_core.cloud.aws.quota import QuotaChecker
 from carbonsight_core.config import Config
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
-from carbonsight_core.estimator.pricing import estimate_cost_usd
+from carbonsight_core.estimator.pricing import configure_pricing, estimate_cost_usd
 from carbonsight_core.mapping.registry import Registry
 from carbonsight_core.paths import (
     carbonsight_package_root_from_cli_command_file,
     resolve_registry_json_file,
 )
-from carbonsight_core.preflight.quota import QuotaChecker
 from carbonsight_core.region_ranking import AwsRegionRankingService
 from carbonsight_core.scheduler import pick_lowest_carbon_start
 from carbonsight_core.tracking import RunLedger, RunRecord
@@ -37,6 +39,7 @@ from carbonsight_cli.commands.advise import (
     apply_gpu_telemetry_cli,
     job_spec_from_sky_yaml,
     parse_duration_hours,
+    resolve_live_aws_pricing,
 )
 
 BASELINE_REGION = "us-east-1"
@@ -102,6 +105,8 @@ def run_launch(
     checkpoint_bucket: str | None = None,
     checkpoint_interval: int = 500,
     script_path: Path | None = None,
+    live_pricing: bool = False,
+    static_pricing: bool = False,
 ) -> None:
     """Shared implementation for ``run`` and ``train``."""
     if not yaml_path.exists():
@@ -130,15 +135,35 @@ def run_launch(
     reg.load_json(rpath)
 
     config = Config.from_env()
+    configure_pricing(
+        config,
+        live_aws_pricing=resolve_live_aws_pricing(
+            config, live_pricing=live_pricing, static_pricing=static_pricing,
+        ),
+    )
     if not config.watttime_username or not config.watttime_password:
         typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD.", err=True)
         raise typer.Exit(1)
 
     watt_time = WattTimeClient(config)
     quota_checker = QuotaChecker() if not skip_preflight else None
-    ranking = AwsRegionRankingService(reg, watt_time, quota_checker=quota_checker)
+    availability_checker = InstanceAvailabilityChecker(config) if not skip_preflight else None
+    enabled_regions_provider = EnabledRegionsProvider(config) if not skip_preflight else None
+    ranking = AwsRegionRankingService(
+        reg,
+        watt_time,
+        quota_checker=quota_checker,
+        availability_checker=availability_checker,
+        enabled_regions_provider=enabled_regions_provider,
+    )
+
+    def _enabled_region_skip(region_code: str, reason: str) -> None:
+        typer.echo(f"  Skipping {region_code}: {reason}", err=True)
 
     def _quota_skip(region_code: str, reason: str) -> None:
+        typer.echo(f"  Skipping {region_code}: {reason}", err=True)
+
+    def _availability_skip(region_code: str, reason: str) -> None:
         typer.echo(f"  Skipping {region_code}: {reason}", err=True)
 
     def _estimate_warn(region_code: str, err: BaseException) -> None:
@@ -147,12 +172,17 @@ def run_launch(
     estimates = ranking.collect_estimates(
         job,
         use_spot=use_spot,
+        on_enabled_region_skip=_enabled_region_skip,
         on_quota_skip=_quota_skip,
+        on_availability_skip=_availability_skip,
         on_estimate_error=_estimate_warn,
     )
 
     if not estimates:
-        typer.echo("No regions available after quota and WattTime checks.", err=True)
+        typer.echo(
+            "No regions available after enabled-region, quota, availability, and WattTime checks.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     best = AwsRegionRankingService.pick_best_region_for_launch(estimates, max_cost_premium)
@@ -319,7 +349,11 @@ def run_cmd(
     yaml_path: Path = typer.Argument(..., help="Path to SkyPilot-style job YAML"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print patched YAML only, do not launch"),
     no_exec: bool = typer.Option(False, "--no-exec", help="Pick region and patch YAML but skip launch"),
-    skip_preflight: bool = typer.Option(False, "--skip-preflight", help="Skip AWS GPU quota check"),
+    skip_preflight: bool = typer.Option(
+        False,
+        "--skip-preflight",
+        help="Skip AWS preflight (enabled regions, GPU quota, instance offerings)",
+    ),
     managed: bool = typer.Option(False, "--managed", help="Use sky jobs launch (managed spot) instead of sky launch"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Pass --yes to SkyPilot (skip confirmation prompt)"),
     max_cost_premium: float = typer.Option(
@@ -365,6 +399,16 @@ def run_cmd(
         "--checkpoint-interval",
         help="Save checkpoint every N training steps.",
     ),
+    live_pricing: bool = typer.Option(
+        False,
+        "--live-pricing",
+        help="Use live AWS EC2 spot prices for cost estimates (when --spot).",
+    ),
+    static_pricing: bool = typer.Option(
+        False,
+        "--static-pricing",
+        help="Force static cost tables instead of live AWS pricing.",
+    ),
 ) -> None:
     """Pick the greenest affordable region, patch YAML, and launch via SkyPilot."""
     run_launch(
@@ -384,4 +428,6 @@ def run_cmd(
         checkpoint=checkpoint,
         checkpoint_bucket=checkpoint_bucket,
         checkpoint_interval=checkpoint_interval,
+        live_pricing=live_pricing,
+        static_pricing=static_pricing,
     )
