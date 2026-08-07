@@ -12,9 +12,9 @@ Sources (static):
 
 from dataclasses import dataclass, field
 
+from carbonsight_core.cloud.aws.ondemand_pricing import OnDemandPriceProvider
+from carbonsight_core.cloud.aws.spot_pricing import SpotPriceProvider
 from carbonsight_core.config import Config
-from carbonsight_core.estimator.aws_estimation.aws_ondemand_pricing import OnDemandPriceProvider
-from carbonsight_core.estimator.aws_estimation.aws_spot_pricing import SpotPriceProvider
 
 # Base price per GPU per hour (us-east-1 on-demand)
 # Instance reference:
