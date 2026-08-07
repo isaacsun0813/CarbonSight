@@ -4,8 +4,11 @@ Design: CO2_kg = (E_facility_MWh * MOER_lb_per_MWh) * 0.45359237; support mixtur
 """
 
 import random
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # avoids estimator <-> carbon import cycle
+    from carbonsight_core.carbon import CarbonIntensityProvider
 
 from carbonsight_core.estimator.power_model import sample_power_params
 from carbonsight_core.estimator.pricing import estimate_cost_usd, estimate_job_cost
@@ -27,12 +30,24 @@ def _facility_mwh_per_hour(p_it_w: float, pue: float) -> float:
 
 
 class JobCarbonEstimator:
-    """Forecast and actual CO₂ for a job using one WattTime client (token cache is per-client)."""
+    """Forecast and actual CO₂ for a job.
 
-    __slots__ = ("_watt_time",)
+    Forecasts come from ``carbon_provider`` when one is supplied, which is how the
+    no-credentials and central-API modes work. Historical MOER always comes from
+    the WattTime client directly: ``compute_actual_run`` reports what a finished
+    job *did* emit, and there is nothing to be gained from fabricating that.
+    """
 
-    def __init__(self, watt_time: WattTimeClient) -> None:
+    __slots__ = ("_watt_time", "_carbon_provider")
+
+    def __init__(
+        self,
+        watt_time: WattTimeClient,
+        *,
+        carbon_provider: "CarbonIntensityProvider | None" = None,
+    ) -> None:
         self._watt_time = watt_time
+        self._carbon_provider = carbon_provider
 
     def _weighted_forecast_moer_lb_per_mwh(
         self,
@@ -42,6 +57,15 @@ class JobCarbonEstimator:
         """Weighted average forecast MOER (lb CO₂/MWh) across WattTime mixture regions."""
         if not watttime_regions:
             return 0.0
+        if self._carbon_provider is not None:
+            # The provider is mixture- and time-weighted over the whole window,
+            # rather than sampling the first forecast point as the direct path does.
+            window_start = datetime.now(UTC)
+            return self._carbon_provider.get_moer_lb_per_mwh(
+                watttime_regions,
+                window_start,
+                window_start + timedelta(hours=1),
+            )
         total = 0.0
         wt = self._watt_time
         for region, weight in watttime_regions:

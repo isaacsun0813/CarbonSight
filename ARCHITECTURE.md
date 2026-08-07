@@ -18,16 +18,36 @@ All the real Python is under **`carbonsight/`** (that’s where `pyproject.toml`
 
 ```
 carbonsight/
-  apps/cli/carbonsight_cli/     # Typer: advise, run, mappings, backtest
-  apps/api/carbonsight_api/     # FastAPI if we want HTTP
-  packages/core/carbonsight_core/   # Brain — WattTime, registry, math, cloud adapters
-    cloud/                      # Provider Protocols; AWS base + GPU catalog
-    estimator/aws_estimation/   # Live EC2 spot + Pricing API on-demand
+  apps/cli/carbonsight_cli/         # Typer: advise, run, train, mappings, backtest
+  apps/api/carbonsight_api/         # FastAPI if we want HTTP
+  packages/core/carbonsight_core/   # Brain
+    cloud/                          # "what does compute cost, and can I get it"
+      base.py                       #   Protocols: pricing, availability
+      aws/                          #   ALL AWS lives here: boto session + TTL cache,
+                                    #   GPU catalog, spot + on-demand pricing,
+                                    #   instance offerings, enabled regions, quota
+    carbon/                         # "how dirty is the power"
+      base.py                       #   CarbonIntensityProvider Protocol + mixture math
+      providers.py                  #   Synthetic / WattTime / API-proxy + factory
+    watttime/                       # plain WattTime API client + ForecastCache
+    mapping/                        # region -> grid registry, drift validate/refresh
+    estimator/                      # power model, carbon model, cost
+    region_ranking.py               # the one ranking path CLI and API share
   tests/
-  infra/                        # SQL schemas; Postgres not fully wired yet
+  infra/                            # SQL schemas; Postgres not fully wired yet
 ```
 
-Rule I use: if it’s **domain logic** (how CO₂ is computed, how WattTime is called), it goes in **`carbonsight_core`**. If it’s **parsing flags, printing tables, or HTTP**, it’s **`cli`** or **`api`**. Keeps the core testable without spinning up a server.
+Two rules that decide where a file goes.
+
+**Layer.** If it’s **domain logic** (how CO₂ is computed, how WattTime is called), it goes in
+**`carbonsight_core`**. If it’s **parsing flags, printing tables, or HTTP**, it’s **`cli`** or
+**`api`**. Keeps the core testable without spinning up a server.
+
+**Axis.** `cloud/` and `carbon/` are siblings answering different questions — *what does this
+cost and can I get it* vs *how dirty is the power*. Anything provider-specific lives under its
+provider (`cloud/aws/`), so adding `cloud/gcp/` later is a drop-in that implements the same
+Protocols in `cloud/base.py`. `watttime/` stays a plain API client with no policy in it;
+source selection is layered above it in `carbon/providers.py`.
 
 ---
 
@@ -38,9 +58,35 @@ You give it a **YAML** (SkyPilot-style) and **WattTime credentials**. We also lo
 Flow that’s in my head:
 
 - **Registry** answers: *which grid(s) does this datacenter sit on?*
-- **WattTime** answers: *how dirty is a marginal MWh on that grid right now (forecast) or in the past (historical)?*
+- **Carbon provider** answers: *how dirty is a marginal MWh on that grid?* Three sources, picked
+  by `get_carbon_provider()` in this order: `CARBONSIGHT_API_URL` (proxy through a CarbonSight
+  API holding one shared credential) → `WATTTIME_*` (your own login) → synthetic (offline demo).
 - **Power model** answers: *how many watts is this job probably drawing?* (we don’t know utilization, so we randomize — more on that below)
 - **carbon_model** multiplies energy × MOER, converts units, runs Monte Carlo for a range
+
+### Synthetic MOER is a demo, never a fallback
+
+The synthetic curves are deterministic **hashes of the region name**. They give every region a
+different number so the carbon lever is visible with no credentials — but they are arbitrary
+with respect to physics: Sweden scores dirtier than India.
+
+So a source that is **configured but broken** raises `CarbonProviderError`; it does not quietly
+substitute synthetic data. Serving a fabricated ranking is worse than failing, because the user
+cannot tell it apart from a real one and it can be *inverted* — recommending a coal grid over
+hydro. Only the genuine "nothing is configured" case is answered synthetically, and the doors
+turn the error into a sentence rather than a traceback.
+
+Historical MOER (`compute_actual_run`) always comes from WattTime directly. There is nothing to
+be gained from fabricating what a finished job already emitted.
+
+### One time-weighting implementation
+
+`watttime/cache.py:time_weighted_moer` is the only one. It divides the weighted sum by the
+**seconds actually covered** by forecast points and fill-forwards past the last point. An earlier
+private copy in `carbon_model.py` divided by the **full window**, which under-reported whenever
+the window opened before the first point — structurally true of `compute_actual_run`, since job
+start times are wall-clock while WattTime points sit on a 5-minute grid. That was a −27.8% error
+on a 10-minute job, always in the direction of overstating savings. Do not reintroduce a second copy.
 
 Optional: **boto** checks account-enabled regions (`describe_regions`), GPU quotas, and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Live spot/on-demand pricing and preflight availability/enabled-regions share **`BaseAWSProvider`** (`cloud/aws/base.py`) for session/client setup; quota checks still use raw boto3. Offerings use `ec2:DescribeInstanceTypeOfferings`; enabled regions use one `ec2:DescribeRegions` intersected with the registry (run preflight only). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
 

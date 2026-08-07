@@ -8,6 +8,7 @@ Sequential WattTime calls: the client token cache is not thread-safe for paralle
 
 from collections.abc import Callable
 
+from carbonsight_core.carbon import CarbonProviderError
 from carbonsight_core.cloud.aws.availability import InstanceAvailabilityChecker
 from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.cloud.aws.quota import QuotaChecker
@@ -35,6 +36,7 @@ class AwsRegionRankingService:
         registry: Registry,
         watt_time: WattTimeClient,
         *,
+        carbon_provider: object | None = None,
         quota_checker: QuotaChecker | None = None,
         availability_checker: InstanceAvailabilityChecker | None = None,
         enabled_regions_provider: EnabledRegionsProvider | None = None,
@@ -43,7 +45,7 @@ class AwsRegionRankingService:
         self._quota_checker = quota_checker
         self._availability_checker = availability_checker
         self._enabled_regions_provider = enabled_regions_provider
-        self._estimator = JobCarbonEstimator(watt_time)
+        self._estimator = JobCarbonEstimator(watt_time, carbon_provider=carbon_provider)
 
     def collect_estimates(
         self,
@@ -102,6 +104,11 @@ class AwsRegionRankingService:
                         use_spot=use_spot,
                     )
                 )
+            except CarbonProviderError:
+                # A configured carbon source is down. That is not a per-region
+                # problem -- every region would fail the same way -- so fail the
+                # whole run rather than returning a silently truncated ranking.
+                raise
             except WattTimeError as err:
                 if on_estimate_error is not None:
                     on_estimate_error(entry.region_code, err)
