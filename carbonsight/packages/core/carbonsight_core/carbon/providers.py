@@ -185,9 +185,17 @@ class ApiCarbonProvider(ForecastBackedProvider):
         return points
 
     def list_regions(self) -> list[str]:
+        """Grid regions the server can serve MOER for.
+
+        Hits ``/v1/carbon/regions``, not ``/v1/regions``. The two are different
+        namespaces and the codes are not interchangeable: ``/v1/regions`` returns
+        *cloud* regions (``us-east-1``) from the mapping registry, while this
+        provider deals in *grid* regions (``CAISO_NORTH``). Asking the wrong one
+        returns plausible-looking strings that no MOER lookup will ever match.
+        """
         try:
             with httpx.Client(timeout=self._timeout) as client:
-                response = client.get(f"{self._base_url}/v1/regions")
+                response = client.get(f"{self._base_url}/v1/carbon/regions")
                 response.raise_for_status()
                 body = response.json()
         except Exception as err:
@@ -195,15 +203,23 @@ class ApiCarbonProvider(ForecastBackedProvider):
                 f"CarbonSight API at {self._base_url} is unreachable: {err}"
             ) from err
 
+        entries = body.get("regions", []) if isinstance(body, dict) else body
         regions: list[str] = []
-        for item in body if isinstance(body, list) else ():
+        for item in entries if isinstance(entries, list) else ():
             if isinstance(item, str):
                 regions.append(item)
-            elif isinstance(item, dict):
-                code = item.get("wt_region") or item.get("region_code") or item.get("region")
-                if code:
-                    regions.append(str(code))
-        return regions or list(SYNTHETIC_WATTTIME_REGIONS)
+            elif isinstance(item, dict) and item.get("wt_region"):
+                regions.append(str(item["wt_region"]))
+        if not regions:
+            # Do NOT fall back to the built-in list. A configured server that
+            # answers with nothing we recognise is a misconfiguration — most
+            # likely pointed at the wrong endpoint — and quietly substituting
+            # the local list makes that invisible and unfixable.
+            raise CarbonProviderError(
+                f"{self._base_url}/v1/carbon/regions returned no recognisable grid "
+                "regions. Expected objects with a 'wt_region' key.",
+            )
+        return regions
 
 
 def get_carbon_provider(config: Config | None = None) -> ForecastBackedProvider:

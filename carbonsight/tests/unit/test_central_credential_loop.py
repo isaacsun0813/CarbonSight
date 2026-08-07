@@ -190,3 +190,35 @@ class TestTheRouteItself:
         _refresh(["SE"])
         with TestClient(app) as client:
             assert client.get("/v1/carbon/forecast", params={"region": "SE"}).status_code == 200
+
+
+class TestRegionNamespacesAreNotInterchangeable:
+    """/v1/regions is cloud regions; /v1/carbon/regions is grid regions.
+
+    ApiCarbonProvider deals in grid codes. It once asked /v1/regions and got
+    `us-east-1` back — plausible-looking strings that no MOER lookup can match.
+    """
+
+    def test_list_regions_returns_grid_codes_not_cloud_codes(
+        self, credentialless_client: ApiCarbonProvider
+    ) -> None:
+        regions = credentialless_client.list_regions()
+        assert "CAISO_NORTH" in regions, "expected WattTime grid codes"
+        assert "us-east-1" not in regions, "cloud region codes leaked in from /v1/regions"
+
+    def test_every_returned_code_is_usable_for_a_forecast(
+        self, credentialless_client: ApiCarbonProvider
+    ) -> None:
+        """The point of list_regions: each code must be a valid forecast key."""
+        from carbonsight_core.watttime import SYNTHETIC_WATTTIME_REGIONS
+
+        assert set(credentialless_client.list_regions()) <= set(SYNTHETIC_WATTTIME_REGIONS)
+
+    def test_the_two_endpoints_really_do_disagree(self) -> None:
+        """Guards the guard: if they ever returned the same thing, the tests above are vacuous."""
+        from fastapi.testclient import TestClient
+
+        with TestClient(app) as client:
+            cloud = {r["region_code"] for r in client.get("/v1/regions").json()}
+            grid = {r["wt_region"] for r in client.get("/v1/carbon/regions").json()["regions"]}
+        assert not (cloud & grid), "namespaces overlap; this test can no longer detect the mix-up"
