@@ -4,15 +4,22 @@ Design: CO2_kg = (E_facility_MWh * MOER_lb_per_MWh) * 0.45359237; support mixtur
 """
 
 import random
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # avoids estimator <-> carbon import cycle
+    from carbonsight_core.carbon import CarbonIntensityProvider
 
 from carbonsight_core.estimator.power_model import sample_power_params
 from carbonsight_core.estimator.pricing import estimate_cost_usd, estimate_job_cost
 from carbonsight_core.models import ActualRunResult, EstimateResult, JobSpec
-from carbonsight_core.watttime import SUPPORTED_MOER_UNIT, WattTimeClient, WattTimeError
+from carbonsight_core.watttime import (
+    LB_TO_KG,
+    WattTimeClient,
+    WattTimeError,
+    time_weighted_moer,
+)
 
-LB_TO_KG = 0.45359237
 MONTE_CARLO_SAMPLES = 1000
 
 
@@ -21,50 +28,34 @@ def _facility_mwh_per_hour(p_it_w: float, pue: float) -> float:
     return (p_it_w / 1000.0) * 1.0 * (pue / 1000.0)
 
 
-def _time_weighted_moer(
-    points: list[dict[str, Any]],
-    actual_start: datetime,
-    actual_end: datetime,
-) -> float:
-    """Compute time-weighted average MOER (lb/MWh) over [actual_start, actual_end].
+class CarbonDataUnavailableError(RuntimeError):
+    """The carbon data source could not answer, so no estimate can be made.
 
-    Each data point covers the interval from its timestamp to the next point's
-    timestamp. The first and last intervals are clipped to actual_start/actual_end.
-    If only one point, its value is used directly.
+    Deliberately fatal rather than falling back to a default MOER. An invented
+    carbon number is indistinguishable from a real one and is the entire thing
+    this product is supposed to get right.
     """
-    if len(points) == 1:
-        return float(points[0]["value"])
-
-    total_seconds = (actual_end - actual_start).total_seconds()
-    sorted_points = sorted(points, key=lambda p: p["point_time"])
-
-    def _parse_utc(ts: str) -> datetime:
-        dt = datetime.fromisoformat(ts)
-        return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
-
-    weighted_sum = 0.0
-    for i, p in enumerate(sorted_points):
-        t_i = _parse_utc(p["point_time"])
-        t_next = (
-            _parse_utc(sorted_points[i + 1]["point_time"])
-            if i + 1 < len(sorted_points)
-            else actual_end
-        )
-        interval_start = max(t_i, actual_start)
-        interval_end = min(t_next, actual_end)
-        overlap = max(0.0, (interval_end - interval_start).total_seconds())
-        weighted_sum += float(p["value"]) * overlap
-
-    return weighted_sum / total_seconds
 
 
 class JobCarbonEstimator:
-    """Forecast and actual CO₂ for a job using one WattTime client (token cache is per-client)."""
+    """Forecast and actual CO₂ for a job.
 
-    __slots__ = ("_watt_time",)
+    Forecasts come from ``carbon_provider`` when one is supplied, which is how the
+    no-credentials and central-API modes work. Historical MOER always comes from
+    the WattTime client directly: ``compute_actual_run`` reports what a finished
+    job *did* emit, and there is nothing to be gained from fabricating that.
+    """
 
-    def __init__(self, watt_time: WattTimeClient) -> None:
+    __slots__ = ("_watt_time", "_carbon_provider")
+
+    def __init__(
+        self,
+        watt_time: WattTimeClient,
+        *,
+        carbon_provider: "CarbonIntensityProvider | None" = None,
+    ) -> None:
         self._watt_time = watt_time
+        self._carbon_provider = carbon_provider
 
     def _weighted_forecast_moer_lb_per_mwh(
         self,
@@ -74,20 +65,51 @@ class JobCarbonEstimator:
         """Weighted average forecast MOER (lb CO₂/MWh) across WattTime mixture regions."""
         if not watttime_regions:
             return 0.0
+        if self._carbon_provider is not None:
+            # The provider is mixture- and time-weighted over the whole window,
+            # rather than sampling the first forecast point as the direct path does.
+            window_start = datetime.now(UTC)
+            try:
+                return self._carbon_provider.get_moer_lb_per_mwh(
+                    watttime_regions,
+                    window_start,
+                    window_start + timedelta(hours=1),
+                )
+            except ValueError:
+                # A bad mixture (e.g. all-zero registry weights) is this region's
+                # problem alone. Escalating it would take down a ranking whose other
+                # twenty regions are perfectly answerable.
+                raise
+            except Exception as err:
+                # Everything else is source-level. Normalise to
+                # CarbonDataUnavailableError so the ranking treats it as a dead data
+                # source (fatal) rather than one flaky region (a warning): a transport
+                # error fails every region identically, and 21 identical warnings
+                # followed by an empty table is a worse answer than one sentence
+                # saying the service is down.
+                raise CarbonDataUnavailableError(str(err)) from err
         total = 0.0
         wt = self._watt_time
         for region, weight in watttime_regions:
             try:
                 data = wt.get_forecast(region, horizon_hours=1, client=client)
-                points = data.get("data", [])
-                if points:
-                    total += weight * float(points[0].get("value", 0))
-                else:
-                    total += weight * 400.0  # fallback default lb/MWh
             except WattTimeError:
                 raise
-            except Exception:
-                total += weight * 400.0
+            except Exception as err:
+                # No substitution. This used to fall back to a flat 400 lb/MWh, which
+                # produced a complete-looking carbon estimate out of nothing. A carbon
+                # tool that invents carbon numbers when its data source is down is
+                # worse than one that admits it is down.
+                raise CarbonDataUnavailableError(
+                    f"WattTime forecast for {region} failed: {err}"
+                ) from err
+
+            points = data.get("data", [])
+            if not points:
+                raise CarbonDataUnavailableError(
+                    f"WattTime returned no forecast points for {region}."
+                )
+            total += weight * float(points[0].get("value", 0))
         return total
 
     def estimate_region(
@@ -113,12 +135,9 @@ class JobCarbonEstimator:
         if moer_override is not None:
             moer_lb = moer_override
         else:
-            try:
-                moer_lb = self._weighted_forecast_moer_lb_per_mwh(watttime_regions, None)
-            except WattTimeError as e:
-                if SUPPORTED_MOER_UNIT in str(e).lower() or "unit" in str(e).lower():
-                    raise
-                moer_lb = 400.0
+            # Any failure here is fatal: see CarbonDataUnavailableError. The unit gate
+            # (WattTimeError) was already fail-closed; now transport failures are too.
+            moer_lb = self._weighted_forecast_moer_lb_per_mwh(watttime_regions, None)
 
         for _ in range(MONTE_CARLO_SAMPLES):
             params = sample_power_params(job, rng)
@@ -161,7 +180,13 @@ class JobCarbonEstimator:
         *,
         historical_moer_override: list[dict[str, Any]] | None = None,
     ) -> ActualRunResult:
-        """Integrate historical MOER over the run window; compare to the pre-run estimate mean."""
+        """Integrate historical MOER over the run window; compare to the pre-run estimate mean.
+
+        ``actual_start`` is wall-clock while WattTime points land on a 5-minute grid, so the
+        head of the window is normally uncovered. :func:`time_weighted_moer` divides by the
+        seconds it actually covered — dividing by the window length instead under-reports
+        actual CO₂ (up to ~28% on a 10-minute job) and inflates the savings-vs-estimate line.
+        """
         if actual_end <= actual_start:
             raise ValueError(
                 f"actual_end must be after actual_start: "
@@ -174,7 +199,7 @@ class JobCarbonEstimator:
         if historical_moer_override is not None:
             if not historical_moer_override:
                 raise ValueError("historical_moer_override must not be empty")
-            avg_moer_lb = _time_weighted_moer(historical_moer_override, actual_start, actual_end)
+            avg_moer_lb = time_weighted_moer(historical_moer_override, actual_start, actual_end)
         else:
             avg_moer_lb = 0.0
             for region, weight in watttime_regions:
@@ -184,7 +209,7 @@ class JobCarbonEstimator:
                         f"No historical MOER data returned for region {region!r} "
                         f"between {actual_start.isoformat()} and {actual_end.isoformat()}"
                     )
-                avg_moer_lb += weight * _time_weighted_moer(points, actual_start, actual_end)
+                avg_moer_lb += weight * time_weighted_moer(points, actual_start, actual_end)
 
         rng = random.Random(0)
         samples_mwh: list[float] = []

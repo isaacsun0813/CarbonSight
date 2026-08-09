@@ -221,7 +221,7 @@ def run_launch(
                         f"(start {sched.start_utc:%H:%M} UTC) -> "
                         f"-{sched.moer_reduction_pct:.1f}% carbon vs running now."
                     )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - scheduling is advisory; never block a launch
             typer.echo(f"Warning: could not compute schedule: {e}", err=True)
 
     # Baseline estimate for tracking

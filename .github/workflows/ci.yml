@@ -25,7 +25,7 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Ruff
-        run: ruff check packages/core apps/cli apps/api
+        run: ruff check packages/core apps/cli apps/api apps/worker
 
       - name: Pytest
         run: pytest tests/unit tests/e2e -q

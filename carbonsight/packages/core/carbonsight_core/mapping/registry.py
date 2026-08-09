@@ -125,6 +125,44 @@ class Registry:
         """Return all cloud regions (for listing)."""
         return list(self._regions.values())
 
+    def grid_regions(self) -> list[str]:
+        """Every WattTime grid region any cloud region maps to, sorted and deduped.
+
+        This is the set the refresh worker must keep warm: a grid region referenced
+        here but never fetched means the cloud regions that map to it have no MOER,
+        so they drop out of every ranking. Deriving the worker's list from the
+        registry rather than a hardcoded tuple is what keeps the two from drifting.
+        """
+        return sorted(
+            {wt_region for entry in self._regions.values() for wt_region, _ in entry.wt_regions}
+        )
+
+
+def bundled_registry_path() -> Path:
+    """Path to the ``seed_registry.json`` shipped inside this package."""
+    return Path(__file__).resolve().parent / "seed_registry.json"
+
+
+def default_grid_regions() -> list[str]:
+    """Grid regions the bundled registry references.
+
+    The worker refreshes exactly these and the API reports exactly these, so the
+    two cannot drift from what the registry actually needs. A grid region the
+    registry maps to but nobody fetches leaves its cloud regions with no MOER.
+
+    Raises if the registry is missing or empty rather than substituting the
+    synthetic list: quietly refreshing the wrong set is how those four regions
+    went unnoticed in the first place.
+    """
+    registry = Registry()
+    registry.load_json(bundled_registry_path())
+    grid_regions = registry.grid_regions()
+    if not grid_regions:
+        raise ValueError(
+            f"{bundled_registry_path()} declares no wt_regions; there is nothing to refresh.",
+        )
+    return grid_regions
+
 
 def site_to_json_dict(site: CloudSite) -> dict:
     """Serialize one site for seed_registry.json round-trip."""

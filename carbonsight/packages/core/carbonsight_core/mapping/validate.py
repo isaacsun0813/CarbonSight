@@ -132,7 +132,7 @@ def validate_registry_mappings(registry: Registry, watt_time: WattTimeClient) ->
                 msg = f"{entry.region_code} {site.site_id}: {err}"
                 drift_report.warnings.append(msg)
                 site_details.append(SiteDriftDetail(site_id=site.site_id, error=str(err)))
-            except Exception as err:
+            except Exception as err:  # noqa: BLE001 - one bad site must not stop the region
                 msg = f"{entry.region_code} {site.site_id}: {err}"
                 drift_report.warnings.append(msg)
                 site_details.append(SiteDriftDetail(site_id=site.site_id, error=str(err)))

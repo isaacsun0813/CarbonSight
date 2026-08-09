@@ -36,5 +36,5 @@ class EnabledRegionsProvider(BaseAWSProvider):
             return self._set_cached(_CACHE_KEY, codes)
         except ClientError:
             return None
-        except Exception:
+        except Exception:  # noqa: BLE001 - AWS is optional; fail open rather than hide a region
             return None

@@ -103,7 +103,7 @@ class QuotaChecker(BaseAWSProvider):
                 requested=requested_gpus, quota_code=quota_code,
                 reason=f"ServiceQuotas API error: {e.response.get('Error', {}).get('Code', 'Unknown')}; skipping",
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - AWS is optional; fail open rather than hide a region
             return QuotaResult(
                 region=region, allowed=True, current_quota=0.0,
                 requested=requested_gpus, quota_code=quota_code,

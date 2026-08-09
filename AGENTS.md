@@ -23,6 +23,12 @@ If docs and code disagree, **fix the doc or the code in the same PR**—do not l
 
 **One orchestration path for rankings.** Use **`AwsRegionRankingService`** (and `JobCarbonEstimator` inside it) so CLI and API stay aligned. Do not duplicate “for each region…” logic in multiple places.
 
+**Two axes, two packages.** `cloud/` answers *what does this compute cost and can I get it*; `carbon/` answers *how dirty is the power*. Anything provider-specific lives under its provider — all AWS code is in **`cloud/aws/`**, so `cloud/gcp/` would be a drop-in implementing the same Protocols in `cloud/base.py`. `watttime/` is a plain API client with no policy; source selection lives above it in `carbon/providers.py`. Don't scatter one provider across several trees.
+
+**Never fabricate data to paper over a failure.** Synthetic MOER curves are hashes of the region name — arbitrary against real grids (Sweden scores dirtier than India). They exist so the tool demos with no credentials. A source that is *configured but broken* must **raise**, not silently substitute them: a fabricated ranking is indistinguishable from a real one and can be inverted. Same rule anywhere else a fallback is tempting — if you can't tell the user the number is made up, don't give them the number. See `ARCHITECTURE.md` § “Synthetic MOER is a demo, never a fallback”.
+
+**One implementation per piece of physics.** There was briefly a second, subtly different time-weighted MOER function; it under-reported actual emissions by up to 28% and inflated the headline savings. Before adding a helper, grep for one that already exists.
+
 **Boundaries.**
 
 - **`carbonsight_core`**: no Typer/Rich/FastAPI imports in domain modules. Config/env loading via existing `config` patterns is OK.
