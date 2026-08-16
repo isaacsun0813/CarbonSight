@@ -30,7 +30,7 @@ Cloud ML training uses electricity; grids differ by hour and region. CarbonSight
    pip install -e .
    ```
 
-3. **Configure** — Copy [`carbonsight/.env.example`](carbonsight/.env.example) to `carbonsight/.env` or export `WATTTIME_USERNAME` and `WATTTIME_PASSWORD`.
+3. **Configure** — export `WATTTIME_USERNAME` and `WATTTIME_PASSWORD` (a [WattTime](https://www.watttime.org/) account of your own), or set `CARBONSIGHT_API_URL` to a CarbonSight API that holds the credential centrally. With neither set, CarbonSight refuses to rank rather than inventing numbers.
 
 4. **Advise** — Rank regions for a SkyPilot-style YAML:
 

@@ -384,3 +384,44 @@ class TestComputeActualCo2:
                 _ACT_START, _ACT_END, MagicMock(), estimated_co2_kg=0.1,
                 historical_moer_override=[],
             )
+
+    # A wall-clock start against a 5-minute point grid leaves the head of the window
+    # uncovered. Dividing by the window length instead of the covered seconds used to
+    # under-report actual CO2 by ~28% on a 10-minute job, which inflated the
+    # savings-vs-estimate line the CLI prints.
+    @pytest.mark.parametrize("job_minutes", [10, 30, 60])
+    def test_uncovered_window_head_does_not_under_report_carbon(self, job_minutes: int) -> None:
+        grid_points = _make_moer_pts([500.0] * 24)
+        start = _ACT_START + timedelta(minutes=2, seconds=30)  # mid-interval, as datetime.now is
+        end = start + timedelta(minutes=job_minutes)
+        job = _make_job(duration_hours=job_minutes / 60)
+
+        actual = compute_actual_co2(
+            job, "aws", "us-east-1", _ACT_REGIONS,
+            start, end, MagicMock(), estimated_co2_kg=0.1,
+            historical_moer_override=grid_points,
+        )
+        flat_500 = compute_actual_co2(
+            job, "aws", "us-east-1", _ACT_REGIONS,
+            start, end, MagicMock(), estimated_co2_kg=0.1,
+            historical_moer_override=[{"point_time": start.isoformat(), "value": 500.0}],
+        )
+        # A constant-500 grid must report exactly 500, head gap or not.
+        assert actual.actual_co2_kg == pytest.approx(flat_500.actual_co2_kg, rel=1e-9)
+
+    def test_window_entirely_before_the_series_uses_the_first_value(self) -> None:
+        """Used to return 0.0 CO2 — a free lunch — instead of the first known MOER."""
+        actual = compute_actual_co2(
+            self._JOB, "aws", "us-east-1", _ACT_REGIONS,
+            _ACT_START - timedelta(hours=5), _ACT_START - timedelta(hours=4),
+            MagicMock(), estimated_co2_kg=0.1,
+            historical_moer_override=_make_moer_pts([500.0, 500.0, 500.0]),
+        )
+        assert actual.actual_co2_kg > 0
+
+    def test_carbon_model_shares_one_moer_implementation_with_the_watttime_layer(self) -> None:
+        """There must be exactly one time-weighted MOER; a private copy drifted before."""
+        from carbonsight_core import estimator, watttime
+
+        assert not hasattr(estimator.carbon_model, "_time_weighted_moer")
+        assert estimator.carbon_model.time_weighted_moer is watttime.time_weighted_moer

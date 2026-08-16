@@ -6,6 +6,7 @@ from typing import Any
 
 import typer
 import yaml
+from carbonsight_core.carbon import CarbonProviderError, get_carbon_provider
 from carbonsight_core.config import Config
 from carbonsight_core.estimator.pricing import configure_pricing
 from carbonsight_core.mapping.registry import Registry
@@ -170,20 +171,32 @@ def run_advise(
             config, live_pricing=live_pricing, static_pricing=static_pricing,
         ),
     )
-    if not config.watttime_username or not config.watttime_password:
-        if json_out:
-            typer.echo("[]")
-        else:
-            typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD to get recommendations.")
-        return
+    try:
+        carbon_provider = get_carbon_provider(config)
+    except (CarbonProviderError, ValueError) as err:
+        typer.echo(f"Error: {err}", err=True)
+        raise typer.Exit(1) from err
 
     watt_time = WattTimeClient(config)
-    ranking = AwsRegionRankingService(reg, watt_time)
+    ranking = AwsRegionRankingService(reg, watt_time, carbon_provider=carbon_provider)
 
     def _warn_estimate(region_code: str, err: BaseException) -> None:
         typer.echo(f"Warning: {region_code}: {err}", err=True)
 
-    all_estimates = ranking.collect_estimates(job, use_spot=use_spot, on_estimate_error=_warn_estimate)
+    try:
+        all_estimates = ranking.collect_estimates(
+            job, use_spot=use_spot, on_estimate_error=_warn_estimate,
+        )
+    except CarbonProviderError as err:
+        typer.echo(
+            "Error: CarbonSight's carbon data source is unavailable, so no ranking "
+            "can be produced.\n"
+            f"  {err}\n"
+            "  Nothing is estimated from defaults -- an invented carbon number would "
+            "be indistinguishable from a real one.",
+            err=True,
+        )
+        raise typer.Exit(1) from err
 
     if not all_estimates:
         if json_out:

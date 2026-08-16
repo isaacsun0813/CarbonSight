@@ -1,18 +1,52 @@
-# CarbonSight API + Postgres (MVP)
-# Run: docker-compose -f carbonsight/infra/docker/docker-compose.yml up -d
+# CarbonSight: Postgres + API + the WattTime refresh worker.
+#
+# Run:
+#   docker compose -f carbonsight/infra/docker/docker-compose.yml \
+#                  --env-file carbonsight/.env up -d
+#
+# `--env-file` matters: with `-f`, compose looks for `.env` next to the compose
+# file, not in carbonsight/. Three variables have no defaults and compose will
+# refuse to start without them:
+#
+#   POSTGRES_PASSWORD   no default because port 5432 is published to the host
+#   WATTTIME_USERNAME   the ONE central credential
+#   WATTTIME_PASSWORD
+#
+# Optional, with the defaults shown below: POSTGRES_USER, POSTGRES_DB,
+# WORKER_INTERVAL_SECONDS, GRID_SIGNAL_RETENTION_HOURS,
+# CARBONSIGHT_FORECAST_CACHE_TTL, LOG_LEVEL.
+#
+# This is the central-credential deployment. ONE WattTime login lives here, on the
+# worker; CLI users set CARBONSIGHT_API_URL=http://<host>:8000 and need none of
+# their own.
+#
+#   worker  --one credential-->  WattTime
+#      |
+#      +--> grid_signal_cache (Postgres)  <-- api reads  <-- CLI reads over HTTP
+#
+# The worker and the API are separate processes, so the in-memory ForecastCache is
+# NOT shared between them. Postgres is the store they both see -- which is why
+# DATABASE_URL must be set on both, not just on the worker.
 
 services:
   db:
     image: postgres:15-alpine
     environment:
-      POSTGRES_USER: carbonsight
-      POSTGRES_PASSWORD: carbonsight
-      POSTGRES_DB: carbonsight
+      POSTGRES_USER: ${POSTGRES_USER:-carbonsight}
+      # No default: port 5432 is published below, so a shipped default would be
+      # a known login on a reachable port. Compose refuses to start without it.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:-carbonsight}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ../../infra/schemas.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   api:
     build:
@@ -21,11 +55,33 @@ services:
     ports:
       - "8000:8000"
     environment:
-      WATTTIME_USERNAME: ${WATTTIME_USERNAME:-}
-      WATTTIME_PASSWORD: ${WATTTIME_PASSWORD:-}
-      DATABASE_URL: postgresql://carbonsight:carbonsight@db:5432/carbonsight
+      # The API serves cached data; it needs no WattTime credentials of its own.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-carbonsight}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:-carbonsight}
+      CARBONSIGHT_FORECAST_CACHE_TTL: ${CARBONSIGHT_FORECAST_CACHE_TTL:-900}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    command: ["python", "-m", "worker.fetch_watttime"]
+    environment:
+      # The ONE credential. Without it the worker raises an explanatory error
+      # rather than quietly refreshing nothing.
+      WATTTIME_USERNAME: ${WATTTIME_USERNAME:?}
+      WATTTIME_PASSWORD: ${WATTTIME_PASSWORD:?}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-carbonsight}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:-carbonsight}
+      WORKER_INTERVAL_SECONDS: ${WORKER_INTERVAL_SECONDS:-900}
+      GRID_SIGNAL_RETENTION_HOURS: ${GRID_SIGNAL_RETENTION_HOURS:-168}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:

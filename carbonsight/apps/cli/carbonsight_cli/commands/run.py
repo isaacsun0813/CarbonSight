@@ -10,6 +10,7 @@ from pathlib import Path
 
 import typer
 import yaml
+from carbonsight_core.carbon import CarbonProviderError, get_carbon_provider
 from carbonsight_core.checkpoint import (
     Framework,
     apply_checkpoint_patch_to_yaml,
@@ -141,9 +142,11 @@ def run_launch(
             config, live_pricing=live_pricing, static_pricing=static_pricing,
         ),
     )
-    if not config.watttime_username or not config.watttime_password:
-        typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD.", err=True)
-        raise typer.Exit(1)
+    try:
+        carbon_provider = get_carbon_provider(config)
+    except (CarbonProviderError, ValueError) as err:
+        typer.echo(f"Error: {err}", err=True)
+        raise typer.Exit(1) from err
 
     watt_time = WattTimeClient(config)
     quota_checker = QuotaChecker() if not skip_preflight else None
@@ -152,6 +155,7 @@ def run_launch(
     ranking = AwsRegionRankingService(
         reg,
         watt_time,
+        carbon_provider=carbon_provider,
         quota_checker=quota_checker,
         availability_checker=availability_checker,
         enabled_regions_provider=enabled_regions_provider,
@@ -169,14 +173,22 @@ def run_launch(
     def _estimate_warn(region_code: str, err: BaseException) -> None:
         typer.echo(f"  Warning {region_code}: {err}", err=True)
 
-    estimates = ranking.collect_estimates(
-        job,
-        use_spot=use_spot,
-        on_enabled_region_skip=_enabled_region_skip,
-        on_quota_skip=_quota_skip,
-        on_availability_skip=_availability_skip,
-        on_estimate_error=_estimate_warn,
-    )
+    try:
+        estimates = ranking.collect_estimates(
+            job,
+            use_spot=use_spot,
+            on_enabled_region_skip=_enabled_region_skip,
+            on_quota_skip=_quota_skip,
+            on_availability_skip=_availability_skip,
+            on_estimate_error=_estimate_warn,
+        )
+    except CarbonProviderError as err:
+        typer.echo(
+            "Error: CarbonSight's carbon data source is unavailable, so no region "
+            f"can be selected.\n  {err}",
+            err=True,
+        )
+        raise typer.Exit(1) from err
 
     if not estimates:
         typer.echo(
@@ -198,7 +210,12 @@ def run_launch(
         f"Confidence={best.mapping_confidence:.2f}"
     )
 
-    max_delay_hours = parse_duration_hours(max_delay)
+    normalized_delay = max_delay.strip().lower()
+    max_delay_hours = (
+        0.0
+        if normalized_delay in {"0", "0h", "0m"}
+        else parse_duration_hours(max_delay)
+    )
     if max_delay_hours > 0:
         try:
             chosen_entry = next(
@@ -206,13 +223,14 @@ def run_launch(
                 if e.region_code == region and e.provider.lower() == "aws"
             )
             horizon = math.ceil(max_delay_hours + job.duration_hours)
-            forecast = watt_time.get_forecast(
+            forecast_points = carbon_provider.get_forecast(
                 chosen_entry.wt_regions[0][0],
                 horizon_hours=horizon,
             )
-            pts = forecast.get("data", [])
-            if pts:
-                sched = pick_lowest_carbon_start(pts, job.duration_hours, max_delay_hours)
+            if forecast_points:
+                sched = pick_lowest_carbon_start(
+                    forecast_points, job.duration_hours, max_delay_hours,
+                )
                 if sched.delay_hours < 0.01:
                     typer.echo("Schedule: run now (already the lowest-carbon window).")
                 else:
@@ -323,6 +341,14 @@ def run_launch(
         raise typer.Exit(exit_code)
 
     end_time = datetime.now(UTC)
+    if not (config.watttime_username and config.watttime_password):
+        typer.echo(
+            "\nActual CO₂ backfill skipped: historical WattTime access is not available "
+            "through the central forecast API yet.",
+            err=True,
+        )
+        return
+
     try:
         actual = JobCarbonEstimator(watt_time).compute_actual_run(
             job=job,

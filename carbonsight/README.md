@@ -22,14 +22,31 @@ Development (tests + linters):
 pip install -e ".[dev]"
 ```
 
-## Configure (your WattTime account)
+## Configure
 
-Use **your own** [WattTime](https://www.watttime.org/) API credentials—copy [`.env.example`](.env.example) to `.env` or export:
+Two modes; pick one.
+
+**Bring your own key** — a [WattTime](https://www.watttime.org/) account per user:
 
 ```bash
 export WATTTIME_USERNAME=...
 export WATTTIME_PASSWORD=...
 ```
+
+**Central credential** — one login lives on the server, clients need none:
+
+```bash
+export CARBONSIGHT_API_URL=http://localhost:8000
+```
+
+With neither set, CarbonSight refuses to rank rather than inventing numbers.
+For an explicitly non-physical offline demo, set `CARBONSIGHT_DEMO_MODE=1`.
+Synthetic MOER is a hash of the region name and is never used as a fallback for
+a missing or failed production source.
+
+Server-side settings (`DATABASE_URL`, `WORKER_INTERVAL_SECONDS`,
+`GRID_SIGNAL_RETENTION_HOURS`, `CARBONSIGHT_FORECAST_CACHE_TTL`) are documented
+in [`infra/docker/docker-compose.yml`](infra/docker/docker-compose.yml).
 
 ## Minimal flow
 

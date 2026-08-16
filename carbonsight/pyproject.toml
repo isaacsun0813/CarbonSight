@@ -25,6 +25,7 @@ api = [
     "uvicorn[standard]>=0.24",
     "sqlalchemy>=2.0",
     "asyncpg>=0.29",
+    "psycopg[binary]>=3.1",
 ]
 aws = [
     "boto3>=1.28",
@@ -39,6 +40,7 @@ dev = [
     "uvicorn[standard]>=0.24",
     "sqlalchemy>=2.0",
     "asyncpg>=0.29",
+    "psycopg[binary]>=3.1",
     "boto3>=1.28",
 ]
 
@@ -46,7 +48,7 @@ dev = [
 carbonsight = "carbonsight_cli.main:app"
 
 [tool.setuptools.packages.find]
-where = ["packages/core", "apps/cli", "apps/api"]
+where = ["packages/core", "apps/cli", "apps/api", "apps"]
 include = ["carbonsight_*"]
 
 [tool.ruff]
@@ -65,5 +67,5 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["packages/core", "apps/cli", "apps/api"]
+pythonpath = ["packages/core", "apps/cli", "apps/api", "apps"]
 addopts = "-v"

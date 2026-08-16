@@ -128,7 +128,9 @@ The API mirrors the CLI “advise” flow and exposes minimal endpoints.
   - `uvicorn carbonsight_api.main:app --reload`
 - **Endpoints**:
   - `GET /health`
-  - `POST /v1/recommendations`: ranks regions like `carbonsight advise` (requires WattTime env vars; returns `[]` without them)
+  - `POST /v1/recommendations`: ranks regions from the server's shared forecast cache/Postgres store; returns `503` when carbon data is unavailable
+  - `GET /v1/carbon/forecast`: serves cached WattTime forecast points for one grid region
+  - `GET /v1/carbon/regions`: lists grid regions known to the shared carbon store
   - `GET /v1/regions`: returns regions from the registry plus confidence + WattTime mixture weights
   - `POST /v1/mappings/revalidate`: runs mapping drift validation (same core as CLI `mappings validate`); returns JSON with `status` (`ok` / `drift`); `503` without WattTime creds
   - `POST /v1/runs` / `GET /v1/runs/{run_id}`: in-memory “runs store” (no Postgres wired yet)
@@ -152,6 +154,7 @@ Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and per
 - **No mapping auto-refresh via API**: `POST /v1/mappings/revalidate` validates drift only; use CLI `mappings refresh --write` to update the registry JSON.
 - **Not compliance-grade accounting**: this is an operational estimate from marginal emissions + a simplified power model.
 - **Scheduling is advisory**: `--max-delay` recommends a start time but does not actually wait before launching.
+- **Central historical backfill is not exposed**: `run` can launch from central forecast data, but post-run actual CO₂ requires direct WattTime credentials and is skipped otherwise.
 
 ## “Where to look in code”
 
@@ -170,4 +173,3 @@ Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and per
 - **Mapping validate**: `carbonsight/packages/core/carbonsight_core/mapping/validate.py`
 - **Mapping refresh**: `carbonsight/packages/core/carbonsight_core/mapping/refresh.py`
 - **WattTime client**: `carbonsight/packages/core/carbonsight_core/watttime.py`
-

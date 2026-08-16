@@ -1,7 +1,7 @@
 """
 Full-path E2E for ``carbonsight advise``: real subprocess, real YAML, JSON contract.
 
-- **No credentials:** must return valid JSON ``[]`` and exit 0 (matches CLI behavior).
+- **Explicit demo mode:** must return valid, non-empty recommendation JSON without HTTP.
 - **With WattTime credentials:** must return a non-empty list of recommendations with
   expected fields (live registry + forecast). Marked ``@pytest.mark.integration``.
 """
@@ -52,15 +52,17 @@ def _run_advise_json(repo_root: Path, fixture: Path, env: dict[str, str], *, tim
     )
 
 
-def test_advise_without_watttime_returns_empty_json_list(repo_root: Path) -> None:
-    """CLI + YAML parse + code path through advise; no HTTP when credentials unset."""
+def test_advise_explicit_demo_mode_returns_recommendations(repo_root: Path) -> None:
+    """CLI + YAML parse + advise path; explicit demo mode requires no HTTP."""
     fixture = repo_root / "tests" / "fixtures" / "train_minimal.yaml"
     assert fixture.is_file()
     env = _cli_env(repo_root, strip_watttime=True)
+    env["CARBONSIGHT_DEMO_MODE"] = "1"
     result = _run_advise_json(repo_root, fixture, env, timeout=30)
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout.strip())
-    assert data == []
+    assert isinstance(data, list)
+    assert data
 
 
 @pytest.mark.integration
