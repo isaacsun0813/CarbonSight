@@ -1,7 +1,9 @@
 """Pytest config; load dotenv for E2E if present."""
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from carbonsight_core.watttime import reset_global_forecast_cache
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -17,3 +19,11 @@ def pytest_configure(config: pytest.Config) -> None:
 def repo_root() -> Path:
     """Repo root (carbonsight/)."""
     return Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def isolate_global_forecast_cache() -> Iterator[None]:
+    """Prevent the process-wide forecast cache from leaking between tests."""
+    reset_global_forecast_cache()
+    yield
+    reset_global_forecast_cache()

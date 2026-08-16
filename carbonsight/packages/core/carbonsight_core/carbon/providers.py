@@ -4,14 +4,14 @@ Preference order (central-credential design):
 
   1. ``CARBONSIGHT_API_URL``  -> :class:`ApiCarbonProvider`     CLI needs no personal creds
   2. ``WATTTIME_USERNAME``    -> :class:`WattTimeCarbonProvider` direct, one login per user
-  3. neither                  -> :class:`SyntheticCarbonProvider` offline demo
+  3. ``CARBONSIGHT_DEMO_MODE`` -> :class:`SyntheticCarbonProvider` offline demo
 
-**On fabrication.** Synthetic curves are a *demo* affordance, not a *fallback*. They
+**On fabrication.** Synthetic curves are an explicit *demo* affordance, not a *fallback*. They
 are deterministic hashes of the region name, so they are arbitrary with respect to
 real grids — Sweden can score dirtier than India. Serving them when a configured
 source fails would hand the user a confident, physically inverted ranking with
-nothing marking it fake. So a configured-but-broken source raises; only the genuine
-"nothing is configured" case is answered synthetically, and it is labelled.
+nothing marking it fake. A configured-but-broken source raises, and synthetic data
+is available only when demo mode is explicitly enabled.
 """
 
 from __future__ import annotations
@@ -26,14 +26,16 @@ from carbonsight_core.carbon.base import (
     ForecastBackedProvider,
     as_utc,
 )
-from carbonsight_core.config import Config
-from carbonsight_core.watttime import (
+from carbonsight_core.carbon.synthetic import (
     SYNTHETIC_WATTTIME_REGIONS,
+    build_synthetic_forecast,
+)
+from carbonsight_core.config import Config
+from carbonsight_core.mapping.registry import default_grid_regions
+from carbonsight_core.watttime import (
     ForecastCache,
     WattTimeClient,
-    build_synthetic_forecast,
     get_global_forecast_cache,
-    synthetic_moer_for_region,
 )
 
 __all__ = [
@@ -43,6 +45,15 @@ __all__ = [
     "WattTimeCarbonProvider",
     "get_carbon_provider",
 ]
+
+
+def _forecast_cache_key(
+    region: str,
+    horizon_hours: int,
+    anchor: datetime | None = None,
+) -> str:
+    key = f"{region}:{horizon_hours}"
+    return key if anchor is None else f"{key}@{as_utc(anchor).isoformat()}"
 
 
 class SyntheticCarbonProvider(ForecastBackedProvider):
@@ -66,7 +77,7 @@ class SyntheticCarbonProvider(ForecastBackedProvider):
     ) -> list[dict[str, Any]]:
         # Key on the anchor too: the curve is a function of (region, window), so a
         # pinned `now` yields the same series on any calendar date.
-        cache_key = region if anchor is None else f"{region}@{as_utc(anchor).isoformat()}"
+        cache_key = _forecast_cache_key(region, horizon_hours, anchor)
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
@@ -77,16 +88,10 @@ class SyntheticCarbonProvider(ForecastBackedProvider):
     def list_regions(self) -> list[str]:
         return list(self._regions)
 
-    def point_moer(self, region: str) -> float:
-        """Instantaneous synthetic MOER, no time weighting."""
-        return synthetic_moer_for_region(region)
-
-
 class WattTimeCarbonProvider(ForecastBackedProvider):
     """Direct WattTime access plus a local :class:`ForecastCache`.
 
-    ``allow_synthetic=False`` on the client: a credentialled provider that cannot
-    reach WattTime must fail, not invent numbers.
+    A credentialled provider that cannot reach WattTime must fail, not invent numbers.
     """
 
     def __init__(
@@ -96,7 +101,7 @@ class WattTimeCarbonProvider(ForecastBackedProvider):
         config: Config | None = None,
     ) -> None:
         self._config = config or Config.from_env()
-        self._client = client or WattTimeClient(self._config, allow_synthetic=False)
+        self._client = client or WattTimeClient(self._config)
         self._cache = cache or ForecastCache(
             ttl_seconds=self._config.forecast_cache_ttl_seconds
         )
@@ -109,16 +114,17 @@ class WattTimeCarbonProvider(ForecastBackedProvider):
         anchor: datetime | None = None,
     ) -> list[dict[str, Any]]:
         del anchor  # live data is whatever the grid reported; the window is applied later
-        cached = self._cache.get(region)
+        cache_key = _forecast_cache_key(region, horizon_hours)
+        cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
         payload = self._client.get_forecast(region, horizon_hours=horizon_hours)
         points = WattTimeClient.normalize_forecast_payload(payload)
-        self._cache.set(region, points)
+        self._cache.set(cache_key, points)
         return points
 
     def list_regions(self) -> list[str]:
-        return list(SYNTHETIC_WATTTIME_REGIONS)
+        return default_grid_regions()
 
 
 class ApiCarbonProvider(ForecastBackedProvider):
@@ -160,7 +166,8 @@ class ApiCarbonProvider(ForecastBackedProvider):
         anchor: datetime | None = None,
     ) -> list[dict[str, Any]]:
         del anchor  # the server decides the series; the window is applied later
-        cached = self._cache.get(region)
+        cache_key = _forecast_cache_key(region, horizon_hours)
+        cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
         try:
@@ -189,7 +196,7 @@ class ApiCarbonProvider(ForecastBackedProvider):
                 f"CarbonSight API returned no forecast points for {region}"
             )
         self.sources[region] = source
-        self._cache.set(region, points)
+        self._cache.set(cache_key, points)
         return points
 
     def list_regions(self) -> list[str]:
@@ -231,7 +238,7 @@ class ApiCarbonProvider(ForecastBackedProvider):
 
 
 def get_carbon_provider(config: Config | None = None) -> ForecastBackedProvider:
-    """Pick a source: API URL > WattTime credentials > synthetic."""
+    """Pick a configured source; synthetic data requires explicit demo mode."""
     cfg = config or Config.from_env()
     if cfg.carbonsight_api_url:
         return ApiCarbonProvider(config=cfg)
@@ -240,4 +247,10 @@ def get_carbon_provider(config: Config | None = None) -> ForecastBackedProvider:
             config=cfg,
             cache=get_global_forecast_cache(cfg.forecast_cache_ttl_seconds),
         )
-    return SyntheticCarbonProvider()
+    if cfg.demo_mode:
+        return SyntheticCarbonProvider()
+    raise CarbonProviderError(
+        "No carbon data source configured. Set CARBONSIGHT_API_URL, set both "
+        "WATTTIME_USERNAME and WATTTIME_PASSWORD, or explicitly enable "
+        "CARBONSIGHT_DEMO_MODE for non-physical demo data."
+    )

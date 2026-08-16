@@ -56,7 +56,7 @@ services:
       - "8000:8000"
     environment:
       # The API serves cached data; it needs no WattTime credentials of its own.
-      DATABASE_URL: postgresql://${POSTGRES_USER:-carbonsight}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:-carbonsight}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-carbonsight}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:-carbonsight}
       CARBONSIGHT_FORECAST_CACHE_TTL: ${CARBONSIGHT_FORECAST_CACHE_TTL:-900}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
@@ -74,7 +74,7 @@ services:
       # rather than quietly refreshing nothing.
       WATTTIME_USERNAME: ${WATTTIME_USERNAME:?}
       WATTTIME_PASSWORD: ${WATTTIME_PASSWORD:?}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-carbonsight}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:-carbonsight}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-carbonsight}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:-carbonsight}
       WORKER_INTERVAL_SECONDS: ${WORKER_INTERVAL_SECONDS:-900}
       GRID_SIGNAL_RETENTION_HOURS: ${GRID_SIGNAL_RETENTION_HOURS:-168}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

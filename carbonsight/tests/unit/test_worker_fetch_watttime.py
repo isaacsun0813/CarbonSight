@@ -11,11 +11,10 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from carbonsight_core.carbon import build_synthetic_forecast
 from carbonsight_core.config import Config
 from carbonsight_core.watttime import (
     WattTimeError,
-    build_synthetic_forecast,
-    reset_global_forecast_cache,
 )
 from worker import fetch_watttime as worker
 
@@ -40,12 +39,10 @@ class FakeWattTime:
             raise WattTimeError(f"upstream exploded for {region}")
         return self.payloads.get(region, {"data": [{"point_time": "2026-03-01T00:00:00Z", "value": 111.0}]})
 
+    def forecast_regions(self) -> set[str]:
+        from carbonsight_core.mapping.registry import default_grid_regions
 
-@pytest.fixture(autouse=True)
-def _clean_cache() -> Any:
-    reset_global_forecast_cache()
-    yield
-    reset_global_forecast_cache()
+        return set(default_grid_regions()) - {"HKG"}
 
 
 @pytest.fixture(autouse=True)
@@ -75,15 +72,16 @@ class TestRefreshPass:
         """Not a hardcoded list: the registry decides what must be kept warm.
 
         Four regions (BHR, HKG, JP_KN, ZAF) were referenced by the registry but
-        absent from the old hardcoded tuple, so they were never refreshed and the
-        cloud regions mapping to them would 503 forever.
+        absent from the old hardcoded tuple. Regions without forecast capability
+        are excluded using WattTime's my-access metadata.
         """
         from carbonsight_core.mapping.registry import default_grid_regions
 
         client = FakeWattTime()
         worker.fetch_all_regions(CREDENTIALLED, client=client)
-        assert client.calls == default_grid_regions()
-        assert {"BHR", "HKG", "JP_KN", "ZAF"} <= set(client.calls)
+        assert client.calls == [region for region in default_grid_regions() if region != "HKG"]
+        assert {"BHR", "JP_KN", "ZAF"} <= set(client.calls)
+        assert "HKG" not in client.calls
 
     def test_requires_credentials(self) -> None:
         """The worker exists to hold the one shared login; without it there's nothing to do."""
@@ -144,22 +142,22 @@ class TestNeverPersistsFabricatedData:
             worker.persist_rows = original  # type: ignore[assignment]
         assert captured == [], "a failed region must contribute no rows"
 
-    def test_the_client_is_built_with_synthetic_disabled(
+    def test_the_worker_uses_the_plain_watttime_client(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Belt and braces: even the client can't hand the worker invented data."""
-        seen: dict[str, Any] = {}
+        """The worker has no synthetic-capable transport to poison shared storage."""
+        seen: dict[str, bool] = {}
 
         class Recorder:
-            def __init__(self, _cfg: Config, *, allow_synthetic: bool = True) -> None:
-                seen["allow_synthetic"] = allow_synthetic
+            def __init__(self, _cfg: Config) -> None:
+                seen["constructed"] = True
 
             def get_forecast(self, region: str, **_: object) -> Any:
                 return {"data": [{"point_time": "2026-03-01T00:00:00Z", "value": 1.0}]}
 
         monkeypatch.setattr(worker, "WattTimeClient", Recorder)
         worker.fetch_all_regions(CREDENTIALLED, regions=["IE"])
-        assert seen["allow_synthetic"] is False
+        assert seen["constructed"] is True
 
     def test_synthetic_curves_are_arbitrary_which_is_why_this_matters(self) -> None:
         """Pinned as a fact: these values have no relationship to real grids."""

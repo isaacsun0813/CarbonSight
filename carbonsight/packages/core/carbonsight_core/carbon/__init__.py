@@ -9,13 +9,17 @@ from carbonsight_core.carbon.base import (
     CarbonProviderError,
     ForecastBackedProvider,
     as_utc,
-    facility_mwh_per_hr,
 )
 from carbonsight_core.carbon.providers import (
     ApiCarbonProvider,
     SyntheticCarbonProvider,
     WattTimeCarbonProvider,
     get_carbon_provider,
+)
+from carbonsight_core.carbon.synthetic import (
+    SYNTHETIC_WATTTIME_REGIONS,
+    build_synthetic_forecast,
+    synthetic_moer_for_region,
 )
 
 __all__ = [
@@ -24,8 +28,10 @@ __all__ = [
     "CarbonProviderError",
     "ForecastBackedProvider",
     "SyntheticCarbonProvider",
+    "SYNTHETIC_WATTTIME_REGIONS",
     "WattTimeCarbonProvider",
     "as_utc",
-    "facility_mwh_per_hr",
     "get_carbon_provider",
+    "build_synthetic_forecast",
+    "synthetic_moer_for_region",
 ]

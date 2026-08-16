@@ -14,6 +14,7 @@ in it fails here rather than at someone's terminal.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -22,7 +23,7 @@ from carbonsight_api.main import app
 import carbonsight_core.carbon.providers as providers_module
 from carbonsight_core.carbon import ApiCarbonProvider, CarbonProviderError
 from carbonsight_core.config import Config
-from carbonsight_core.watttime import get_global_forecast_cache, reset_global_forecast_cache
+from carbonsight_core.watttime import get_global_forecast_cache
 from worker import fetch_watttime as worker
 
 SERVER_CONFIG = Config(watttime_username="server-account", watttime_password="server-secret")
@@ -39,13 +40,6 @@ class ServerSideWattTime:
             ],
             "units": "lbs_co2_per_mwh",
         }
-
-
-@pytest.fixture(autouse=True)
-def _clean_cache() -> Any:
-    reset_global_forecast_cache()
-    yield
-    reset_global_forecast_cache()
 
 
 @pytest.fixture
@@ -150,6 +144,52 @@ class TestHonestFailureModes:
 
 
 class TestTheRouteItself:
+    def test_horizon_limits_the_returned_points(self) -> None:
+        from fastapi.testclient import TestClient
+
+        start = datetime(2026, 3, 1, tzinfo=UTC)
+        points = [
+            {
+                "point_time": (start + timedelta(minutes=30 * index))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "value": 100.0 + index,
+            }
+            for index in range(5)
+        ]
+        get_global_forecast_cache().set("SE", points)
+        with TestClient(app) as client:
+            body = client.get(
+                "/v1/carbon/forecast",
+                params={"region": "SE", "horizon_hours": 1},
+            ).json()
+        assert len(body["data"]) == 2
+
+    def test_api_recommendations_use_the_server_store_without_credentials(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from fastapi.testclient import TestClient
+        from carbonsight_core.mapping.registry import default_grid_regions
+
+        for variable in ("WATTTIME_USERNAME", "WATTTIME_PASSWORD", "CARBONSIGHT_API_URL"):
+            monkeypatch.delenv(variable, raising=False)
+        start = datetime.now(UTC)
+        points = [
+            {"point_time": start.isoformat(), "value": 300.0},
+            {"point_time": (start + timedelta(hours=1)).isoformat(), "value": 300.0},
+        ]
+        cache = get_global_forecast_cache()
+        for region in default_grid_regions():
+            cache.set(region, points)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/recommendations",
+                json={"gpu_type": "A100", "gpu_count": 1, "duration_hours": 1},
+            )
+        assert response.status_code == 200
+        assert response.json()
+
     def test_expired_data_is_served_but_labelled_stale(self) -> None:
         from fastapi.testclient import TestClient
 

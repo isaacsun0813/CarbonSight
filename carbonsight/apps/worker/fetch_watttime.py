@@ -119,17 +119,29 @@ def fetch_all_regions(
         )
 
     cache = get_global_forecast_cache(cfg.forecast_cache_ttl_seconds)
-    # allow_synthetic=False: a worker that invents data poisons the shared cache.
-    watt_time = client or WattTimeClient(cfg, allow_synthetic=False)
+    watt_time = client or WattTimeClient(cfg)
 
     report = RefreshReport()
     rows: list[dict[str, Any]] = []
 
-    for region in regions if regions is not None else default_grid_regions():
+    target_regions = regions
+    if target_regions is None:
+        forecast_regions = watt_time.forecast_regions()
+        target_regions = [
+            region for region in default_grid_regions() if region in forecast_regions
+        ]
+        unavailable_count = len(default_grid_regions()) - len(target_regions)
+        if unavailable_count:
+            logger.info(
+                "skipping %s registry regions without forecast access",
+                unavailable_count,
+            )
+
+    for region in target_regions:
         try:
             payload = watt_time.get_forecast(region, horizon_hours=horizon_hours)
             points = WattTimeClient.normalize_forecast_payload(payload)
-        except Exception as err:  # noqa: BLE001 - one bad region must not stop the pass
+        except Exception as err:
             report.regions_failed += 1
             report.failures.append(f"{region}: {err}")
             logger.warning("refresh failed for %s: %s", region, err)

@@ -18,20 +18,13 @@ from carbonsight_core.carbon import (
     CarbonProviderError,
     SyntheticCarbonProvider,
     WattTimeCarbonProvider,
-    facility_mwh_per_hr,
     get_carbon_provider,
 )
 from carbonsight_core.config import Config
-from carbonsight_core.models import JobSpec
-from carbonsight_core.watttime import LB_TO_KG, WattTimeError
+from carbonsight_core.watttime import WattTimeError
 
 START = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
 END = START + timedelta(hours=4)
-
-
-@pytest.fixture
-def job() -> JobSpec:
-    return JobSpec(gpu_type="A100", gpu_count=8, duration_hours=4.0)
 
 
 def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -56,6 +49,19 @@ class TestProtocolConformance:
 
 
 class TestSyntheticProvider:
+    def test_forecast_horizon_covers_the_requested_window(self) -> None:
+        provider = SyntheticCarbonProvider()
+        points = provider.get_forecast("IE", horizon_hours=6, anchor=START)
+        assert len(points) == 6 * 12
+        assert datetime.fromisoformat(points[-1]["point_time"].replace("Z", "+00:00")) == (
+            START + timedelta(hours=6) - timedelta(minutes=5)
+        )
+
+    def test_short_cached_horizon_does_not_truncate_a_later_request(self) -> None:
+        provider = SyntheticCarbonProvider()
+        assert len(provider.get_forecast("IE", horizon_hours=1, anchor=START)) == 12
+        assert len(provider.get_forecast("IE", horizon_hours=6, anchor=START)) == 72
+
     def test_regions_are_not_flat(self) -> None:
         """A flat curve would make the carbon lever invisible in the demo."""
         provider = SyntheticCarbonProvider()
@@ -87,44 +93,6 @@ class TestSyntheticProvider:
         assert blend == pytest.approx((pure_ie + pure_se) / 2, rel=1e-6)
 
 
-class TestJobAwareness:
-    def test_kg_per_hr_scales_with_gpu_count(self, job: JobSpec) -> None:
-        provider = SyntheticCarbonProvider()
-        one = provider.get_kg_per_hr(job.model_copy(update={"gpu_count": 1}), [("IE", 1.0)], START, END)
-        eight = provider.get_kg_per_hr(job.model_copy(update={"gpu_count": 8}), [("IE", 1.0)], START, END)
-        assert eight > one * 4
-
-    def test_kg_per_hr_is_moer_times_power_times_conversion(self, job: JobSpec) -> None:
-        provider = SyntheticCarbonProvider()
-        moer = provider.get_moer_lb_per_mwh([("IE", 1.0)], START, END)
-        expected = facility_mwh_per_hr(job) * moer * LB_TO_KG
-        assert provider.get_kg_per_hr(job, [("IE", 1.0)], START, END) == pytest.approx(expected)
-
-    def test_gpu_utilization_pins_the_draw(self, job: JobSpec) -> None:
-        idle = facility_mwh_per_hr(job.model_copy(update={"gpu_utilization": 0.05}))
-        busy = facility_mwh_per_hr(job.model_copy(update={"gpu_utilization": 0.95}))
-        assert busy > idle
-
-    def test_cost_per_hr_is_kg_dollarised(self, job: JobSpec) -> None:
-        provider = SyntheticCarbonProvider()
-        kg = provider.get_kg_per_hr(job, [("IE", 1.0)], START, END)
-        cost = provider.get_cost_per_hr(job, [("IE", 1.0)], START, END, 50.0, 1.0)
-        assert cost == pytest.approx(kg / 1000.0 * 50.0)
-
-    def test_carbon_weight_scales_linearly(self, job: JobSpec) -> None:
-        provider = SyntheticCarbonProvider()
-        single = provider.get_cost_per_hr(job, [("IE", 1.0)], START, END, 50.0, 1.0)
-        double = provider.get_cost_per_hr(job, [("IE", 1.0)], START, END, 50.0, 2.0)
-        assert double == pytest.approx(single * 2)
-
-    def test_power_averaging_beats_a_single_draw(self, job: JobSpec) -> None:
-        """64 draws, fixed seed: reproducible, and not an outlier of the distribution."""
-        averaged = facility_mwh_per_hr(job)
-        one_shot = facility_mwh_per_hr(job, samples=1)
-        assert averaged == facility_mwh_per_hr(job)
-        assert abs(averaged - one_shot) / averaged < 0.20
-
-
 class TestFactorySelection:
     def test_api_url_wins(self) -> None:
         cfg = Config(
@@ -138,13 +106,19 @@ class TestFactorySelection:
         cfg = Config(watttime_username="u", watttime_password="p")
         assert isinstance(get_carbon_provider(cfg), WattTimeCarbonProvider)
 
-    def test_nothing_configured_falls_to_synthetic(self) -> None:
-        assert isinstance(get_carbon_provider(Config()), SyntheticCarbonProvider)
+    def test_synthetic_requires_explicit_demo_mode(self) -> None:
+        assert isinstance(
+            get_carbon_provider(Config(demo_mode=True)),
+            SyntheticCarbonProvider,
+        )
 
     def test_half_a_credential_is_not_a_credential(self) -> None:
-        assert isinstance(
-            get_carbon_provider(Config(watttime_username="u")), SyntheticCarbonProvider
-        )
+        with pytest.raises(CarbonProviderError, match="No carbon data source"):
+            get_carbon_provider(Config(watttime_username="u"))
+
+    def test_nothing_configured_is_an_error(self) -> None:
+        with pytest.raises(CarbonProviderError, match="No carbon data source"):
+            get_carbon_provider(Config())
 
 
 class TestNeverFabricateARanking:

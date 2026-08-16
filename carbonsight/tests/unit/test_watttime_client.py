@@ -1,9 +1,4 @@
-"""WattTime client: token cache, 401 refresh, 429 backoff, unit gate, synthetic fallback.
-
-The synthetic path is what lets `carbonsight advise` show a carbon lever with no
-credentials, so the tests below pin both halves of that promise: it must produce
-materially different MOER per region, and it must never mask a unit-gate failure.
-"""
+"""WattTime client: credentials, token cache, retries, endpoints, and unit gate."""
 
 from __future__ import annotations
 
@@ -15,19 +10,11 @@ from carbonsight_core.config import Config
 from carbonsight_core.watttime import (
     LB_TO_KG,
     SUPPORTED_MOER_UNIT,
-    SYNTHETIC_WATTTIME_REGIONS,
     WattTimeClient,
     WattTimeError,
-    build_synthetic_forecast,
-    build_synthetic_forecast_payload,
-    synthetic_moer_for_region,
 )
 
 FORECAST_POINT = {"point_time": "2026-01-01T00:00:00Z", "value": 321.0}
-
-
-def _parse_point_time(point: dict) -> datetime:
-    return datetime.fromisoformat(point["point_time"].replace("Z", "+00:00"))
 
 
 def _config_with_credentials(**overrides: object) -> Config:
@@ -84,21 +71,32 @@ def test_region_from_loc_has_no_synthetic_fallback() -> None:
         client.region_from_loc(38.9, -77.5)
 
 
-def test_forecast_without_credentials_and_synthetic_disabled_raises() -> None:
-    client = WattTimeClient(_config_without_credentials(), allow_synthetic=False)
-    assert client.allow_synthetic is False
+def test_forecast_without_credentials_raises() -> None:
+    client = WattTimeClient(_config_without_credentials())
     with pytest.raises(WattTimeError, match="credentials not configured"):
         client.get_forecast("CAISO_NORTH")
 
 
-def test_historical_without_credentials_and_synthetic_disabled_raises() -> None:
-    client = WattTimeClient(_config_without_credentials(), allow_synthetic=False)
+def test_historical_without_credentials_raises() -> None:
+    client = WattTimeClient(_config_without_credentials())
     start = datetime(2026, 1, 1, tzinfo=UTC)
     with pytest.raises(WattTimeError, match="credentials not configured"):
         client.get_historical("CAISO_NORTH", start, start + timedelta(hours=2))
 
 
 # --- token cache / 401 / 429 -------------------------------------------------
+
+
+def test_login_uses_documented_get_with_basic_auth() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/login":
+            assert request.method == "GET"
+            assert request.headers.get("Authorization", "").startswith("Basic ")
+            return _login_ok()
+        return httpx.Response(200, json={"regions": []})
+
+    client = WattTimeClient(_config_with_credentials())
+    client.my_access(client=httpx.Client(transport=httpx.MockTransport(handle)))
 
 
 def test_login_token_is_cached_across_calls() -> None:
@@ -136,7 +134,7 @@ def test_login_is_repeated_when_token_caching_is_off() -> None:
 
 def test_login_without_token_in_response_raises() -> None:
     transport = _RecordingTransport({"/v2/login": [httpx.Response(200, json={})]})
-    client = WattTimeClient(_config_with_credentials(), allow_synthetic=False)
+    client = WattTimeClient(_config_with_credentials())
     with pytest.raises(WattTimeError, match="No token in login response"):
         client.my_access(client=transport.new_client())
 
@@ -260,6 +258,58 @@ def test_units_may_be_carried_per_point() -> None:
     assert payload["data"][0]["value"] == 321.0
 
 
+def test_units_may_be_carried_in_v3_meta() -> None:
+    transport = _RecordingTransport(
+        {
+            "/v2/login": [_login_ok()],
+            "/v3/forecast": [
+                httpx.Response(
+                    200,
+                    json={
+                        "data": [FORECAST_POINT],
+                        "meta": {"units": SUPPORTED_MOER_UNIT},
+                    },
+                )
+            ],
+        }
+    )
+    client = WattTimeClient(_config_with_credentials())
+    payload = client.get_forecast("PJM_DC", client=transport.new_client())
+    assert payload["data"][0]["value"] == 321.0
+
+
+def test_forecast_regions_uses_my_access_endpoint_capabilities() -> None:
+    transport = _RecordingTransport(
+        {
+            "/v2/login": [_login_ok()],
+            "/v3/my-access": [
+                httpx.Response(
+                    200,
+                    json={
+                        "signal_types": [
+                            {
+                                "signal_type": "co2_moer",
+                                "regions": [
+                                    {
+                                        "region": "FORECASTABLE",
+                                        "endpoints": [{"endpoint": "v3/forecast"}],
+                                    },
+                                    {
+                                        "region": "HISTORICAL_ONLY",
+                                        "endpoints": [{"endpoint": "v3/historical"}],
+                                    },
+                                ],
+                            }
+                        ]
+                    },
+                )
+            ],
+        }
+    )
+    client = WattTimeClient(_config_with_credentials())
+    assert client.forecast_regions(client=transport.new_client()) == {"FORECASTABLE"}
+
+
 def test_historical_applies_the_same_unit_gate() -> None:
     transport = _RecordingTransport(
         {
@@ -273,19 +323,6 @@ def test_historical_applies_the_same_unit_gate() -> None:
     start = datetime(2026, 1, 1, tzinfo=UTC)
     with pytest.raises(WattTimeError, match="Unsupported unit"):
         client.get_historical("PJM_DC", start, start + timedelta(hours=1), client=transport.new_client())
-
-
-# --- synthetic fallback ------------------------------------------------------
-
-
-def test_forecast_without_credentials_returns_the_live_envelope_shape() -> None:
-    """Callers do payload["data"]; the synthetic path must not hand back a bare list."""
-    payload = WattTimeClient(_config_without_credentials()).get_forecast("CAISO_NORTH")
-    assert isinstance(payload, dict)
-    assert payload["units"] == SUPPORTED_MOER_UNIT
-    assert payload["meta"]["source"] == "synthetic"
-    assert len(payload["data"]) > 1
-    assert payload["data"][0]["value"] > 0
 
 
 def _dead_network_client() -> httpx.Client:
@@ -305,7 +342,6 @@ def test_transport_failure_raises_rather_than_fabricating_a_ranking() -> None:
     inverted answer with nothing marking it as fake.
     """
     client = WattTimeClient(_config_with_credentials())
-    assert client.allow_synthetic is True
     with pytest.raises(httpx.ConnectError):
         client.get_forecast("PJM_DC", client=_dead_network_client())
 
@@ -328,105 +364,6 @@ def test_http_error_from_forecast_raises() -> None:
     client = WattTimeClient(_config_with_credentials())
     with pytest.raises(httpx.HTTPStatusError):
         client.get_forecast("PJM_DC", client=transport.new_client())
-
-
-def test_unit_gate_is_never_masked_by_the_synthetic_fallback() -> None:
-    """A bad-units response must fail closed even though allow_synthetic is on."""
-    transport = _RecordingTransport(
-        {
-            "/v2/login": [_login_ok()],
-            "/v3/forecast": [
-                httpx.Response(200, json={"data": [FORECAST_POINT], "units": "g_co2_per_kwh"})
-            ],
-        }
-    )
-    client = WattTimeClient(_config_with_credentials())
-    assert client.allow_synthetic is True
-    with pytest.raises(WattTimeError, match="Unsupported unit"):
-        client.get_forecast("PJM_DC", client=transport.new_client())
-
-
-def test_synthetic_forecast_honours_the_requested_horizon() -> None:
-    """run.py sizes the scheduling horizon from max-delay; ignoring it truncates the search."""
-    client = WattTimeClient(_config_without_credentials())
-    six_hours = client.get_forecast("PJM_DC", horizon_hours=6)["data"]
-    default_horizon = client.get_forecast("PJM_DC")["data"]
-
-    assert len(six_hours) == 6 * 12  # 5-minute resolution
-    assert len(default_horizon) == 24 * 12
-    span = _parse_point_time(six_hours[-1]) - _parse_point_time(six_hours[0])
-    assert span == timedelta(hours=6) - timedelta(minutes=5)
-
-
-def test_historical_without_credentials_spans_the_requested_window() -> None:
-    start = datetime(2026, 3, 1, 6, 0, tzinfo=UTC)
-    points = WattTimeClient(_config_without_credentials()).get_historical(
-        "SE", start, start + timedelta(hours=3)
-    )
-    assert points[0]["point_time"].startswith("2026-03-01T06:00")
-    assert len(points) == 3 * 12  # 3h at 5-minute resolution
-
-
-def test_historical_without_credentials_tracks_the_window_length() -> None:
-    """A longer window must produce a longer series, not the 24h default."""
-    start = datetime(2026, 3, 1, tzinfo=UTC)
-    client = WattTimeClient(_config_without_credentials())
-    assert len(client.get_historical("SE", start, start + timedelta(hours=8))) == 8 * 12
-    # Sub-hour windows still yield at least one hour of points rather than nothing.
-    assert len(client.get_historical("SE", start, start + timedelta(minutes=20))) == 12
-
-
-def test_synthetic_moer_is_deterministic_per_region() -> None:
-    assert synthetic_moer_for_region("CAISO_NORTH") == synthetic_moer_for_region("CAISO_NORTH")
-    assert synthetic_moer_for_region("CAISO_NORTH") != synthetic_moer_for_region("DIRTY_GRID_ZZ")
-
-
-def test_synthetic_moer_is_not_flat_across_regions() -> None:
-    """A flat constant everywhere would make the carbon lever invisible.
-
-    The curves are hash-derived over an 850 lb/MWh span, so a couple of the 17
-    regions can collide; what matters is the spread, not perfect uniqueness.
-    """
-    values = {synthetic_moer_for_region(region) for region in SYNTHETIC_WATTTIME_REGIONS}
-    assert len(values) >= len(SYNTHETIC_WATTTIME_REGIONS) - 2
-    assert max(values) - min(values) > 300.0
-
-
-def test_synthetic_forecast_series_shape() -> None:
-    start = datetime(2026, 5, 1, tzinfo=UTC)
-    points = build_synthetic_forecast("IND", horizon_hours=2, step_minutes=15, now=start)
-    assert len(points) == 8
-    assert points[0]["point_time"] == "2026-05-01T00:00:00Z"
-    assert points[1]["point_time"] == "2026-05-01T00:15:00Z"
-    assert all(point["units"] == SUPPORTED_MOER_UNIT for point in points)
-    assert all(point["value"] > 0 for point in points)
-
-
-def test_synthetic_forecast_varies_within_the_horizon() -> None:
-    """A single repeated value would make time-weighted averaging meaningless."""
-    values = {point["value"] for point in build_synthetic_forecast("DE", horizon_hours=2)}
-    assert len(values) > 1
-
-
-def test_synthetic_forecast_accepts_a_naive_start() -> None:
-    points = build_synthetic_forecast("UK", horizon_hours=1, now=datetime(2026, 5, 1))
-    assert points[0]["point_time"] == "2026-05-01T00:00:00Z"
-
-
-def test_synthetic_forecast_horizon_never_yields_an_empty_series() -> None:
-    assert len(build_synthetic_forecast("FR", horizon_hours=0)) == 1
-
-
-@pytest.mark.parametrize("horizon_hours", [1, 3, 12, 24, 48])
-def test_synthetic_payload_honours_the_requested_horizon(horizon_hours: int) -> None:
-    payload = build_synthetic_forecast_payload("FR", horizon_hours=horizon_hours)
-    assert len(payload["data"]) == horizon_hours * 12
-
-
-def test_synthetic_payload_and_series_agree() -> None:
-    start = datetime(2026, 5, 1, tzinfo=UTC)
-    payload = build_synthetic_forecast_payload("KOR", horizon_hours=1, now=start)
-    assert payload["data"] == build_synthetic_forecast("KOR", horizon_hours=1, now=start)
 
 
 # --- small helpers -----------------------------------------------------------
@@ -473,23 +410,3 @@ def test_every_call_site_import_still_resolves() -> None:
             AwsRegionRankingService,
         )
     )
-
-
-def test_estimator_sees_a_per_region_lever_without_credentials() -> None:
-    """The reason the envelope shape matters: carbon_model reads payload["data"].
-
-    If the synthetic path returned a bare list, carbon_model would swallow the
-    AttributeError and fall back to a flat 400 lb/MWh for every region, and the
-    greenest-region ranking would be pure noise.
-    """
-    from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
-    from carbonsight_core.models import JobSpec
-
-    estimator = JobCarbonEstimator(WattTimeClient(_config_without_credentials()))
-    job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
-    clean = estimator.estimate_region(job, "aws", "eu-west-1", [("IE", 1.0)], 0.9)
-    dirty = estimator.estimate_region(job, "aws", "eu-north-1", [("SE", 1.0)], 0.9)
-
-    assert clean.expected_co2_kg_mean != dirty.expected_co2_kg_mean
-    ratio = dirty.expected_co2_kg_mean / clean.expected_co2_kg_mean
-    assert ratio > 1.5, "synthetic regions collapsed to a near-flat MOER"

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from carbonsight_core.carbon import build_synthetic_forecast, synthetic_moer_for_region
 from carbonsight_core.config import DEFAULT_FORECAST_CACHE_TTL_SECONDS, Config
 from carbonsight_core.watttime.cache import (
     ForecastCache,
@@ -15,7 +16,6 @@ from carbonsight_core.watttime.cache import (
     reset_global_forecast_cache,
     time_weighted_moer,
 )
-from carbonsight_core.watttime.client import build_synthetic_forecast, synthetic_moer_for_region
 
 START = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -50,13 +50,6 @@ def fake_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
     clock = _FakeClock()
     monkeypatch.setattr("carbonsight_core.watttime.cache.time", clock)
     return clock
-
-
-@pytest.fixture(autouse=True)
-def _isolate_global_cache():
-    reset_global_forecast_cache()
-    yield
-    reset_global_forecast_cache()
 
 
 # --- TTL ---------------------------------------------------------------------

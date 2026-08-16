@@ -84,5 +84,5 @@ class OnDemandPriceProvider(BaseAWSProvider):
             return self._set_cached(cache_key, price_per_gpu)
         except ClientError:
             return None
-        except Exception:  # noqa: BLE001 - AWS is optional; fail open rather than hide a region
+        except Exception:
             return None

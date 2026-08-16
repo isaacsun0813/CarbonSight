@@ -13,6 +13,7 @@ import httpx
 import pytest
 import typer
 from carbonsight_cli.commands.advise import run_advise
+from carbonsight_cli.commands.run import run_launch
 from typer.testing import CliRunner
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "train_minimal.yaml"
@@ -20,23 +21,44 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "train_minimal.yaml
 
 @pytest.fixture(autouse=True)
 def _no_ambient_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in ("WATTTIME_USERNAME", "WATTTIME_PASSWORD", "CARBONSIGHT_API_URL"):
+    for var in (
+        "WATTTIME_USERNAME",
+        "WATTTIME_PASSWORD",
+        "CARBONSIGHT_API_URL",
+        "CARBONSIGHT_DEMO_MODE",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
 def test_no_source_configured_names_both_options(capsys: pytest.CaptureFixture[str]) -> None:
-    run_advise(FIXTURE)
-    out = capsys.readouterr().out
-    assert "No carbon data source" in out
-    assert "WATTTIME_USERNAME" in out and "CARBONSIGHT_API_URL" in out
+    with pytest.raises(typer.Exit):
+        run_advise(FIXTURE)
+    err = capsys.readouterr().err
+    assert "No carbon data source" in err
+    assert "WATTTIME_USERNAME" in err and "CARBONSIGHT_API_URL" in err
 
 
-def test_no_source_configured_still_emits_valid_json(
+def test_demo_mode_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CARBONSIGHT_DEMO_MODE", "true")
+    run_advise(FIXTURE, json_out=True)
+
+
+def test_run_uses_the_same_explicit_demo_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Scripts parse this; the empty case must stay machine-readable."""
-    run_advise(FIXTURE, json_out=True)
-    assert capsys.readouterr().out.strip() == "[]"
+    monkeypatch.setenv("CARBONSIGHT_DEMO_MODE", "true")
+    run_launch(
+        FIXTURE,
+        dry_run=True,
+        skip_preflight=True,
+        checkpoint=False,
+        db_path=tmp_path / "runs.db",
+    )
+    output = capsys.readouterr().out
+    assert "Chosen:" in output
+    assert "Patched YAML" in output
 
 
 def test_unreachable_api_exits_cleanly_not_with_a_traceback(

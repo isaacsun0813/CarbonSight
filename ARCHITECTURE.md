@@ -60,7 +60,8 @@ Flow that’s in my head:
 - **Registry** answers: *which grid(s) does this datacenter sit on?*
 - **Carbon provider** answers: *how dirty is a marginal MWh on that grid?* Three sources, picked
   by `get_carbon_provider()` in this order: `CARBONSIGHT_API_URL` (proxy through a CarbonSight
-  API holding one shared credential) → `WATTTIME_*` (your own login) → synthetic (offline demo).
+  API holding one shared credential) → `WATTTIME_*` (your own login) → explicit
+  `CARBONSIGHT_DEMO_MODE=1` (non-physical offline demo). With none configured, ranking fails.
 - **Power model** answers: *how many watts is this job probably drawing?* (we don’t know utilization, so we randomize — more on that below)
 - **carbon_model** multiplies energy × MOER, converts units, runs Monte Carlo for a range
 
@@ -73,8 +74,8 @@ with respect to physics: Sweden scores dirtier than India.
 So a source that is **configured but broken** raises `CarbonProviderError`; it does not quietly
 substitute synthetic data. Serving a fabricated ranking is worse than failing, because the user
 cannot tell it apart from a real one and it can be *inverted* — recommending a coal grid over
-hydro. Only the genuine "nothing is configured" case is answered synthetically, and the doors
-turn the error into a sentence rather than a traceback.
+hydro. Synthetic data is available only through explicit demo mode; missing or broken production
+configuration fails, and the doors turn the error into a sentence rather than a traceback.
 
 Historical MOER (`compute_actual_run`) always comes from WattTime directly. There is nothing to
 be gained from fabricating what a finished job already emitted.
@@ -117,7 +118,7 @@ Implementation: `carbonsight/apps/cli/carbonsight_cli/commands/train.py`.
 
 Same loop as advise, plus optional **quota check** and **instance offerings check** per region (when preflight is enabled). Pick the **greenest** row that still passes the cost filter, **inject `cloud` and `region` into the YAML**, write a temp file, call SkyPilot.
 
-If the subprocess exits 0, we try **post-run actual CO₂** via **`JobCarbonEstimator.compute_actual_run`**: pull **historical** MOER for the job window from WattTime, time-weight it, compare to the pre-run estimate. The module-level **`compute_actual_co2`** remains a thin wrapper for tests and scripts. Start/end times are **wall clock around the local SkyPilot process** — MVP scope.
+If the subprocess exits 0 and direct WattTime credentials are available, we try **post-run actual CO₂** via **`JobCarbonEstimator.compute_actual_run`**: pull **historical** MOER for the job window from WattTime, time-weight it, compare to the pre-run estimate. Central-API mode currently skips historical backfill because that API exposes forecasts only. The module-level **`compute_actual_co2`** remains a thin wrapper for tests and scripts. Start/end times are **wall clock around the local SkyPilot process** — MVP scope.
 
 Implementation: `commands/run.py`.
 
@@ -174,7 +175,7 @@ Implementation: `carbonsight/packages/core/carbonsight_core/checkpoint.py` (core
 
 **Facility MWh** isn’t just “GPU nameplate watts × hours.” We model **IT watts** (base + GPU + CPU + mem + small network), then multiply by **PUE** to get facility-level energy per hour, then multiply by **duration**. GPU power is interpolated between idle and peak using a **random utilization** each Monte Carlo draw because I don’t know if your training script is pegging the GPU or waiting on I/O.
 
-We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per region estimate — we learned the hard way not to put that inside the loop). Sort the 1000 kg outcomes → **mean**, **p10**, **p90**. That range is the honest answer to “we don’t know your exact utilization.”
+We time-weight forecast MOER across the requested job duration, then run the power model **1000 times** (Monte Carlo). The forecast is fetched once per region estimate — never inside the loop. Sort the 1000 kg outcomes → **mean**, **p10**, **p90**. That range is the honest answer to “we don’t know your exact utilization.”
 
 **Cost** is separate: base $/GPU/hr × regional multiplier × count × hours. With `--spot` (default ON), cost uses either **live EC2 spot history** (when `CARBONSIGHT_LIVE_AWS_PRICING=1` or `--live-pricing`) via `describe_spot_price_history` (min across AZs, cached), or live/static on-demand × `SPOT_PRICE_FRACTION` (0.35) as fallback. With live pricing and `--no-spot`, on-demand cost uses **Pricing API** `get_products` (OnDemand terms only), mapped via `aws_pricing_locations`. Static tables remain the default when live pricing is off. IAM: `ec2:DescribeSpotPriceHistory`, `pricing:GetProducts`. It’s for **relative** ranking vs other regions, not a quote from AWS billing.
 

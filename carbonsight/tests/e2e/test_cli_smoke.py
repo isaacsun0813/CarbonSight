@@ -31,7 +31,7 @@ def test_carbonsight_help() -> None:
 
 
 def test_advise_parses_yaml() -> None:
-    """Advise with fixture YAML; may fail on missing WattTime but must not crash on parse."""
+    """Advise parses fixture YAML and runs with explicitly enabled demo data."""
     root = Path(__file__).resolve().parents[2]
     fixture = root / "tests" / "fixtures" / "train_minimal.yaml"
     if not fixture.exists():
@@ -40,6 +40,7 @@ def test_advise_parses_yaml() -> None:
     if not cli_main.exists():
         return
     env = {**__import__("os").environ, "PYTHONPATH": str(root / "packages" / "core") + ":" + str(root / "apps" / "cli")}
+    env["CARBONSIGHT_DEMO_MODE"] = "1"
     result = subprocess.run(
         [sys.executable, str(cli_main), "advise", "--yaml", str(fixture), "--json"],
         capture_output=True,
@@ -51,8 +52,8 @@ def test_advise_parses_yaml() -> None:
     assert result.returncode == 0
 
 
-def test_train_script_without_watttime_returns_empty_json() -> None:
-    """train script.py builds YAML and runs advise; no creds -> []."""
+def test_train_script_with_demo_mode_returns_recommendations() -> None:
+    """train script.py builds YAML and runs advise with explicit demo data."""
     root = Path(__file__).resolve().parents[2]
     stub = root.parent / "examples" / "skypilot" / "train_stub.py"
     if not stub.is_file():
@@ -60,6 +61,7 @@ def test_train_script_without_watttime_returns_empty_json() -> None:
     env = {**__import__("os").environ, "PYTHONPATH": str(root / "packages" / "core") + ":" + str(root / "apps" / "cli")}
     env.pop("WATTTIME_USERNAME", None)
     env.pop("WATTTIME_PASSWORD", None)
+    env["CARBONSIGHT_DEMO_MODE"] = "1"
     result = subprocess.run(
         [sys.executable, "-m", "carbonsight_cli.main", "train", str(stub), "--json"],
         capture_output=True,
@@ -69,4 +71,5 @@ def test_train_script_without_watttime_returns_empty_json() -> None:
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "[]"
+    assert result.stdout.strip().startswith("[")
+    assert result.stdout.strip() != "[]"

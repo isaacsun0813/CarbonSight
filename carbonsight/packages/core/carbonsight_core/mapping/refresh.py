@@ -77,7 +77,7 @@ def refresh_registry_mappings(registry: Registry, watt_time: WattTimeClient) -> 
                 succeeded_site_ids.add(site.site_id)
             except WattTimeError as err:
                 refresh_report.warnings.append(f"{entry.region_code} {site.site_id}: {err}")
-            except Exception as err:  # noqa: BLE001 - one bad site must not stop the region
+            except Exception as err:
                 refresh_report.warnings.append(f"{entry.region_code} {site.site_id}: {err}")
 
         if not site_codes:

@@ -2,13 +2,16 @@
 
 from pathlib import Path
 
+from carbonsight_core.carbon import CarbonProviderError
 from carbonsight_core.config import Config
 from carbonsight_core.mapping.registry import Registry
 from carbonsight_core.models import JobSpec
 from carbonsight_core.region_ranking import AwsRegionRankingService
 from carbonsight_core.watttime import WattTimeClient
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+
+from carbonsight_api.routes.carbon import StoredCarbonProvider
 
 router = APIRouter()
 
@@ -46,13 +49,15 @@ def post_recommendations(req: RecommendationRequest, request: Request) -> list[d
 
     reg = Registry()
     reg.load_json(rpath)
-    config = Config.from_env()
-    if not config.watttime_username or not config.watttime_password:
-        return []
-
-    watt_time = WattTimeClient(config)
-    ranking = AwsRegionRankingService(reg, watt_time)
-    estimates = ranking.collect_estimates(job)
+    try:
+        ranking = AwsRegionRankingService(
+            reg,
+            WattTimeClient(Config.from_env()),
+            carbon_provider=StoredCarbonProvider(),
+        )
+        estimates = ranking.collect_estimates(job)
+    except (CarbonProviderError, ValueError) as err:
+        raise HTTPException(status_code=503, detail=str(err)) from err
     if not estimates:
         return []
 

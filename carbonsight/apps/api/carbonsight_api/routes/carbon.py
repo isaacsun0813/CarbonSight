@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timedelta
 from typing import Any
 
+from carbonsight_core.carbon import CarbonProviderError, ForecastBackedProvider
 from carbonsight_core.config import Config
 from carbonsight_core.mapping.registry import default_grid_regions
 from carbonsight_core.watttime import get_global_forecast_cache
@@ -36,6 +38,28 @@ FROM grid_signal_cache
 WHERE wt_region = :wt_region AND signal_type = 'co2_moer'
 ORDER BY point_time
 """
+
+
+def _limit_horizon(points: list[dict[str, Any]], horizon_hours: int) -> list[dict[str, Any]]:
+    """Return at most ``horizon_hours`` from the first usable forecast point."""
+    if not points:
+        return []
+    try:
+        start = datetime.fromisoformat(str(points[0]["point_time"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return points
+    end = start + timedelta(hours=horizon_hours)
+    limited: list[dict[str, Any]] = []
+    for point in points:
+        try:
+            point_time = datetime.fromisoformat(
+                str(point["point_time"]).replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if point_time < end:
+            limited.append(point)
+    return limited
 
 
 def read_points_from_db(region: str, *, database_url: str | None = None) -> list[dict[str, Any]]:
@@ -69,44 +93,74 @@ def read_points_from_db(region: str, *, database_url: str | None = None) -> list
         return []
 
 
+def read_cached_forecast(region: str, horizon_hours: int = 24) -> dict[str, Any]:
+    """Read one forecast from process cache or Postgres without upstream I/O."""
+    config = Config.from_env()
+    cache = get_global_forecast_cache(config.forecast_cache_ttl_seconds)
+
+    any_points = cache.get_or_expired(region)
+    fresh_points = cache.get(region)
+    if fresh_points is not None:
+        return {
+            "region": region,
+            "source": "cache",
+            "data": _limit_horizon(fresh_points, horizon_hours),
+        }
+
+    db_points = read_points_from_db(region)
+    if db_points:
+        cache.set(region, db_points)
+        return {
+            "region": region,
+            "source": "db",
+            "data": _limit_horizon(db_points, horizon_hours),
+        }
+
+    if any_points is not None:
+        return {
+            "region": region,
+            "source": "stale",
+            "data": _limit_horizon(any_points, horizon_hours),
+        }
+
+    raise CarbonProviderError(
+        f"No forecast cached for {region}. The refresh worker has not stored usable data."
+    )
+
+
+class StoredCarbonProvider(ForecastBackedProvider):
+    """Server-local provider backed by the shared forecast store."""
+
+    def get_forecast(
+        self,
+        region: str,
+        *,
+        horizon_hours: int = 24,
+        anchor: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        del anchor
+        return list(read_cached_forecast(region, horizon_hours)["data"])
+
+    def list_regions(self) -> list[str]:
+        return default_grid_regions()
+
+
 @router.get("/carbon/forecast")
 def get_carbon_forecast(
     region: str = Query(..., description="WattTime grid region code, e.g. CAISO_NORTH"),
     horizon_hours: int = Query(24, ge=1, le=168),
 ) -> dict[str, Any]:
     """Return cached MOER points for one grid region."""
-    del horizon_hours  # the worker decides the horizon; kept for client compatibility
-    config = Config.from_env()
-    cache = get_global_forecast_cache(config.forecast_cache_ttl_seconds)
-
-    # Read the expired-tolerant copy FIRST: ForecastCache.get() evicts an expired
-    # entry as a side effect, so asking it before get_or_expired() would leave
-    # nothing to serve and make the stale branch unreachable.
-    any_points = cache.get_or_expired(region)
-    fresh_points = cache.get(region)
-
-    if fresh_points is not None:
-        return {"region": region, "source": "cache", "data": fresh_points}
-
-    # Nothing fresh in this process. When the worker runs in a *different* process
-    # (the compose setup), Postgres is the only store both sides see.
-    db_points = read_points_from_db(region)
-    if db_points:
-        cache.set(region, db_points)
-        return {"region": region, "source": "db", "data": db_points}
-
-    # Expired but present: a stale real reading beats nothing, clearly labelled.
-    if any_points is not None:
-        return {"region": region, "source": "stale", "data": any_points}
-
-    raise HTTPException(
-        status_code=503,
-        detail=(
-            f"No forecast cached for {region}. The refresh worker populates the cache "
-            "every 15 minutes; if this persists, check that the worker is running and "
-            "that WATTTIME_USERNAME/PASSWORD are set on the server."
-        ),
-    )
+    try:
+        return read_cached_forecast(region, horizon_hours)
+    except CarbonProviderError as err:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{err} Check that the refresh worker is running and that "
+                "WATTTIME_USERNAME/PASSWORD are set on the server."
+            ),
+        ) from err
 
 
 @router.get("/carbon/regions")

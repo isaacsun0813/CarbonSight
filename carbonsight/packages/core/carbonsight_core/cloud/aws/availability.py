@@ -98,7 +98,7 @@ class InstanceAvailabilityChecker(BaseAWSProvider):
                 gpu_type=normalized_gpu,
                 reason=f"EC2 API error: {error_code}; skipping availability check",
             )
-        except Exception as e:  # noqa: BLE001 - AWS is optional; fail open rather than hide a region
+        except Exception as e:
             return AvailabilityResult(
                 region=region,
                 available=True,

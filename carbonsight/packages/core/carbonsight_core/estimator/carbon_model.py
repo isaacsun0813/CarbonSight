@@ -3,6 +3,7 @@ Carbon estimator: E_facility_MWh, time-integrate MOER, Monte Carlo for mean/p10/
 Design: CO2_kg = (E_facility_MWh * MOER_lb_per_MWh) * 0.45359237; support mixture mapping.
 """
 
+import math
 import random
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # avoids estimator <-> carbon import cycle
     from carbonsight_core.carbon import CarbonIntensityProvider
 
+from carbonsight_core.carbon.base import CarbonProviderError
 from carbonsight_core.estimator.power_model import sample_power_params
 from carbonsight_core.estimator.pricing import estimate_cost_usd, estimate_job_cost
 from carbonsight_core.models import ActualRunResult, EstimateResult, JobSpec
@@ -26,15 +28,6 @@ MONTE_CARLO_SAMPLES = 1000
 def _facility_mwh_per_hour(p_it_w: float, pue: float) -> float:
     """E_facility_MWh for one hour = (P_IT_W/1000)*1*hour*PUE/1000."""
     return (p_it_w / 1000.0) * 1.0 * (pue / 1000.0)
-
-
-class CarbonDataUnavailableError(RuntimeError):
-    """The carbon data source could not answer, so no estimate can be made.
-
-    Deliberately fatal rather than falling back to a default MOER. An invented
-    carbon number is indistinguishable from a real one and is the entire thing
-    this product is supposed to get right.
-    """
 
 
 class JobCarbonEstimator:
@@ -60,6 +53,7 @@ class JobCarbonEstimator:
     def _weighted_forecast_moer_lb_per_mwh(
         self,
         watttime_regions: list[tuple[str, float]],
+        duration_hours: float = 1.0,
         client: Any = None,
     ) -> float:
         """Weighted average forecast MOER (lb CO₂/MWh) across WattTime mixture regions."""
@@ -73,7 +67,7 @@ class JobCarbonEstimator:
                 return self._carbon_provider.get_moer_lb_per_mwh(
                     watttime_regions,
                     window_start,
-                    window_start + timedelta(hours=1),
+                    window_start + timedelta(hours=duration_hours),
                 )
             except ValueError:
                 # A bad mixture (e.g. all-zero registry weights) is this region's
@@ -82,17 +76,23 @@ class JobCarbonEstimator:
                 raise
             except Exception as err:
                 # Everything else is source-level. Normalise to
-                # CarbonDataUnavailableError so the ranking treats it as a dead data
+                # CarbonProviderError so the ranking treats it as a dead data
                 # source (fatal) rather than one flaky region (a warning): a transport
                 # error fails every region identically, and 21 identical warnings
                 # followed by an empty table is a worse answer than one sentence
                 # saying the service is down.
-                raise CarbonDataUnavailableError(str(err)) from err
+                raise CarbonProviderError(str(err)) from err
         total = 0.0
+        window_start = datetime.now(UTC)
+        window_end = window_start + timedelta(hours=duration_hours)
         wt = self._watt_time
         for region, weight in watttime_regions:
             try:
-                data = wt.get_forecast(region, horizon_hours=1, client=client)
+                data = wt.get_forecast(
+                    region,
+                    horizon_hours=max(1, math.ceil(duration_hours)),
+                    client=client,
+                )
             except WattTimeError:
                 raise
             except Exception as err:
@@ -100,16 +100,16 @@ class JobCarbonEstimator:
                 # produced a complete-looking carbon estimate out of nothing. A carbon
                 # tool that invents carbon numbers when its data source is down is
                 # worse than one that admits it is down.
-                raise CarbonDataUnavailableError(
+                raise CarbonProviderError(
                     f"WattTime forecast for {region} failed: {err}"
                 ) from err
 
             points = data.get("data", [])
             if not points:
-                raise CarbonDataUnavailableError(
+                raise CarbonProviderError(
                     f"WattTime returned no forecast points for {region}."
                 )
-            total += weight * float(points[0].get("value", 0))
+            total += weight * time_weighted_moer(points, window_start, window_end)
         return total
 
     def estimate_region(
@@ -135,9 +135,13 @@ class JobCarbonEstimator:
         if moer_override is not None:
             moer_lb = moer_override
         else:
-            # Any failure here is fatal: see CarbonDataUnavailableError. The unit gate
+            # Any failure here is fatal: see CarbonProviderError. The unit gate
             # (WattTimeError) was already fail-closed; now transport failures are too.
-            moer_lb = self._weighted_forecast_moer_lb_per_mwh(watttime_regions, None)
+            moer_lb = self._weighted_forecast_moer_lb_per_mwh(
+                watttime_regions,
+                job.duration_hours,
+                None,
+            )
 
         for _ in range(MONTE_CARLO_SAMPLES):
             params = sample_power_params(job, rng)

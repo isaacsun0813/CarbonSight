@@ -20,12 +20,10 @@ from carbonsight_core.carbon import (
     CarbonProviderError,
     ForecastBackedProvider,
     SyntheticCarbonProvider,
+    get_carbon_provider,
 )
 from carbonsight_core.config import Config
-from carbonsight_core.estimator.carbon_model import (
-    CarbonDataUnavailableError,
-    JobCarbonEstimator,
-)
+from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
 from carbonsight_core.mapping.registry import CloudRegionEntry, Registry
 from carbonsight_core.models import JobSpec
 from carbonsight_core.region_ranking import AwsRegionRankingService
@@ -33,6 +31,28 @@ from carbonsight_core.watttime import WattTimeClient, WattTimeError
 
 JOB = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
 CREDS = Config(watttime_username="user", watttime_password="secret")
+
+
+def test_estimator_uses_the_full_job_duration_for_forecast_moer() -> None:
+    seen: list[float] = []
+
+    class RecordingProvider(SyntheticCarbonProvider):
+        def get_moer_lb_per_mwh(
+            self,
+            wt_regions: list[tuple[str, float]],
+            start: datetime,
+            end: datetime,
+        ) -> float:
+            seen.append((end - start).total_seconds() / 3600)
+            return super().get_moer_lb_per_mwh(wt_regions, start, end)
+
+    job = JOB.model_copy(update={"duration_hours": 6.5})
+    JobCarbonEstimator(
+        WattTimeClient(CREDS),
+        carbon_provider=RecordingProvider(),
+    ).estimate_region(job, "aws", "eu-west-1", [("IE", 1.0)], 0.9)
+
+    assert seen == [6.5]
 
 
 class DeadWattTime:
@@ -63,12 +83,12 @@ def _registry() -> Registry:
 class TestTheEstimatorRefusesToGuess:
     def test_a_dead_source_raises_instead_of_returning_400(self) -> None:
         estimator = JobCarbonEstimator(DeadWattTime())  # type: ignore[arg-type]
-        with pytest.raises(CarbonDataUnavailableError):
+        with pytest.raises(CarbonProviderError):
             estimator.estimate_region(JOB, "aws", "eu-west-1", [("IE", 1.0)], 0.9)
 
     def test_an_empty_forecast_raises_instead_of_returning_400(self) -> None:
         estimator = JobCarbonEstimator(EmptyWattTime())  # type: ignore[arg-type]
-        with pytest.raises(CarbonDataUnavailableError, match="no forecast points"):
+        with pytest.raises(CarbonProviderError, match="no forecast points"):
             estimator.estimate_region(JOB, "aws", "eu-west-1", [("IE", 1.0)], 0.9)
 
     def test_a_dead_provider_raises_too(self) -> None:
@@ -77,7 +97,7 @@ class TestTheEstimatorRefusesToGuess:
             DeadWattTime(),  # type: ignore[arg-type]
             carbon_provider=DeadProvider(),  # type: ignore[arg-type]
         )
-        with pytest.raises(CarbonDataUnavailableError):
+        with pytest.raises(CarbonProviderError):
             estimator.estimate_region(JOB, "aws", "eu-west-1", [("IE", 1.0)], 0.9)
 
     def test_no_estimate_ever_comes_back_as_the_old_400_default(self) -> None:
@@ -85,7 +105,7 @@ class TestTheEstimatorRefusesToGuess:
         estimator = JobCarbonEstimator(DeadWattTime())  # type: ignore[arg-type]
         try:
             result = estimator.estimate_region(JOB, "aws", "eu-west-1", [("IE", 1.0)], 0.9)
-        except CarbonDataUnavailableError:
+        except CarbonProviderError:
             return
         pytest.fail(f"expected a refusal, got a fabricated estimate: {result.expected_co2_kg_mean} kg")
 
@@ -107,10 +127,10 @@ class TestTheRankingFailsWholeNotPerRegion:
         a worse answer than one sentence saying the service is down."""
         ranking = AwsRegionRankingService(
             _registry(),
-            WattTimeClient(CREDS, allow_synthetic=False),
+            WattTimeClient(CREDS),
             carbon_provider=DeadProvider(),
         )
-        with pytest.raises(CarbonDataUnavailableError):
+        with pytest.raises(CarbonProviderError):
             ranking.collect_estimates(JOB)
 
     def test_it_does_not_degrade_to_a_truncated_ranking(self) -> None:
@@ -118,10 +138,10 @@ class TestTheRankingFailsWholeNotPerRegion:
         warnings: list[str] = []
         ranking = AwsRegionRankingService(
             _registry(),
-            WattTimeClient(CREDS, allow_synthetic=False),
+            WattTimeClient(CREDS),
             carbon_provider=DeadProvider(),
         )
-        with pytest.raises(CarbonDataUnavailableError):
+        with pytest.raises(CarbonProviderError):
             ranking.collect_estimates(JOB, on_estimate_error=lambda r, e: warnings.append(r))
         assert warnings == [], "a dead source must not be reported as per-region warnings"
 
@@ -155,14 +175,15 @@ class TestTheUserSeesAnHonestMessage:
 
 class TestSyntheticIsStillAvailableForTheDemo:
     def test_no_credentials_at_all_still_gets_synthetic(self) -> None:
-        """Removing the fallback must not break the offline demo path."""
-        payload = WattTimeClient(Config(), allow_synthetic=True).get_forecast("SE")
-        assert payload["data"], "the no-credentials demo should still produce a curve"
-        assert payload.get("meta", {}).get("source") == "synthetic"
+        """Explicit demo mode remains available through the provider layer."""
+        points = SyntheticCarbonProvider().get_forecast("SE")
+        assert points
 
     def test_and_that_curve_is_labelled_as_synthetic(self) -> None:
-        payload = WattTimeClient(Config(), allow_synthetic=True).get_forecast("IE")
-        assert payload["meta"]["source"] == "synthetic"
+        assert isinstance(
+            get_carbon_provider(Config(demo_mode=True)),
+            SyntheticCarbonProvider,
+        )
 
 
 class TestTheMixtureMathRefusesToGuess:
@@ -208,7 +229,7 @@ class TestTheMixtureMathRefusesToGuess:
         warned: list[str] = []
         ranking = AwsRegionRankingService(
             registry,
-            WattTimeClient(CREDS, allow_synthetic=False),
+            WattTimeClient(CREDS),
             carbon_provider=SyntheticCarbonProvider(),
         )
         estimates = ranking.collect_estimates(

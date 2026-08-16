@@ -52,7 +52,7 @@ In each phase below, **Testing** describes only **E2E scenarios** and how they u
 | **0.1** Create monorepo layout | `carbonsight/` root with `pyproject.toml`, `apps/cli/`, `apps/api/`, `packages/core/`, `infra/`, `tests/`. Use a single `pyproject.toml` with optional deps or workspace-style layout (e.g. `pip install -e packages/core`, `-e apps/cli`). |
 | **0.2** Tooling | Ruff + mypy, pre-commit or CI lint. Python 3.11+ in CI. |
 | **0.3** Core types | In `packages/core/carbonsight_core/models.py`: `JobSpec` (gpu_type, gpu_count, duration_hours, cpu_count, mem_gib, data_in/out_gb, start_time_utc, constraints), `EstimateResult` (cloud, cloud_region, watttime_regions, expected_cost_usd, expected_co2_kg_mean/p10/p90, mapping_confidence, notes). Use Pydantic. |
-| **0.4** Config and env | Load from env (WattTime credentials, CARBON_PROVIDER, LOG_LEVEL, etc.). No secrets in config files. |
+| **0.4** Config and env | Load from env (WattTime credentials, `CARBONSIGHT_API_URL`, `CARBONSIGHT_DEMO_MODE`, `LOG_LEVEL`, etc.). No secrets in config files. |
 
 **Testing (Phase 0)** — E2E only. No tests yet; “done” = lint and mypy pass, and a single E2E smoke that imports the app and runs `carbonsight --help` (no HTTP). Optional: one E2E that builds a `JobSpec` from a fixture YAML and asserts it parses; no WattTime. **How to run:** `ruff check .`; `mypy packages/core`; `pytest tests/e2e/ -v` (smoke only). **Done when:** Layout exists, types load, smoke E2E passes.
 
@@ -64,7 +64,7 @@ In each phase below, **Testing** describes only **E2E scenarios** and how they u
 
 | Task | Details |
 |------|--------|
-| **1.1** Auth and token cache | POST `/login` (basic auth). Cache bearer token; refresh on 401. Respect rate limits (3,000/5min, 100/5min for login). |
+| **1.1** Auth and token cache | GET `/v2/login` (basic auth). Cache bearer token; refresh on 401. Respect rate limits (3,000/5min, 100/5min for login). |
 | **1.2** Discovery | GET `/v3/my-access`: list regions, signal types, models. Use for validation and for knowing what's available. |
 | **1.3** Region-from-loc | GET `/v3/region-from-loc?signal_type=co2_moer&latitude=...&longitude=...`. Core for mapping. |
 | **1.4** MOER signals | Implement clients for: `/v3/forecast`, `/v3/historical` (where plan allows), and `/v3/signal-index` as fallback. Parse and expose `units` (require `lbs_co2_per_mwh` for kg CO₂). |

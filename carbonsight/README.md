@@ -40,8 +40,9 @@ export CARBONSIGHT_API_URL=http://localhost:8000
 ```
 
 With neither set, CarbonSight refuses to rank rather than inventing numbers.
-Synthetic MOER exists for offline demos, is a hash of the region name, and is
-never used as a fallback for a source that failed.
+For an explicitly non-physical offline demo, set `CARBONSIGHT_DEMO_MODE=1`.
+Synthetic MOER is a hash of the region name and is never used as a fallback for
+a missing or failed production source.
 
 Server-side settings (`DATABASE_URL`, `WORKER_INTERVAL_SECONDS`,
 `GRID_SIGNAL_RETENTION_HOURS`, `CARBONSIGHT_FORECAST_CACHE_TTL`) are documented

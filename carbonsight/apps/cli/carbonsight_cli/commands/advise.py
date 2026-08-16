@@ -8,7 +8,6 @@ import typer
 import yaml
 from carbonsight_core.carbon import CarbonProviderError, get_carbon_provider
 from carbonsight_core.config import Config
-from carbonsight_core.estimator.carbon_model import CarbonDataUnavailableError
 from carbonsight_core.estimator.pricing import configure_pricing
 from carbonsight_core.mapping.registry import Registry
 from carbonsight_core.models import JobSpec
@@ -172,17 +171,6 @@ def run_advise(
             config, live_pricing=live_pricing, static_pricing=static_pricing,
         ),
     )
-    has_credentials = bool(config.watttime_username and config.watttime_password)
-    if not has_credentials and not config.carbonsight_api_url:
-        if json_out:
-            typer.echo("[]")
-        else:
-            typer.echo(
-                "No carbon data source. Set WATTTIME_USERNAME and WATTTIME_PASSWORD, "
-                "or point CARBONSIGHT_API_URL at a CarbonSight API.",
-            )
-        return
-
     try:
         carbon_provider = get_carbon_provider(config)
     except (CarbonProviderError, ValueError) as err:
@@ -199,7 +187,7 @@ def run_advise(
         all_estimates = ranking.collect_estimates(
             job, use_spot=use_spot, on_estimate_error=_warn_estimate,
         )
-    except (CarbonProviderError, CarbonDataUnavailableError) as err:
+    except CarbonProviderError as err:
         typer.echo(
             "Error: CarbonSight's carbon data source is unavailable, so no ranking "
             "can be produced.\n"
