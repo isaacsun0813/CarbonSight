@@ -45,17 +45,25 @@ from carbonsight_cli.commands.advise import (
 BASELINE_REGION = "us-east-1"
 
 
+def _apply_cloud_region_to_resources(
+    resources: dict, cloud: str, region: str, *, use_spot: bool = False,
+) -> None:
+    """Set SkyPilot ``resources.infra`` and drop legacy cloud/region/zone keys."""
+    resources["infra"] = f"{cloud}/{region}"
+    for key in ("cloud", "region", "zone"):
+        resources.pop(key, None)
+    if use_spot:
+        resources["use_spot"] = True
+
+
 def patch_sky_yaml_with_cloud_region(
     yaml_path: Path, cloud: str, region: str, *, use_spot: bool = False,
 ) -> str:
-    """Inject resources.cloud and resources.region into SkyPilot YAML; return full document text."""
+    """Inject resources.infra (cloud/region) into SkyPilot YAML; return full document text."""
     data = yaml.safe_load(yaml_path.read_text()) or {}
     if "resources" not in data:
         data["resources"] = {}
-    data["resources"]["cloud"] = cloud
-    data["resources"]["region"] = region
-    if use_spot:
-        data["resources"]["use_spot"] = True
+    _apply_cloud_region_to_resources(data["resources"], cloud, region, use_spot=use_spot)
     return yaml.dump(data, default_flow_style=False, sort_keys=False)
 
 
@@ -288,10 +296,7 @@ def run_launch(
         data = yaml.safe_load(yaml_path.read_text()) or {}
         if "resources" not in data:
             data["resources"] = {}
-        data["resources"]["cloud"] = cloud
-        data["resources"]["region"] = region
-        if use_spot:
-            data["resources"]["use_spot"] = True
+        _apply_cloud_region_to_resources(data["resources"], cloud, region, use_spot=use_spot)
         data = apply_checkpoint_patch_to_yaml(data, ckpt_patch)
         patched = yaml.dump(data, default_flow_style=False, sort_keys=False)
     else:

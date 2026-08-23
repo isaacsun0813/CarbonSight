@@ -1,18 +1,17 @@
-# Example SkyPilot task — swap train_stub.py for your real training script.
-name: carbonsight-example-train
+# SkyPilot task — Bitcoin RNN smoke job (~15–30 min on T4)
+# CarbonSight estimates: duration from --max-minutes in run:; pass --gpu-util 0.75 on advise/run.
+name: carbonsight-bitcoin-rnn
+
+workdir: .
 
 resources:
-  cloud: aws
-  accelerators: A100:1
-  cpus: 8
-  memory: 32
+  infra: aws
+  accelerators: T4:1
+  cpus: 4
+  memory: 16
 
-# Job length for carbon/cost estimate (advise uses this)
-duration: 2h
-
-# Optional: fix GPU utilization in [0,1] for a tighter power estimate (e.g. from nvidia-smi)
-# carbonsight:
-#   gpu_utilization: 0.75
+setup: |
+  pip install -r requirements.txt
 
 run: |
-  python train_stub.py
+  python train_stub.py --epochs 120 --max-minutes 25 --require-cuda

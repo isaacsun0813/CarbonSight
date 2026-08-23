@@ -23,6 +23,10 @@ htmlcov/
 .idea/
 .vscode/
 
-# pytest verification suite
+# pytest verification suite + Makefile CLI smoke artifacts (DBs, logs)
 carbonsight/misc/
+carbonsight/misc/cli-test/
+
+# aws debugging
+aws.sh
 
