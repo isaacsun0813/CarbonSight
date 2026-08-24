@@ -7,6 +7,7 @@ from typing import Any
 import typer
 import yaml
 from carbonsight_core.config import Config
+from carbonsight_core.estimator.pricing import configure_pricing
 from carbonsight_core.mapping.registry import Registry
 from carbonsight_core.models import JobSpec
 from carbonsight_core.paths import (
@@ -106,6 +107,23 @@ def apply_gpu_telemetry_cli(
     return job, False
 
 
+def resolve_live_aws_pricing(
+    config: Config,
+    *,
+    live_pricing: bool,
+    static_pricing: bool,
+) -> bool:
+    """CLI/env precedence: --static-pricing > --live-pricing > CARBONSIGHT_LIVE_AWS_PRICING."""
+    if static_pricing and live_pricing:
+        typer.echo("Error: use only one of --live-pricing and --static-pricing.", err=True)
+        raise typer.Exit(1)
+    if static_pricing:
+        return False
+    if live_pricing:
+        return True
+    return config.live_aws_pricing
+
+
 def run_advise(
     yaml_path: Path,
     *,
@@ -115,6 +133,9 @@ def run_advise(
     max_cost_premium: float = 0.20,
     gpu_util: float | None = None,
     nvidia_smi: bool = False,
+    live_pricing: bool = False,
+    static_pricing: bool = False,
+    use_spot: bool = False,
 ) -> None:
     """Shared implementation for ``advise`` and ``train``."""
     if not yaml_path.exists():
@@ -143,6 +164,12 @@ def run_advise(
     reg.load_json(rpath)
 
     config = Config.from_env()
+    configure_pricing(
+        config,
+        live_aws_pricing=resolve_live_aws_pricing(
+            config, live_pricing=live_pricing, static_pricing=static_pricing,
+        ),
+    )
     if not config.watttime_username or not config.watttime_password:
         if json_out:
             typer.echo("[]")
@@ -156,7 +183,7 @@ def run_advise(
     def _warn_estimate(region_code: str, err: BaseException) -> None:
         typer.echo(f"Warning: {region_code}: {err}", err=True)
 
-    all_estimates = ranking.collect_estimates(job, on_estimate_error=_warn_estimate)
+    all_estimates = ranking.collect_estimates(job, use_spot=use_spot, on_estimate_error=_warn_estimate)
 
     if not all_estimates:
         if json_out:
@@ -228,6 +255,21 @@ def advise(
         "--nvidia-smi",
         help="Sample GPU utilization from nvidia-smi on this machine (overrides YAML when successful).",
     ),
+    live_pricing: bool = typer.Option(
+        False,
+        "--live-pricing",
+        help="Use live AWS EC2 spot prices for cost estimates (when --spot).",
+    ),
+    static_pricing: bool = typer.Option(
+        False,
+        "--static-pricing",
+        help="Force static cost tables instead of live AWS pricing.",
+    ),
+    spot: bool = typer.Option(
+        False,
+        "--spot/--no-spot",
+        help="Estimate cost using spot pricing (static 35%% or live when --live-pricing).",
+    ),
 ) -> None:
     """Print regions ranked greenest-first, filtered to those within your cost tolerance."""
     run_advise(
@@ -238,6 +280,9 @@ def advise(
         max_cost_premium=max_cost_premium,
         gpu_util=gpu_util,
         nvidia_smi=nvidia_smi,
+        live_pricing=live_pricing,
+        static_pricing=static_pricing,
+        use_spot=spot,
     )
 
 

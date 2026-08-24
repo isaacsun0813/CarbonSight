@@ -1,23 +1,34 @@
 """
 Single orchestration path for ranking AWS regions by estimated carbon.
 
-CLI and API use :class:`AwsRegionRankingService` so region loops, confidence, and quota rules stay in sync.
+CLI and API use :class:`AwsRegionRankingService` so region loops, enabled-region,
+quota, availability, and confidence rules stay in sync.
 Sequential WattTime calls: the client token cache is not thread-safe for parallel forecasts.
 """
 
 from collections.abc import Callable
 
+from carbonsight_core.cloud.aws.availability import InstanceAvailabilityChecker
+from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
+from carbonsight_core.cloud.aws.quota import QuotaChecker
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
 from carbonsight_core.mapping.registry import Registry, mapping_confidence
 from carbonsight_core.models import EstimateResult, JobSpec
-from carbonsight_core.preflight.quota import QuotaChecker
 from carbonsight_core.watttime import WattTimeClient, WattTimeError
+
+_ENABLED_REGION_SKIP_REASON = "region not enabled for this AWS account"
 
 
 class AwsRegionRankingService:
     """Load registry + WattTime once; enumerate AWS regions and build :class:`EstimateResult` rows."""
 
-    __slots__ = ("_registry", "_quota_checker", "_estimator")
+    __slots__ = (
+        "_registry",
+        "_quota_checker",
+        "_availability_checker",
+        "_enabled_regions_provider",
+        "_estimator",
+    )
 
     def __init__(
         self,
@@ -25,9 +36,13 @@ class AwsRegionRankingService:
         watt_time: WattTimeClient,
         *,
         quota_checker: QuotaChecker | None = None,
+        availability_checker: InstanceAvailabilityChecker | None = None,
+        enabled_regions_provider: EnabledRegionsProvider | None = None,
     ) -> None:
         self._registry = registry
         self._quota_checker = quota_checker
+        self._availability_checker = availability_checker
+        self._enabled_regions_provider = enabled_regions_provider
         self._estimator = JobCarbonEstimator(watt_time)
 
     def collect_estimates(
@@ -35,17 +50,27 @@ class AwsRegionRankingService:
         job: JobSpec,
         *,
         use_spot: bool = False,
+        on_enabled_region_skip: Callable[[str, str], None] | None = None,
         on_quota_skip: Callable[[str, str], None] | None = None,
+        on_availability_skip: Callable[[str, str], None] | None = None,
         on_estimate_error: Callable[[str, BaseException], None] | None = None,
     ) -> list[EstimateResult]:
         """
-        One pass over registry: optional GPU quota filter, then WattTime + Monte Carlo per region.
+        One pass over registry: optional enabled-region, quota, availability filters, then estimate.
 
         Callbacks are optional I/O hooks (e.g. typer.echo); core stays free of CLI dependencies.
         """
+        enabled_regions: frozenset[str] | None = None
+        if self._enabled_regions_provider is not None:
+            enabled_regions = self._enabled_regions_provider.enabled_region_codes()
+
         estimates: list[EstimateResult] = []
         for entry in self._registry.all_regions():
             if not entry.wt_regions or entry.provider.lower() != "aws":
+                continue
+            if enabled_regions is not None and entry.region_code not in enabled_regions:
+                if on_enabled_region_skip is not None:
+                    on_enabled_region_skip(entry.region_code, _ENABLED_REGION_SKIP_REASON)
                 continue
             if self._quota_checker is not None:
                 quota_result = self._quota_checker.check_gpu_quota(
@@ -54,6 +79,14 @@ class AwsRegionRankingService:
                 if not quota_result.allowed:
                     if on_quota_skip is not None:
                         on_quota_skip(entry.region_code, quota_result.reason)
+                    continue
+            if self._availability_checker is not None:
+                avail = self._availability_checker.check_instance_offering(
+                    entry.region_code, job.gpu_type,
+                )
+                if not avail.available:
+                    if on_availability_skip is not None:
+                        on_availability_skip(entry.region_code, avail.reason)
                     continue
             conf = mapping_confidence(
                 entry.s_source, entry.s_geo, entry.s_wt_stability, entry.s_recency
@@ -116,13 +149,25 @@ def collect_aws_region_estimates(
     watt_time: WattTimeClient,
     *,
     quota_checker: QuotaChecker | None = None,
+    availability_checker: InstanceAvailabilityChecker | None = None,
+    enabled_regions_provider: EnabledRegionsProvider | None = None,
+    on_enabled_region_skip: Callable[[str, str], None] | None = None,
     on_quota_skip: Callable[[str, str], None] | None = None,
+    on_availability_skip: Callable[[str, str], None] | None = None,
     on_estimate_error: Callable[[str, BaseException], None] | None = None,
 ) -> list[EstimateResult]:
     """Backward-compatible wrapper around :meth:`AwsRegionRankingService.collect_estimates`."""
-    return AwsRegionRankingService(registry, watt_time, quota_checker=quota_checker).collect_estimates(
+    return AwsRegionRankingService(
+        registry,
+        watt_time,
+        quota_checker=quota_checker,
+        availability_checker=availability_checker,
+        enabled_regions_provider=enabled_regions_provider,
+    ).collect_estimates(
         job,
+        on_enabled_region_skip=on_enabled_region_skip,
         on_quota_skip=on_quota_skip,
+        on_availability_skip=on_availability_skip,
         on_estimate_error=on_estimate_error,
     )
 

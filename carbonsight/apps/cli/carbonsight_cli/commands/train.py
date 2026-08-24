@@ -89,7 +89,11 @@ def train_cmd(
     json_out: bool = typer.Option(False, "--json", help="[advise] Machine-readable JSON"),
     dry_run: bool = typer.Option(False, "--dry-run", help="[launch] Print patched YAML only"),
     no_exec: bool = typer.Option(False, "--no-exec", help="[launch] Patch YAML but do not call sky"),
-    skip_preflight: bool = typer.Option(False, "--skip-preflight", help="[launch] Skip AWS GPU quota check"),
+    skip_preflight: bool = typer.Option(
+        False,
+        "--skip-preflight",
+        help="[launch] Skip AWS preflight (enabled regions, GPU quota, instance offerings)",
+    ),
     managed: bool = typer.Option(False, "--managed", help="[launch] Use sky jobs launch"),
     yes: bool = typer.Option(False, "--yes", "-y", help="[launch] Pass --yes to SkyPilot"),
     registry_path: Path | None = typer.Option(None, "--registry", help="Path to mapping registry JSON"),
@@ -132,6 +136,16 @@ def train_cmd(
         "--checkpoint-interval",
         help="Save checkpoint every N training steps.",
     ),
+    live_pricing: bool = typer.Option(
+        False,
+        "--live-pricing",
+        help="Use live AWS EC2 spot prices for cost estimates (when --spot).",
+    ),
+    static_pricing: bool = typer.Option(
+        False,
+        "--static-pricing",
+        help="Force static cost tables instead of live AWS pricing.",
+    ),
 ) -> None:
     """Estimate carbon/cost for training ``script`` without writing a YAML by hand.
 
@@ -172,6 +186,8 @@ def train_cmd(
                 checkpoint_bucket=checkpoint_bucket,
                 checkpoint_interval=checkpoint_interval,
                 script_path=script,
+                live_pricing=live_pricing,
+                static_pricing=static_pricing,
             )
         else:
             run_advise(
@@ -182,6 +198,9 @@ def train_cmd(
                 max_cost_premium=max_cost_premium,
                 gpu_util=gpu_util,
                 nvidia_smi=nvidia_smi,
+                live_pricing=live_pricing,
+                static_pricing=static_pricing,
+                use_spot=spot,
             )
     finally:
         tmp.unlink(missing_ok=True)

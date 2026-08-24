@@ -20,11 +20,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cli = [
-    "typer[all]>=0.9",
-    "rich>=13.0",
-    "pyyaml>=6.0",
-]
 api = [
     "fastapi>=0.104",
     "uvicorn[standard]>=0.24",
@@ -40,6 +35,11 @@ dev = [
     "vcrpy>=4.0",
     "ruff>=0.1",
     "mypy>=1.0",
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "sqlalchemy>=2.0",
+    "asyncpg>=0.29",
+    "boto3>=1.28",
 ]
 
 [project.scripts]

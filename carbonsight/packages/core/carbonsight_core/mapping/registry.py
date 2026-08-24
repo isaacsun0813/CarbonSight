@@ -124,3 +124,46 @@ class Registry:
     def all_regions(self) -> list[CloudRegionEntry]:
         """Return all cloud regions (for listing)."""
         return list(self._regions.values())
+
+
+def site_to_json_dict(site: CloudSite) -> dict:
+    """Serialize one site for seed_registry.json round-trip."""
+    data: dict = {
+        "site_id": site.site_id,
+        "provider": site.provider,
+        "region_code": site.region_code,
+        "lat": site.lat,
+        "lon": site.lon,
+        "source_type": site.source_type,
+    }
+    if site.last_verified_at is not None:
+        data["last_verified_at"] = site.last_verified_at
+    return data
+
+
+def entry_to_json_dict(entry: CloudRegionEntry) -> dict:
+    """Serialize one cloud region entry for seed_registry.json round-trip."""
+    return {
+        "provider": entry.provider,
+        "region_code": entry.region_code,
+        "display_name": entry.display_name,
+        "country": entry.country,
+        "source_url": entry.source_url,
+        "sites": [site_to_json_dict(site) for site in entry.sites],
+        "wt_regions": [{"wt_region": wt, "weight": weight} for wt, weight in entry.wt_regions],
+        "s_source": entry.s_source,
+        "s_geo": entry.s_geo,
+        "s_wt_stability": entry.s_wt_stability,
+        "s_recency": entry.s_recency,
+    }
+
+
+def registry_to_json_dict(registry: Registry) -> dict:
+    """Serialize full registry as {\"regions\": [...]}."""
+    return {"regions": [entry_to_json_dict(entry) for entry in registry.all_regions()]}
+
+
+def write_registry_json(registry: Registry, path: Path | str) -> None:
+    """Write registry JSON to path (indent=2, trailing newline)."""
+    out = Path(path)
+    out.write_text(json.dumps(registry_to_json_dict(registry), indent=2) + "\n")
