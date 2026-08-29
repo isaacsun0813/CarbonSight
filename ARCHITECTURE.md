@@ -41,7 +41,7 @@ Flow that’s in my head:
 - **Power model** answers: *how many watts is this job probably drawing?* (we don’t know utilization, so we randomize — more on that below)
 - **carbon_model** multiplies energy × MOER, converts units, runs Monte Carlo for a range
 
-Optional: **boto** checks account-enabled regions (`describe_regions`), GPU quotas, and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Live spot/on-demand pricing and preflight availability/enabled-regions share **`BaseAWSProvider`** (`cloud/aws/base.py`) for session/client setup; quota checks still use raw boto3. Offerings use `ec2:DescribeInstanceTypeOfferings`; enabled regions use one `ec2:DescribeRegions` intersected with the registry (run preflight only). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
+Optional: **boto** checks account-enabled regions (`describe_regions`), GPU quotas, and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Live spot/on-demand pricing and preflight (quota, availability, enabled-regions) share **`BaseAWSProvider`** (`cloud/aws/base.py`) for session/client setup. Offerings use `ec2:DescribeInstanceTypeOfferings`; enabled regions use one `ec2:DescribeRegions` intersected with the registry (run preflight only). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
 
 ---
 
@@ -68,7 +68,7 @@ Implementation: `carbonsight/apps/cli/carbonsight_cli/commands/train.py`.
 
 ## `run` — same ranking, then actually launch
 
-Same loop as advise, plus optional **quota check** and **instance offerings check** per region (when preflight is enabled). Pick the **greenest** row that still passes the cost filter, **inject `cloud` and `region` into the YAML**, write a temp file, call SkyPilot.
+Same loop as advise, plus optional **quota check** and **instance offerings check** per region (when preflight is enabled). Pick the **greenest** row that still passes the cost filter, **inject `resources.infra` (`cloud/region`) into the YAML** (and strip legacy `cloud`/`region`/`zone` keys), write a temp file, call SkyPilot.
 
 If the subprocess exits 0, we try **post-run actual CO₂** via **`JobCarbonEstimator.compute_actual_run`**: pull **historical** MOER for the job window from WattTime, time-weight it, compare to the pre-run estimate. The module-level **`compute_actual_co2`** remains a thin wrapper for tests and scripts. Start/end times are **wall clock around the local SkyPilot process** — MVP scope.
 

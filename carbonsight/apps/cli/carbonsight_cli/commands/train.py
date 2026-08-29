@@ -39,7 +39,7 @@ def build_train_yaml_dict(
     return {
         "name": task_name,
         "resources": {
-            "cloud": cloud,
+            "infra": cloud,
             "accelerators": accelerators,
             "cpus": cpus,
             "memory": memory,
@@ -84,7 +84,7 @@ def train_cmd(
     ),
     cpus: int = typer.Option(8, "--cpus", help="CPU count in resources."),
     memory: int = typer.Option(32, "--memory", "-m", help="Memory (GiB) in resources."),
-    cloud: str = typer.Option("aws", "--cloud", help="resources.cloud (provider hint for SkyPilot)."),
+    cloud: str = typer.Option("aws", "--cloud", help="resources.infra provider hint for SkyPilot (e.g. aws)."),
     explain: bool = typer.Option(False, "--explain", help="[advise] Extra context after the table"),
     json_out: bool = typer.Option(False, "--json", help="[advise] Machine-readable JSON"),
     dry_run: bool = typer.Option(False, "--dry-run", help="[launch] Print patched YAML only"),

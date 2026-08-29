@@ -1,6 +1,6 @@
 """
 WattTime v3 API client.
-Design doc: /login (basic auth), token cache, /v3/my-access, /v3/region-from-loc,
+Design doc: GET /v2/login (basic auth), token cache, /v3/my-access, /v3/region-from-loc,
 /v3/forecast, /v3/historical, /v3/signal-index. Units: lbs_co2_per_mwh. 401 refresh, 429 backoff.
 """
 
@@ -37,7 +37,7 @@ class WattTimeClient:
         if self._config.cache_tokens and self._token and time.time() < self._token_expires_at:
             return
         # WattTime v2 login returns token; v3 may differ - use v2 login per common docs
-        r = client.post(
+        r = client.get(
             f"{WATTTIME_BASE}/v2/login",
             auth=(self._config.watttime_username, self._config.watttime_password),
             timeout=self._timeout,
@@ -173,6 +173,10 @@ class WattTimeClient:
     def _assert_moer_units(self, data: dict[str, Any]) -> None:
         """Fail closed if MOER data does not have supported units for kg CO2."""
         units: str | None = data.get("units")
+        if units is None:
+            meta = data.get("meta")
+            if isinstance(meta, dict):
+                units = meta.get("units")
         if units is None and data.get("data"):
             units = data["data"][0].get("units") if data["data"] else None
         if units is None:

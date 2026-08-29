@@ -148,6 +148,7 @@ def collect_aws_region_estimates(
     registry: Registry,
     watt_time: WattTimeClient,
     *,
+    use_spot: bool = False,
     quota_checker: QuotaChecker | None = None,
     availability_checker: InstanceAvailabilityChecker | None = None,
     enabled_regions_provider: EnabledRegionsProvider | None = None,
@@ -165,6 +166,7 @@ def collect_aws_region_estimates(
         enabled_regions_provider=enabled_regions_provider,
     ).collect_estimates(
         job,
+        use_spot=use_spot,
         on_enabled_region_skip=on_enabled_region_skip,
         on_quota_skip=on_quota_skip,
         on_availability_skip=on_availability_skip,

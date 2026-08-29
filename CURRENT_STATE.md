@@ -45,7 +45,7 @@ Relevant code:
 
 - Run the same estimate + ranking pipeline
 - Choose the best region within the cost premium
-- Patch the YAML with `resources.cloud` and `resources.region`
+- Patch the YAML with `resources.infra` (`cloud/region`) and drop legacy `cloud`/`region`/`zone` keys
 - Optionally invoke SkyPilot:
   - `sky launch` (default)
   - `sky jobs launch` (`--managed`)
@@ -58,7 +58,7 @@ Key behavior from the code:
 - **Run tracking**: each run is persisted to a SQLite ledger (`~/.carbonsight/runs.db` by default, overridable with `--db` or `CARBONSIGHT_DB`). Baseline is `us-east-1` on-demand/spot (matching `--spot`).
 - **Dry run**: `--dry-run` prints patched YAML and exits
 - **No exec**: `--no-exec` prints patched YAML and exits (after choosing region)
-- **AWS preflight**: enabled by default (`--skip-preflight` to disable); intersects registry with account-enabled regions, checks GPU Service Quotas, and EC2 instance type offerings per region. Instance availability and enabled-regions checks extend `BaseAWSProvider` (`cloud/aws/base.py`); quota checks use raw boto3.
+- **AWS preflight**: enabled by default (`--skip-preflight` to disable); intersects registry with account-enabled regions, checks GPU Service Quotas, and EC2 instance type offerings per region. Quota, instance availability, and enabled-regions checks all extend `BaseAWSProvider` (`cloud/aws/base.py`).
 - **After a successful SkyPilot launch**: attempts to compute **actual CO₂** using **historical MOER** over the wall-clock run window and compares to the estimate.
 
 Relevant code:
