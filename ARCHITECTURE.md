@@ -21,8 +21,7 @@ carbonsight/
   apps/cli/carbonsight_cli/     # Typer: advise, run, mappings, backtest
   apps/api/carbonsight_api/     # FastAPI if we want HTTP
   packages/core/carbonsight_core/   # Brain — WattTime, registry, math, cloud adapters
-    cloud/                      # Provider Protocols; AWS base + GPU catalog
-    estimator/aws_estimation/   # Live EC2 spot + Pricing API on-demand
+    cloud/                      # Provider Protocols; AWS base, GPU catalog, live pricing, preflight
   tests/
   infra/                        # SQL schemas; Postgres not fully wired yet
 ```
@@ -151,10 +150,10 @@ We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per re
 |-------------------|------|
 | CO₂ math, Monte Carlo, post-run | `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py` |
 | Watt curves, PUE sampling | `.../estimator/power_model.py` |
-| $ estimates, spot/on-demand pricing | `.../estimator/pricing.py`, `.../estimator/aws_estimation/`, `.../cloud/aws/gpu_catalog.py` |
+| $ estimates, spot/on-demand pricing | `.../estimator/pricing.py`, `.../cloud/aws/spot_pricing.py`, `.../cloud/aws/ondemand_pricing.py`, `.../cloud/aws/gpu_catalog.py` |
 | AWS shared boto plumbing | `.../cloud/aws/base.py` |
 | Mapping drift / refresh | `.../mapping/validate.py`, `.../mapping/refresh.py` |
-| Preflight (quota, offerings, enabled regions) | `.../preflight/` (availability/enabled_regions use `BaseAWSProvider`) |
+| Preflight (quota, offerings, enabled regions) | `.../cloud/aws/` (`quota.py`, `availability.py`, `enabled_regions.py`) |
 | Region → grid JSON | `.../mapping/seed_registry.json` |
 | WattTime client / auth / retries | `.../watttime.py` |
 | Time-shift scheduling | `.../scheduler.py` |

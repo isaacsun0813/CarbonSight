@@ -64,9 +64,9 @@ Key behavior from the code:
 Relevant code:
 
 - CLI implementation: `carbonsight/apps/cli/carbonsight_cli/commands/run.py`
-- Quota checker: `carbonsight/packages/core/carbonsight_core/preflight/quota.py`
-- Instance availability: `carbonsight/packages/core/carbonsight_core/preflight/availability.py`
-- Enabled regions: `carbonsight/packages/core/carbonsight_core/preflight/enabled_regions.py`
+- Quota checker: `carbonsight/packages/core/carbonsight_core/cloud/aws/quota.py`
+- Instance availability: `carbonsight/packages/core/carbonsight_core/cloud/aws/availability.py`
+- Enabled regions: `carbonsight/packages/core/carbonsight_core/cloud/aws/enabled_regions.py`
 - Actual-run carbon: `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py`
 - Scheduler: `carbonsight/packages/core/carbonsight_core/scheduler.py`
 - Run ledger: `carbonsight/packages/core/carbonsight_core/tracking.py`
@@ -158,7 +158,7 @@ Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and per
 - **CLI entrypoint**: `carbonsight/apps/cli/carbonsight_cli/main.py`
 - **Core orchestration**: `carbonsight/packages/core/carbonsight_core/region_ranking.py`
 - **Estimator**: `carbonsight/packages/core/carbonsight_core/estimator/`
-- **Live AWS pricing**: `carbonsight/packages/core/carbonsight_core/estimator/aws_estimation/` (`SpotPriceProvider`, `OnDemandPriceProvider`; re-exported from `aws_estimation/__init__.py`)
+- **Live AWS pricing**: `carbonsight/packages/core/carbonsight_core/cloud/aws/` (`SpotPriceProvider`, `OnDemandPriceProvider`; used from `estimator/pricing.py`)
 - **AWS GPU instance catalog**: `carbonsight/packages/core/carbonsight_core/cloud/aws/gpu_catalog.py`
 - **AWS provider base**: `carbonsight/packages/core/carbonsight_core/cloud/aws/base.py` (`BaseAWSProvider` — shared session/client for spot, on-demand, preflight)
 - **Cloud protocols**: `carbonsight/packages/core/carbonsight_core/cloud/base.py`

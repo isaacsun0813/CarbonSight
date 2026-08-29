@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from dataclasses import dataclass
+from typing import Protocol
 
-if TYPE_CHECKING:
-    from carbonsight_core.preflight.availability import AvailabilityResult
+
+@dataclass
+class AvailabilityResult:
+    """Result of an instance-type offering check for one region."""
+
+    region: str
+    available: bool
+    instance_type: str
+    gpu_type: str
+    reason: str = ""
 
 
 class OnDemandPricingProvider(Protocol):

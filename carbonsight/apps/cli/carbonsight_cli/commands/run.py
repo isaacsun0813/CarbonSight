@@ -19,6 +19,9 @@ from carbonsight_core.checkpoint import (
     extract_script_path_from_run_command,
     shim_local_path,
 )
+from carbonsight_core.cloud.aws.availability import InstanceAvailabilityChecker
+from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
+from carbonsight_core.cloud.aws.quota import QuotaChecker
 from carbonsight_core.config import Config
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
 from carbonsight_core.estimator.pricing import configure_pricing, estimate_cost_usd
@@ -27,9 +30,6 @@ from carbonsight_core.paths import (
     carbonsight_package_root_from_cli_command_file,
     resolve_registry_json_file,
 )
-from carbonsight_core.preflight.availability import InstanceAvailabilityChecker
-from carbonsight_core.preflight.enabled_regions import EnabledRegionsProvider
-from carbonsight_core.preflight.quota import QuotaChecker
 from carbonsight_core.region_ranking import AwsRegionRankingService
 from carbonsight_core.scheduler import pick_lowest_carbon_start
 from carbonsight_core.tracking import RunLedger, RunRecord

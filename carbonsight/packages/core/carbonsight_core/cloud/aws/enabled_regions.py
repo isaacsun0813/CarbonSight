@@ -1,8 +1,6 @@
 """Account-enabled AWS regions via describe_regions."""
 
-from botocore.exceptions import ClientError
-
-from carbonsight_core.cloud.aws.base import HAS_BOTO, BaseAWSProvider
+from carbonsight_core.cloud.aws.base import HAS_BOTO, BaseAWSProvider, ClientError
 from carbonsight_core.config import Config
 
 PREFLIGHT_CACHE_TTL_SECONDS = 15 * 60

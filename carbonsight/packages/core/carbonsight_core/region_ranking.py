@@ -8,12 +8,12 @@ Sequential WattTime calls: the client token cache is not thread-safe for paralle
 
 from collections.abc import Callable
 
+from carbonsight_core.cloud.aws.availability import InstanceAvailabilityChecker
+from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
+from carbonsight_core.cloud.aws.quota import QuotaChecker
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
 from carbonsight_core.mapping.registry import Registry, mapping_confidence
 from carbonsight_core.models import EstimateResult, JobSpec
-from carbonsight_core.preflight.availability import InstanceAvailabilityChecker
-from carbonsight_core.preflight.enabled_regions import EnabledRegionsProvider
-from carbonsight_core.preflight.quota import QuotaChecker
 from carbonsight_core.watttime import WattTimeClient, WattTimeError
 
 _ENABLED_REGION_SKIP_REASON = "region not enabled for this AWS account"

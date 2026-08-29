@@ -40,7 +40,7 @@ dev = [
     "sqlalchemy>=2.0",
     "asyncpg>=0.29",
     "boto3>=1.28",
-    "skypilot[aws]>=0.5"
+    "skypilot[aws]>=0.5",
 ]
 
 [project.scripts]

@@ -7,8 +7,8 @@ from carbonsight_core.cloud.aws.gpu_catalog import (
     aws_gpus_per_instance,
     aws_instance_type_for_gpu,
 )
+from carbonsight_core.cloud.aws.spot_pricing import SpotPriceProvider
 from carbonsight_core.config import Config
-from carbonsight_core.estimator.aws_estimation.aws_spot_pricing import SpotPriceProvider
 from carbonsight_core.estimator.pricing import (
     SPOT_PRICE_FRACTION,
     configure_pricing,

@@ -5,14 +5,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from carbonsight_core.config import Config
-from carbonsight_core.estimator.aws_estimation.aws_ondemand_pricing import (
+from carbonsight_core.cloud.aws.ondemand_pricing import (
     OnDemandPriceProvider,
     parse_ondemand_instance_price_usd,
 )
-from carbonsight_core.estimator.aws_estimation.aws_pricing_locations import (
+from carbonsight_core.cloud.aws.pricing_locations import (
     pricing_location_for_region,
 )
+from carbonsight_core.config import Config
 from carbonsight_core.estimator.pricing import (
     configure_pricing,
     estimate_cost_usd,

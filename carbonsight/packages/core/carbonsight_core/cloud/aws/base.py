@@ -10,12 +10,14 @@ from carbonsight_core.config import Config
 
 try:
     import boto3
+    from botocore.exceptions import ClientError
 
     HAS_BOTO = True
-except ImportError:
+except ImportError:  # boto3 is an optional extra; degrade instead of failing to import
     HAS_BOTO = False
 
-_HAS_BOTO = HAS_BOTO
+    class ClientError(Exception):  # type: ignore[no-redef]
+        """Stand-in so ``except ClientError`` is valid without botocore installed."""
 
 
 class BaseAWSProvider:
