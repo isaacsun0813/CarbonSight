@@ -43,11 +43,14 @@ from carbonsight_core.watttime import WattTimeClient, WattTimeError
 
 from carbonsight_cli.commands.advise import (
     apply_gpu_telemetry_cli,
-    finish_by_from_yaml,
     job_spec_from_sky_yaml,
     parse_duration_hours,
     parse_finish_by,
+    resolve_carbon_budget_kg,
+    resolve_carbon_price,
+    resolve_finish_by,
     resolve_live_aws_pricing,
+    strip_carbonsight_only_yaml_keys,
 )
 
 BASELINE_REGION = "us-east-1"
@@ -88,15 +91,37 @@ def _apply_cloud_region_to_resources(
 def patch_sky_yaml_with_cloud_region(
     yaml_path: Path, cloud: str, region: str, *, use_spot: bool = False,
 ) -> str:
-    """Inject resources.infra (cloud/region) into SkyPilot YAML; return full document text."""
+    """Inject resources.infra (cloud/region) into SkyPilot YAML; return SkyPilot-ready text."""
     data = yaml.safe_load(yaml_path.read_text()) or {}
     if "resources" not in data:
         data["resources"] = {}
     _apply_cloud_region_to_resources(data["resources"], cloud, region, use_spot=use_spot)
-    return yaml.dump(data, default_flow_style=False, sort_keys=False)
+    return yaml.dump(
+        strip_carbonsight_only_yaml_keys(data),
+        default_flow_style=False,
+        sort_keys=False,
+    )
 
 
-def launch_skypilot_with_patched_yaml(patched_yaml: str, *, managed: bool, yes: bool) -> int:
+def _require_sky_cli() -> None:
+    sky_check = subprocess.run(["sky", "--version"], capture_output=True)
+    if sky_check.returncode != 0:
+        typer.echo(
+            "SkyPilot not found. Install it with: pip install skypilot[aws]",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+
+def launch_skypilot_with_patched_yaml(
+    patched_yaml: str,
+    *,
+    managed: bool,
+    yes: bool,
+    dryrun: bool = False,
+    down: bool = False,
+    cwd: Path | None = None,
+) -> int:
     """Write YAML to temp file, run sky launch or sky jobs launch. Returns process exit code."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(patched_yaml)
@@ -106,10 +131,14 @@ def launch_skypilot_with_patched_yaml(patched_yaml: str, *, managed: bool, yes: 
         cmd = ["sky", "jobs", "launch"] if managed else ["sky", "launch"]
         if yes:
             cmd.append("--yes")
+        if dryrun:
+            cmd.append("--dryrun")
+        if down:
+            cmd.append("--down")
         cmd.append(str(tmp_path))
 
         typer.echo(f"Running: {' '.join(cmd)}")
-        return subprocess.run(cmd).returncode
+        return subprocess.run(cmd, cwd=cwd).returncode
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -146,7 +175,9 @@ def run_launch(
     static_pricing: bool = False,
     finish_by: datetime | None = None,
     carbon_budget_kg: float | None = None,
-    carbon_price: float = 0.0,
+    carbon_price: float | None = None,
+    validate_sky: bool = False,
+    sky_smoke: bool = False,
 ) -> None:
     """Shared implementation for ``run`` and ``train``."""
     if not yaml_path.exists():
@@ -225,7 +256,15 @@ def run_launch(
         )
         raise typer.Exit(1)
 
-    effective_finish_by = finish_by or finish_by_from_yaml(yaml_path)
+    effective_finish_by = resolve_finish_by(finish_by, yaml_path)
+    effective_carbon_budget = resolve_carbon_budget_kg(carbon_budget_kg, yaml_path)
+    effective_carbon_price = resolve_carbon_price(carbon_price, yaml_path)
+
+    if effective_finish_by is not None:
+        if finish_by is not None:
+            typer.echo(f"Finish-by (CLI): {effective_finish_by.isoformat()}")
+        else:
+            typer.echo(f"Finish-by (YAML): {effective_finish_by.isoformat()}")
     cloud = "aws"
     region: str
     best = None
@@ -242,9 +281,9 @@ def run_launch(
         constraints = PlanConstraints.from_finish_by(
             effective_finish_by,
             now_utc,
-            carbon_budget_kg=carbon_budget_kg,
+            carbon_budget_kg=effective_carbon_budget,
             max_cost_premium=max_cost_premium,
-            lambda_co2_usd_per_kg=carbon_price,
+            lambda_co2_usd_per_kg=effective_carbon_price,
         )
         try:
             region_inputs = build_region_plan_inputs(
@@ -378,32 +417,59 @@ def run_launch(
             data["resources"] = {}
         _apply_cloud_region_to_resources(data["resources"], cloud, region, use_spot=use_spot)
         data = apply_checkpoint_patch_to_yaml(data, ckpt_patch)
-        patched = yaml.dump(data, default_flow_style=False, sort_keys=False)
+        patched = yaml.dump(
+            strip_carbonsight_only_yaml_keys(data),
+            default_flow_style=False,
+            sort_keys=False,
+        )
     else:
         patched = patch_sky_yaml_with_cloud_region(yaml_path, cloud, region, use_spot=use_spot)
 
+    sky_cwd = yaml_path.parent.resolve()
+
     if dry_run:
-        typer.echo("\n--- Patched YAML (dry run) ---")
+        typer.echo("\n--- Patched YAML for SkyPilot (dry run) ---")
         typer.echo(patched)
         return
 
     if no_exec:
-        typer.echo("\n--- Patched YAML (--no-exec) ---")
+        typer.echo("\n--- Patched YAML for SkyPilot (--no-exec) ---")
         typer.echo(patched)
         typer.echo("Skipping launch (--no-exec).")
         return
 
-    sky_check = subprocess.run(["sky", "--version"], capture_output=True)
-    if sky_check.returncode != 0:
-        typer.echo(
-            "SkyPilot not found. Install it with: pip install skypilot[aws]\n"
-            "Then re-run without --no-exec.",
-            err=True,
+    if validate_sky:
+        _require_sky_cli()
+        typer.echo("\nValidating patched YAML with SkyPilot (`sky launch --dryrun`)...")
+        exit_code = launch_skypilot_with_patched_yaml(
+            patched, managed=managed, yes=True, dryrun=True, cwd=sky_cwd,
         )
-        raise typer.Exit(1)
+        if exit_code == 0:
+            typer.echo("SkyPilot accepted the patched YAML.")
+        raise typer.Exit(exit_code)
+
+    if sky_smoke:
+        _require_sky_cli()
+        smoke_data = yaml.safe_load(patched) or {}
+        smoke_data["run"] = "echo 'carbonsight sky-smoke ok'\n"
+        smoke_data.pop("file_mounts", None)
+        smoke_data.pop("envs", None)
+        setup = smoke_data.get("setup")
+        if isinstance(setup, str) and "/ckpt" in setup:
+            smoke_data["setup"] = "echo 'carbonsight sky-smoke setup'\n"
+        smoke_yaml = yaml.dump(smoke_data, default_flow_style=False, sort_keys=False)
+        typer.echo("\nSky smoke test: minimal job with `sky launch --down` (auto teardown)...")
+        exit_code = launch_skypilot_with_patched_yaml(
+            smoke_yaml, managed=False, yes=True, down=True, cwd=sky_cwd,
+        )
+        raise typer.Exit(exit_code)
+
+    _require_sky_cli()
 
     start_time = datetime.now(UTC)
-    exit_code = launch_skypilot_with_patched_yaml(patched, managed=managed, yes=yes)
+    exit_code = launch_skypilot_with_patched_yaml(
+        patched, managed=managed, yes=yes, cwd=sky_cwd,
+    )
     if exit_code != 0:
         raise typer.Exit(exit_code)
 
@@ -449,7 +515,7 @@ def run_cmd(
     gpu_util: float | None = typer.Option(
         None,
         "--gpu-util",
-        help="Observed GPU utilization in [0, 1] (overrides YAML carbonsight.gpu_utilization).",
+        help="Observed GPU utilization in [0, 1] for the power model.",
     ),
     nvidia_smi: bool = typer.Option(
         False,
@@ -497,17 +563,27 @@ def run_cmd(
     finish_by: str | None = typer.Option(
         None,
         "--finish-by",
-        help="ISO-8601 finish-by deadline (enables dynamic planner). Overrides YAML carbonsight.finish_by.",
+        help="ISO-8601 finish-by deadline (enables dynamic planner). When omitted, uses YAML carbonsight.finish_by.",
     ),
     carbon_budget: float | None = typer.Option(
         None,
         "--carbon-budget",
-        help="Hard carbon budget in kg CO2 for dynamic planning.",
+        help="Hard carbon budget in kg CO2 for dynamic planning. When omitted, uses YAML carbonsight.carbon_budget_kg.",
     ),
-    carbon_price: float = typer.Option(
-        0.0,
+    carbon_price: float | None = typer.Option(
+        None,
         "--carbon-price",
-        help="Shadow price in USD per kg CO2 for dynamic utility scoring.",
+        help="Shadow price in USD per kg CO2 for dynamic utility scoring. When omitted, uses YAML carbonsight.carbon_price.",
+    ),
+    validate_sky: bool = typer.Option(
+        False,
+        "--validate-sky",
+        help="After patching, run `sky launch --dryrun` to verify SkyPilot accepts the YAML.",
+    ),
+    sky_smoke: bool = typer.Option(
+        False,
+        "--sky-smoke",
+        help="Launch a minimal echo job via SkyPilot with `--down` (provisions briefly, then tears down).",
     ),
 ) -> None:
     """Pick the greenest affordable region, patch YAML, and launch via SkyPilot."""
@@ -534,4 +610,6 @@ def run_cmd(
         finish_by=parsed_finish_by,
         carbon_budget_kg=carbon_budget,
         carbon_price=carbon_price,
+        validate_sky=validate_sky,
+        sky_smoke=sky_smoke,
     )

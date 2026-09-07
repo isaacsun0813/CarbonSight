@@ -68,9 +68,40 @@ Implementation: `carbonsight/apps/cli/carbonsight_cli/commands/train.py`.
 
 ## `run` — same ranking, then actually launch
 
-Same loop as advise, plus optional **quota check** and **instance offerings check** per region (when preflight is enabled). Pick the **greenest** row that still passes the cost filter, **inject `resources.infra` (`cloud/region`) into the YAML** (and strip legacy `cloud`/`region`/`zone` keys), write a temp file, call SkyPilot.
+Same loop as advise, plus optional **quota check** and **instance offerings check** per region (when preflight is enabled). Pick the **greenest** row that still passes the cost filter, **inject `resources.infra` (`cloud/region`) into the YAML** (and strip legacy `cloud`/`region`/`zone` keys), **strip CarbonSight-only keys** (`duration`, `carbonsight`) so SkyPilot only sees valid task fields, write a temp file, call SkyPilot.
 
-With **`--finish-by`** (or YAML `carbonsight.finish_by`), `run` uses the **dynamic planner** (`planning/plan_dynamic_job`) to simulate greedy spot + Safety Net against the deadline, then launches in the recommended initial region/mode.
+### One YAML file (CarbonSight + SkyPilot)
+
+You can keep planning inputs in the same task YAML as SkyPilot. CarbonSight reads them, then removes them before launch:
+
+```yaml
+duration: 30m                    # work estimate (CarbonSight only)
+carbonsight:
+  finish_by: "2026-09-08T22:00:00Z"   # deadline → dynamic planner
+  carbon_budget_kg: 10.0               # optional hard cap
+  carbon_price: 5.0                    # optional shadow price (USD/kg)
+
+resources:
+  accelerators: T4:1
+run: |
+  python train.py
+```
+
+**CLI precedence:** `--finish-by`, `--carbon-budget`, and `--carbon-price` override YAML **only when you pass them**. Omit the flags to use YAML values. GPU utilization is **CLI-only** (`--gpu-util` or `--nvidia-smi`), not a YAML field.
+
+Example: [`examples/skypilot/train.yaml`](../examples/skypilot/train.yaml).
+
+### Dynamic planner (`finish_by`)
+
+When `carbonsight.finish_by` is set (or `--finish-by`), `run` uses **`planning/plan_dynamic_job`**: simulates greedy spot + idle/wait + Safety Net on-demand fallback against the deadline, then launches in the recommended **initial** region/mode. Advisory only — SkyPilot still handles real spot preemption at runtime.
+
+Without `finish_by`, `run` uses the static greenest-region ranking (and optional `--max-delay` start-time advice).
+
+### SkyPilot validation
+
+- **`--dry-run`** — print SkyPilot-ready patched YAML (no launch)
+- **`--validate-sky`** — run `sky launch --dryrun` on the patched YAML
+- **`--sky-smoke`** — minimal echo job with `sky launch --down` (provision + auto teardown)
 
 If the subprocess exits 0, we try **post-run actual CO₂** via **`JobCarbonEstimator.compute_actual_run`**: pull **historical** MOER for the job window from WattTime, time-weight it, compare to the pre-run estimate. The module-level **`compute_actual_co2`** remains a thin wrapper for tests and scripts. Start/end times are **wall clock around the local SkyPilot process** — MVP scope.
 

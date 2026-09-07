@@ -156,8 +156,8 @@ def train_cmd(
         "--carbon-budget",
         help="Hard carbon budget in kg CO2 for dynamic planning.",
     ),
-    carbon_price: float = typer.Option(
-        0.0,
+    carbon_price: float | None = typer.Option(
+        None,
         "--carbon-price",
         help="Shadow price in USD per kg CO2 for dynamic utility scoring.",
     ),

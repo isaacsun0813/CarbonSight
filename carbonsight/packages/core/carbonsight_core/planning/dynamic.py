@@ -226,7 +226,7 @@ def pick_next_state(
             cand.mode,
             expected_lifetime_hours=cand.expected_lifetime_hours,
             cold_start_hours=constraints.cold_start_hours,
-            migration_usd=c.migration_usd,
+            migration_usd=cand.migration_usd,
             lambda_co2_usd_per_kg=constraints.lambda_co2_usd_per_kg,
         )
         if u > u_current:
