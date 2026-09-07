@@ -8,7 +8,7 @@ from pathlib import Path
 import typer
 import yaml
 
-from carbonsight_cli.commands.advise import run_advise
+from carbonsight_cli.commands.advise import run_advise, parse_finish_by
 from carbonsight_cli.commands.run import run_launch
 
 
@@ -146,6 +146,21 @@ def train_cmd(
         "--static-pricing",
         help="Force static cost tables instead of live AWS pricing.",
     ),
+    finish_by: str | None = typer.Option(
+        None,
+        "--finish-by",
+        help="ISO-8601 finish-by deadline for dynamic planning when launching.",
+    ),
+    carbon_budget: float | None = typer.Option(
+        None,
+        "--carbon-budget",
+        help="Hard carbon budget in kg CO2 for dynamic planning.",
+    ),
+    carbon_price: float = typer.Option(
+        0.0,
+        "--carbon-price",
+        help="Shadow price in USD per kg CO2 for dynamic utility scoring.",
+    ),
 ) -> None:
     """Estimate carbon/cost for training ``script`` without writing a YAML by hand.
 
@@ -188,6 +203,9 @@ def train_cmd(
                 script_path=script,
                 live_pricing=live_pricing,
                 static_pricing=static_pricing,
+                finish_by=parse_finish_by(finish_by) if finish_by else None,
+                carbon_budget_kg=carbon_budget,
+                carbon_price=carbon_price,
             )
         else:
             run_advise(

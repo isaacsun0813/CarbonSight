@@ -1,6 +1,7 @@
 """carbonsight advise --yaml train.yaml [--explain] [--json]"""
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,26 @@ def parse_duration_hours(raw: Any) -> float:
     if "m" in s:
         num /= 60.0
     return num if num > 0 else 1.0
+
+
+def parse_finish_by(raw: Any) -> datetime:
+    """Parse ISO-8601 finish-by timestamp; ensure timezone-aware UTC."""
+    if isinstance(raw, datetime):
+        dt = raw
+    else:
+        dt = datetime.fromisoformat(str(raw).strip())
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def finish_by_from_yaml(path: Path) -> datetime | None:
+    """Read optional ``carbonsight.finish_by`` from a SkyPilot YAML file."""
+    data: dict = yaml.safe_load(path.read_text()) or {}
+    cs = data.get("carbonsight")
+    if not isinstance(cs, dict) or cs.get("finish_by") is None:
+        return None
+    return parse_finish_by(cs["finish_by"])
 
 
 def job_spec_from_sky_yaml(path: Path) -> JobSpec:

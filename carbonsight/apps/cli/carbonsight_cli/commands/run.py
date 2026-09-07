@@ -30,6 +30,12 @@ from carbonsight_core.paths import (
     carbonsight_package_root_from_cli_command_file,
     resolve_registry_json_file,
 )
+from carbonsight_core.planning import (
+    JobMode,
+    PlanConstraints,
+    build_region_plan_inputs,
+    plan_dynamic_job,
+)
 from carbonsight_core.region_ranking import AwsRegionRankingService
 from carbonsight_core.scheduler import pick_lowest_carbon_start
 from carbonsight_core.tracking import RunLedger, RunRecord
@@ -37,12 +43,35 @@ from carbonsight_core.watttime import WattTimeClient, WattTimeError
 
 from carbonsight_cli.commands.advise import (
     apply_gpu_telemetry_cli,
+    finish_by_from_yaml,
     job_spec_from_sky_yaml,
     parse_duration_hours,
+    parse_finish_by,
     resolve_live_aws_pricing,
 )
 
 BASELINE_REGION = "us-east-1"
+
+
+def _echo_dynamic_plan(dyn) -> None:
+    """Print concise dynamic plan trajectory."""
+    typer.echo("\nDynamic plan (advisory simulation):")
+    typer.echo(
+        f"  Deadline met: {dyn.deadline_met}  "
+        f"Cost: ${dyn.total_cost_usd:.2f}  Carbon: {dyn.total_carbon_kg:.2f}kg"
+    )
+    if dyn.initial_launch:
+        typer.echo(
+            f"  Initial launch: {dyn.initial_launch.region} "
+            f"({dyn.initial_launch.mode.value})"
+        )
+    for ev in dyn.events[:12]:
+        typer.echo(
+            f"  {ev.time_utc:%Y-%m-%d %H:%M}Z {ev.event_type.value} "
+            f"{ev.region or '-'} progress={ev.progress_hours:.2f}h"
+        )
+    if len(dyn.events) > 12:
+        typer.echo(f"  ... {len(dyn.events) - 12} more events")
 
 
 def _apply_cloud_region_to_resources(
@@ -115,6 +144,9 @@ def run_launch(
     script_path: Path | None = None,
     live_pricing: bool = False,
     static_pricing: bool = False,
+    finish_by: datetime | None = None,
+    carbon_budget_kg: float | None = None,
+    carbon_price: float = 0.0,
 ) -> None:
     """Shared implementation for ``run`` and ``train``."""
     if not yaml_path.exists():
@@ -193,44 +225,92 @@ def run_launch(
         )
         raise typer.Exit(1)
 
-    best = AwsRegionRankingService.pick_best_region_for_launch(estimates, max_cost_premium)
-    if best is None:
-        typer.echo("No region selected.", err=True)
-        raise typer.Exit(1)
+    effective_finish_by = finish_by or finish_by_from_yaml(yaml_path)
+    cloud = "aws"
+    region: str
+    best = None
 
-    cloud, region = best.cloud, best.cloud_region
-    typer.echo(
-        f"\nChosen: {cloud}/{region}  "
-        f"CO2={best.expected_co2_kg_mean:.2f}kg  "
-        f"Cost=${best.expected_cost_usd:.2f}  "
-        f"Confidence={best.mapping_confidence:.2f}"
-    )
-
-    max_delay_hours = parse_duration_hours(max_delay)
-    if max_delay_hours > 0:
+    if effective_finish_by is not None:
+        now_utc = datetime.now(UTC)
+        if effective_finish_by <= now_utc:
+            typer.echo("Error: finish-by must be in the future.", err=True)
+            raise typer.Exit(1)
+        visible, _, _ = AwsRegionRankingService.rank_greenest_first_then_cost_ceiling(
+            estimates, max_cost_premium,
+        )
+        allowed = [e.cloud_region for e in visible]
+        constraints = PlanConstraints.from_finish_by(
+            effective_finish_by,
+            now_utc,
+            carbon_budget_kg=carbon_budget_kg,
+            max_cost_premium=max_cost_premium,
+            lambda_co2_usd_per_kg=carbon_price,
+        )
         try:
-            chosen_entry = next(
-                e for e in reg.all_regions()
-                if e.region_code == region and e.provider.lower() == "aws"
+            region_inputs = build_region_plan_inputs(
+                reg, watt_time, job, constraints, region_codes=allowed,
             )
-            horizon = math.ceil(max_delay_hours + job.duration_hours)
-            forecast = watt_time.get_forecast(
-                chosen_entry.wt_regions[0][0],
-                horizon_hours=horizon,
-            )
-            pts = forecast.get("data", [])
-            if pts:
-                sched = pick_lowest_carbon_start(pts, job.duration_hours, max_delay_hours)
-                if sched.delay_hours < 0.01:
-                    typer.echo("Schedule: run now (already the lowest-carbon window).")
-                else:
-                    typer.echo(
-                        f"Schedule: wait {sched.delay_hours:.1f}h "
-                        f"(start {sched.start_utc:%H:%M} UTC) -> "
-                        f"-{sched.moer_reduction_pct:.1f}% carbon vs running now."
-                    )
-        except Exception as e:
-            typer.echo(f"Warning: could not compute schedule: {e}", err=True)
+        except WattTimeError as err:
+            typer.echo(f"Error fetching forecasts for dynamic plan: {err}", err=True)
+            raise typer.Exit(1)
+        if not region_inputs:
+            typer.echo("No regions with WattTime forecasts for dynamic planning.", err=True)
+            raise typer.Exit(1)
+        dyn = plan_dynamic_job(job, constraints, region_inputs)
+        _echo_dynamic_plan(dyn)
+        if not dyn.deadline_met or dyn.initial_launch is None:
+            typer.echo("Dynamic plan: no feasible launch before finish-by.", err=True)
+            raise typer.Exit(1)
+        region = dyn.initial_launch.region
+        use_spot = dyn.initial_launch.mode == JobMode.SPOT
+        best = next((e for e in estimates if e.cloud_region == region), None)
+        if best is None:
+            typer.echo(f"No estimate row for planned region {region}.", err=True)
+            raise typer.Exit(1)
+        typer.echo(
+            f"\nChosen (dynamic): {cloud}/{region}  "
+            f"mode={dyn.initial_launch.mode.value}  "
+            f"finish-by={effective_finish_by.isoformat()}"
+        )
+    else:
+        best = AwsRegionRankingService.pick_best_region_for_launch(estimates, max_cost_premium)
+        if best is None:
+            typer.echo("No region selected.", err=True)
+            raise typer.Exit(1)
+        cloud, region = best.cloud, best.cloud_region
+        typer.echo(
+            f"\nChosen: {cloud}/{region}  "
+            f"CO2={best.expected_co2_kg_mean:.2f}kg  "
+            f"Cost=${best.expected_cost_usd:.2f}  "
+            f"Confidence={best.mapping_confidence:.2f}"
+        )
+
+    if effective_finish_by is None:
+        max_delay_hours = parse_duration_hours(max_delay)
+        if max_delay_hours > 0:
+            try:
+                chosen_entry = next(
+                    e for e in reg.all_regions()
+                    if e.region_code == region and e.provider.lower() == "aws"
+                )
+                horizon = math.ceil(max_delay_hours + job.duration_hours)
+                forecast = watt_time.get_forecast(
+                    chosen_entry.wt_regions[0][0],
+                    horizon_hours=horizon,
+                )
+                pts = forecast.get("data", [])
+                if pts:
+                    sched = pick_lowest_carbon_start(pts, job.duration_hours, max_delay_hours)
+                    if sched.delay_hours < 0.01:
+                        typer.echo("Schedule: run now (already the lowest-carbon window).")
+                    else:
+                        typer.echo(
+                            f"Schedule: wait {sched.delay_hours:.1f}h "
+                            f"(start {sched.start_utc:%H:%M} UTC) -> "
+                            f"-{sched.moer_reduction_pct:.1f}% carbon vs running now."
+                        )
+            except Exception as e:
+                typer.echo(f"Warning: could not compute schedule: {e}", err=True)
 
     # Baseline estimate for tracking
     baseline_cost = estimate_cost_usd(
@@ -414,8 +494,24 @@ def run_cmd(
         "--static-pricing",
         help="Force static cost tables instead of live AWS pricing.",
     ),
+    finish_by: str | None = typer.Option(
+        None,
+        "--finish-by",
+        help="ISO-8601 finish-by deadline (enables dynamic planner). Overrides YAML carbonsight.finish_by.",
+    ),
+    carbon_budget: float | None = typer.Option(
+        None,
+        "--carbon-budget",
+        help="Hard carbon budget in kg CO2 for dynamic planning.",
+    ),
+    carbon_price: float = typer.Option(
+        0.0,
+        "--carbon-price",
+        help="Shadow price in USD per kg CO2 for dynamic utility scoring.",
+    ),
 ) -> None:
     """Pick the greenest affordable region, patch YAML, and launch via SkyPilot."""
+    parsed_finish_by = parse_finish_by(finish_by) if finish_by else None
     run_launch(
         yaml_path,
         dry_run=dry_run,
@@ -435,4 +531,7 @@ def run_cmd(
         checkpoint_interval=checkpoint_interval,
         live_pricing=live_pricing,
         static_pricing=static_pricing,
+        finish_by=parsed_finish_by,
+        carbon_budget_kg=carbon_budget,
+        carbon_price=carbon_price,
     )

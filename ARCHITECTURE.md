@@ -70,6 +70,8 @@ Implementation: `carbonsight/apps/cli/carbonsight_cli/commands/train.py`.
 
 Same loop as advise, plus optional **quota check** and **instance offerings check** per region (when preflight is enabled). Pick the **greenest** row that still passes the cost filter, **inject `resources.infra` (`cloud/region`) into the YAML** (and strip legacy `cloud`/`region`/`zone` keys), write a temp file, call SkyPilot.
 
+With **`--finish-by`** (or YAML `carbonsight.finish_by`), `run` uses the **dynamic planner** (`planning/plan_dynamic_job`) to simulate greedy spot + Safety Net against the deadline, then launches in the recommended initial region/mode.
+
 If the subprocess exits 0, we try **post-run actual CO₂** via **`JobCarbonEstimator.compute_actual_run`**: pull **historical** MOER for the job window from WattTime, time-weight it, compare to the pre-run estimate. The module-level **`compute_actual_co2`** remains a thin wrapper for tests and scripts. Start/end times are **wall clock around the local SkyPilot process** — MVP scope.
 
 Implementation: `commands/run.py`.
@@ -157,6 +159,7 @@ We run that **1000 times** (Monte Carlo), same MOER per run (fetched once per re
 | Region → grid JSON | `.../mapping/seed_registry.json` |
 | WattTime client / auth / retries | `.../watttime.py` |
 | Time-shift scheduling | `.../scheduler.py` |
+| Job planning (static + dynamic, finish-by) | `.../planning/` |
 | Persistent run ledger (SQLite) | `.../tracking.py` |
 | Checkpoint core (framework detect, YAML patch) | `.../checkpoint.py` |
 | Checkpoint shim (remote SIGTERM wrapper) | `.../checkpoint_shim.py` |
