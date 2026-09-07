@@ -70,9 +70,13 @@ def parse_finish_by(raw: Any) -> datetime:
     return dt.astimezone(UTC)
 
 
-def finish_by_from_yaml(path: Path) -> datetime | None:
+def finish_by_from_yaml(
+    path: Path,
+    *,
+    carbonsight_block: dict | None = None,
+) -> datetime | None:
     """Read optional ``carbonsight.finish_by`` from a SkyPilot YAML file."""
-    cs = carbonsight_block_from_yaml(path)
+    cs = carbonsight_block if carbonsight_block is not None else carbonsight_block_from_yaml(path)
     if cs.get("finish_by") is None:
         return None
     return parse_finish_by(cs["finish_by"])
@@ -88,21 +92,25 @@ def carbonsight_block_from_yaml(path: Path) -> dict:
 def resolve_finish_by(
     cli_finish_by: datetime | None,
     yaml_path: Path,
+    *,
+    carbonsight_block: dict | None = None,
 ) -> datetime | None:
     """Deadline for dynamic planning: explicit CLI wins; else YAML ``carbonsight.finish_by``."""
     if cli_finish_by is not None:
         return cli_finish_by
-    return finish_by_from_yaml(yaml_path)
+    return finish_by_from_yaml(yaml_path, carbonsight_block=carbonsight_block)
 
 
 def resolve_carbon_budget_kg(
     cli_carbon_budget_kg: float | None,
     yaml_path: Path,
+    *,
+    carbonsight_block: dict | None = None,
 ) -> float | None:
     """Carbon budget: explicit CLI wins; else optional YAML ``carbonsight.carbon_budget_kg``."""
     if cli_carbon_budget_kg is not None:
         return cli_carbon_budget_kg
-    cs = carbonsight_block_from_yaml(yaml_path)
+    cs = carbonsight_block if carbonsight_block is not None else carbonsight_block_from_yaml(yaml_path)
     raw = cs.get("carbon_budget_kg")
     if raw is None:
         return None
@@ -115,11 +123,13 @@ def resolve_carbon_budget_kg(
 def resolve_carbon_price(
     cli_carbon_price: float | None,
     yaml_path: Path,
+    *,
+    carbonsight_block: dict | None = None,
 ) -> float:
     """Shadow carbon price: explicit CLI wins; else YAML ``carbonsight.carbon_price``; else 0."""
     if cli_carbon_price is not None:
         return cli_carbon_price
-    cs = carbonsight_block_from_yaml(yaml_path)
+    cs = carbonsight_block if carbonsight_block is not None else carbonsight_block_from_yaml(yaml_path)
     raw = cs.get("carbon_price")
     if raw is None:
         return 0.0

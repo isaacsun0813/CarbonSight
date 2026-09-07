@@ -1,14 +1,10 @@
-# SkyPilot task — Bitcoin RNN smoke job (~15–30 min on T4)
 name: carbonsight-bitcoin-rnn
 workdir: .
 
-# CarbonSight planning (stripped before SkyPilot launch)
-# Optional CLI: --gpu-util 0.75  or  --nvidia-smi  (power model; not a YAML field)
 duration: 30m
 carbonsight:
   finish_by: "2026-09-08T22:00:00Z"
 
-# SkyPilot execution
 resources:
   infra: aws
   accelerators: T4:1

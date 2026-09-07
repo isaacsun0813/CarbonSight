@@ -1,11 +1,16 @@
 """Utility and carbon estimation helpers for planning (SkyNomad Eq. 7 + 9 barebones)."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from carbonsight_core.estimator.carbon_model import LB_TO_KG, time_weighted_moer
 from carbonsight_core.estimator.power_model import PUE_MEAN, power_it_w
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning.types import JobMode
+
+
+def parse_forecast_utc(ts: str) -> datetime:
+    dt = datetime.fromisoformat(ts)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 def facility_mwh_for_duration(job: JobSpec, duration_hours: float, pue: float = PUE_MEAN) -> float:

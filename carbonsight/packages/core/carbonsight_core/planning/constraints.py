@@ -44,36 +44,37 @@ def filter_by_priority(
         "cost_premium": [],
     }
 
-    tier1: list[PlanCandidate] = []
+    survivors: list[PlanCandidate] = []
+    carbon_cap = constraints.carbon_budget_kg
     for c in candidates:
-        if is_deadline_feasible(c.finish_utc, constraints.deadline_utc):
-            tier1.append(c)
-        else:
+        misses_deadline = not is_deadline_feasible(c.finish_utc, constraints.deadline_utc)
+        if misses_deadline:
             filtered_out["deadline"].append(c)
+            continue
+        over_carbon_cap = carbon_cap is not None and c.carbon_kg > carbon_cap
+        if over_carbon_cap:
+            filtered_out["carbon_budget"].append(c)
+            continue
+        survivors.append(c)
 
-    tier2: list[PlanCandidate] = []
-    if constraints.carbon_budget_kg is not None:
-        for c in tier1:
-            if c.carbon_kg <= constraints.carbon_budget_kg:
-                tier2.append(c)
-            else:
-                filtered_out["carbon_budget"].append(c)
-    else:
-        tier2 = tier1
-
-    if not tier2:
+    if not survivors:
         return [], filtered_out
 
-    min_cost = min(c.cost_usd for c in tier2)
+    min_cost = min(c.cost_usd for c in survivors)
     cost_ceiling = min_cost * (1.0 + constraints.max_cost_premium)
-    tier3 = [c for c in tier2 if c.cost_usd <= cost_ceiling]
+    tier3: list[PlanCandidate] = []
+    over_ceiling: list[PlanCandidate] = []
+    for c in survivors:
+        within_cost_ceiling = c.cost_usd <= cost_ceiling
+        if within_cost_ceiling:
+            tier3.append(c)
+        else:
+            over_ceiling.append(c)
+
     if not tier3:
-        cheapest = min(tier2, key=lambda c: (c.cost_usd, c.carbon_kg, c.start_utc))
-        tier3 = [cheapest]
+        tier3 = [min(survivors, key=lambda c: (c.cost_usd, c.carbon_kg, c.start_utc))]
     else:
-        for c in tier2:
-            if c not in tier3:
-                filtered_out["cost_premium"].append(c)
+        filtered_out["cost_premium"].extend(over_ceiling)
 
     return tier3, filtered_out
 

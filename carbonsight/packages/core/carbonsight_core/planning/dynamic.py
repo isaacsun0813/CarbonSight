@@ -22,6 +22,7 @@ from carbonsight_core.planning.types import (
 from carbonsight_core.planning.utility import (
     carbon_rate_kg_per_hr,
     estimate_window_carbon_kg,
+    parse_forecast_utc,
     progress_value,
     calc_utility,
     deadline_pressure,
@@ -39,23 +40,70 @@ def safety_net_triggered(
     return slack < 2.0 * constraints.cold_start_hours
 
 
-def _parse_utc(ts: str) -> datetime:
-    dt = datetime.fromisoformat(ts)
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
-
-
 def _moer_at_time(forecast_points: list[dict], at: datetime) -> float:
+    """MOER at ``at`` from chronologically sorted forecast points."""
     if not forecast_points:
         return 400.0
-    sorted_pts = sorted(forecast_points, key=lambda p: p["point_time"])
-    chosen = sorted_pts[0]
-    for p in sorted_pts:
-        t = _parse_utc(p["point_time"])
+    chosen = forecast_points[0]
+    for p in forecast_points:
+        t = parse_forecast_utc(p["point_time"])
         if t <= at:
             chosen = p
         else:
             break
     return float(chosen.get("value", 400.0))
+
+
+def _scheduler_utility(
+    candidate: SchedulerCandidate,
+    v_t: float,
+    constraints: PlanConstraints,
+) -> float:
+    return calc_utility(
+        v_t,
+        candidate.cost_rate_usd_per_hr,
+        candidate.carbon_rate_kg_per_hr,
+        candidate.mode,
+        expected_lifetime_hours=candidate.expected_lifetime_hours,
+        cold_start_hours=constraints.cold_start_hours,
+        migration_usd=candidate.migration_usd,
+        lambda_co2_usd_per_kg=constraints.lambda_co2_usd_per_kg,
+    )
+
+
+def _scheduler_candidate_for_region(
+    job: JobSpec,
+    constraints: PlanConstraints,
+    region: RegionPlanInput,
+    trackers: dict[str, VirtualInstanceTracker],
+    now_utc: datetime,
+    checkpoint_region: str,
+    region_code: str,
+    mode: JobMode,
+) -> SchedulerCandidate | None:
+    """Build one scheduler candidate without enumerating all regions/modes."""
+    if region.cloud_region != region_code:
+        return None
+    moer = _moer_at_time(region.forecast_points, now_utc)
+    carb_rate = carbon_rate_kg_per_hr(job, moer)
+    migration = _migration_cost(constraints, checkpoint_region, region.cloud_region)
+    use_spot = mode == JobMode.SPOT
+    cost_rate = estimate_job_cost(
+        job.gpu_type, job.gpu_count, 1.0, region.cloud_region, use_spot=use_spot,
+    ).usd
+    lifetime = (
+        trackers[region.cloud_region].predict_lifetime_hours(now_utc)
+        if use_spot
+        else max(job.duration_hours, 1.0)
+    )
+    return SchedulerCandidate(
+        region=region.cloud_region,
+        mode=mode,
+        cost_rate_usd_per_hr=cost_rate,
+        carbon_rate_kg_per_hr=carb_rate,
+        migration_usd=migration,
+        expected_lifetime_hours=lifetime,
+    )
 
 
 def _migration_cost(
@@ -172,23 +220,28 @@ def pick_next_state(
     )
     v_t = progress_value(theta, theta_bar, c_od_min)
 
-    if safety_net_triggered(state, constraints):
-        od_candidates = [c for c in candidates if c.mode == JobMode.ON_DEMAND]
-        if not od_candidates:
+    should_force_ondemand = safety_net_triggered(state, constraints)
+    if should_force_ondemand:
+        best: SchedulerCandidate | None = None
+        best_cost = float("inf")
+        for c in candidates:
+            if c.mode != JobMode.ON_DEMAND:
+                continue
+            cost = _fallback_ondemand_cost(state, constraints, c, remaining_work)
+            if cost < best_cost:
+                best_cost = cost
+                best = c
+        if best is None:
             return SchedulerDecision(
                 chosen=None,
                 safety_net=True,
                 utility=0.0,
                 reason="safety_net triggered but no on-demand candidates",
             )
-        best = min(
-            od_candidates,
-            key=lambda c: _fallback_ondemand_cost(state, constraints, c, remaining_work),
-        )
         return SchedulerDecision(
             chosen=best,
             safety_net=True,
-            utility=_fallback_ondemand_cost(state, constraints, best, remaining_work),
+            utility=best_cost,
             reason="safety_net forced on-demand fallback",
         )
 
@@ -199,43 +252,29 @@ def pick_next_state(
         carbon_rate_kg_per_hr=0.0,
     )
     if state.mode != JobMode.IDLE:
-        current_candidate = next(
-            (c for c in candidates if c.region == state.region and c.mode == state.mode),
-            current_candidate,
-        )
+        for c in candidates:
+            if c.region == state.region and c.mode == state.mode:
+                current_candidate = c
+                break
     u_current = _current_utility(state, constraints, current_candidate, v_t)
 
-    for cand in sorted(
-        candidates,
-        key=lambda c: calc_utility(
-            v_t,
-            c.cost_rate_usd_per_hr,
-            c.carbon_rate_kg_per_hr,
-            c.mode,
-            expected_lifetime_hours=c.expected_lifetime_hours,
-            cold_start_hours=constraints.cold_start_hours,
-            migration_usd=c.migration_usd,
-            lambda_co2_usd_per_kg=constraints.lambda_co2_usd_per_kg,
-        ),
-        reverse=True,
-    ):
-        u = calc_utility(
-            v_t,
-            cand.cost_rate_usd_per_hr,
-            cand.carbon_rate_kg_per_hr,
-            cand.mode,
-            expected_lifetime_hours=cand.expected_lifetime_hours,
-            cold_start_hours=constraints.cold_start_hours,
-            migration_usd=cand.migration_usd,
-            lambda_co2_usd_per_kg=constraints.lambda_co2_usd_per_kg,
+    best_cand: SchedulerCandidate | None = None
+    best_u = u_current
+    for c in candidates:
+        u = _scheduler_utility(c, v_t, constraints)
+        improves_utility = u > best_u
+        if improves_utility:
+            best_u = u
+            best_cand = c
+
+    has_better_candidate = best_cand is not None
+    if has_better_candidate:
+        return SchedulerDecision(
+            chosen=best_cand,
+            safety_net=False,
+            utility=best_u,
+            reason="higher utility than current state",
         )
-        if u > u_current:
-            return SchedulerDecision(
-                chosen=cand,
-                safety_net=False,
-                utility=u,
-                reason="higher utility than current state",
-            )
 
     return SchedulerDecision(
         chosen=None,
@@ -358,44 +397,47 @@ def plan_dynamic_job(
     ):
         iters += 1
         remaining = job.duration_hours - state.progress_hours
+        work_in_progress = state.mode != JobMode.IDLE
 
-        if state.mode != JobMode.IDLE:
+        if work_in_progress:
             region_input = region_map[state.region]
-            candidate = next(
-                (
-                    c
-                    for c in _build_scheduler_candidates(
-                        job, constraints, [region_input], trackers, state.now_utc, checkpoint,
-                    )
-                    if c.region == state.region and c.mode == state.mode
-                ),
-                None,
+            candidate = _scheduler_candidate_for_region(
+                job,
+                constraints,
+                region_input,
+                trackers,
+                state.now_utc,
+                checkpoint,
+                state.region,
+                state.mode,
             )
             if candidate is None:
                 state = replace(state, mode=JobMode.IDLE)
                 continue
 
             run_hours = min(tick_hours, remaining)
+            spot_lifetime_exceeded = False
             if state.mode == JobMode.SPOT and spot_run_start is not None:
                 elapsed_spot = (state.now_utc - spot_run_start).total_seconds() / 3600.0
                 run_hours = min(run_hours, max(spot_lifetime_budget - elapsed_spot, 0.0))
-                if run_hours <= 1e-9:
-                    trackers[state.region].record_probe(state.now_utc, available=False)
-                    events.append(
-                        DynamicPlanEvent(
-                            time_utc=state.now_utc,
-                            event_type=DynamicEventType.PREEMPT,
-                            region=state.region,
-                            mode=JobMode.SPOT,
-                            progress_hours=state.progress_hours,
-                            cost_usd_delta=0.0,
-                            carbon_kg_delta=0.0,
-                            notes="spot lifetime exceeded",
-                        )
+                spot_lifetime_exceeded = run_hours <= 1e-9
+            if spot_lifetime_exceeded:
+                trackers[state.region].record_probe(state.now_utc, available=False)
+                events.append(
+                    DynamicPlanEvent(
+                        time_utc=state.now_utc,
+                        event_type=DynamicEventType.PREEMPT,
+                        region=state.region,
+                        mode=JobMode.SPOT,
+                        progress_hours=state.progress_hours,
+                        cost_usd_delta=0.0,
+                        carbon_kg_delta=0.0,
+                        notes="spot lifetime exceeded",
                     )
-                    state = replace(state, mode=JobMode.IDLE, region=checkpoint or state.region)
-                    spot_run_start = None
-                    continue
+                )
+                state = replace(state, mode=JobMode.IDLE, region=checkpoint or state.region)
+                spot_run_start = None
+                continue
 
             run_end = state.now_utc + timedelta(hours=run_hours)
             run_cost = candidate.cost_rate_usd_per_hr * run_hours
@@ -433,7 +475,8 @@ def plan_dynamic_job(
         )
         decision = pick_next_state(state, constraints, candidates, c_od_min=c_od_min)
 
-        if decision.safety_net and decision.chosen:
+        safety_net_fallback = decision.safety_net and decision.chosen is not None
+        if safety_net_fallback:
             if initial_launch is None:
                 initial_launch = decision.chosen
             region_input = region_map[decision.chosen.region]
@@ -442,7 +485,8 @@ def plan_dynamic_job(
             )
             break
 
-        if decision.chosen is None:
+        no_improving_action = decision.chosen is None
+        if no_improving_action:
             next_time = state.now_utc + timedelta(hours=tick_hours)
             events.append(
                 DynamicPlanEvent(

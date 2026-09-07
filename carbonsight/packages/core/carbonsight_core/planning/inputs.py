@@ -1,5 +1,3 @@
-"""Build RegionPlanInput rows from registry + WattTime (app-boundary HTTP)."""
-
 from __future__ import annotations
 
 import math
@@ -16,7 +14,7 @@ def build_region_plan_inputs(
     watt_time: WattTimeClient,
     job: JobSpec,
     constraints: PlanConstraints,
-    region_codes: list[str] | None = None,
+    region_codes: list[str] | frozenset[str] | None = None,
 ) -> list[RegionPlanInput]:
     """
     Fetch MOER forecast per AWS region for dynamic/static planning.
@@ -29,14 +27,10 @@ def build_region_plan_inputs(
         + job.duration_hours
     )
     horizon_hours = max(1, min(horizon_hours, 72))
-    allowed = set(region_codes) if region_codes else None
+    allowed = frozenset(region_codes) if region_codes else None
     inputs: list[RegionPlanInput] = []
 
-    for entry in registry.all_regions():
-        if entry.provider.lower() != "aws" or not entry.wt_regions:
-            continue
-        if allowed is not None and entry.region_code not in allowed:
-            continue
+    for entry in registry.iter_plannable_aws_regions(allowed):
         wt_region = entry.wt_regions[0][0]
         try:
             forecast = watt_time.get_forecast(wt_region, horizon_hours=horizon_hours)
@@ -49,7 +43,7 @@ def build_region_plan_inputs(
             RegionPlanInput(
                 cloud_region=entry.region_code,
                 watttime_regions=list(entry.wt_regions),
-                forecast_points=points,
+                forecast_points=sorted(points, key=lambda p: p["point_time"]),
                 mapping_confidence=entry.s_source,
             )
         )

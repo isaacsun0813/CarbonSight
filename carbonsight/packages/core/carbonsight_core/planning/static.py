@@ -1,7 +1,5 @@
 """Static pre-launch planner: brute-force over region x start x mode."""
 
-from datetime import UTC, datetime
-
 from carbonsight_core.estimator.pricing import estimate_job_cost
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning.constraints import (
@@ -21,14 +19,10 @@ from carbonsight_core.planning.utility import (
     carbon_rate_kg_per_hr,
     deadline_pressure,
     estimate_window_carbon_kg,
+    parse_forecast_utc,
     progress_value,
     calc_utility,
 )
-
-
-def _parse_utc(ts: str) -> datetime:
-    dt = datetime.fromisoformat(ts)
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 def _migration_cost(
@@ -65,7 +59,7 @@ def enumerate_candidates(
     for region in regions:
         if not region.forecast_points:
             continue
-        sorted_pts = sorted(region.forecast_points, key=lambda p: p["point_time"])
+        sorted_pts = region.forecast_points
         latest_start = latest_feasible_start(
             constraints.deadline_utc,
             job.duration_hours,
@@ -74,10 +68,12 @@ def enumerate_candidates(
         migration_usd = _migration_cost(constraints, checkpoint_region, region.cloud_region)
 
         for p in sorted_pts:
-            t_s = _parse_utc(p["point_time"])
-            if t_s < constraints.now_utc:
+            t_s = parse_forecast_utc(p["point_time"])
+            before_planning_window = t_s < constraints.now_utc
+            if before_planning_window:
                 continue
-            if t_s > latest_start:
+            after_latest_start = t_s > latest_start
+            if after_latest_start:
                 break
 
             t_finish = finish_time(t_s, job.duration_hours, constraints.cold_start_hours)
