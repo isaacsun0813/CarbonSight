@@ -65,10 +65,11 @@ class AwsRegionRankingService:
             enabled_regions = self._enabled_regions_provider.enabled_region_codes()
 
         estimates: list[EstimateResult] = []
-        for entry in self._registry.all_regions():
-            if not entry.wt_regions or entry.provider.lower() != "aws":
-                continue
-            if enabled_regions is not None and entry.region_code not in enabled_regions:
+        for entry in self._registry.iter_plannable_aws_regions():
+            region_disabled = (
+                enabled_regions is not None and entry.region_code not in enabled_regions
+            )
+            if region_disabled:
                 if on_enabled_region_skip is not None:
                     on_enabled_region_skip(entry.region_code, _ENABLED_REGION_SKIP_REASON)
                 continue
@@ -148,6 +149,7 @@ def collect_aws_region_estimates(
     registry: Registry,
     watt_time: WattTimeClient,
     *,
+    use_spot: bool = False,
     quota_checker: QuotaChecker | None = None,
     availability_checker: InstanceAvailabilityChecker | None = None,
     enabled_regions_provider: EnabledRegionsProvider | None = None,
@@ -165,6 +167,7 @@ def collect_aws_region_estimates(
         enabled_regions_provider=enabled_regions_provider,
     ).collect_estimates(
         job,
+        use_spot=use_spot,
         on_enabled_region_skip=on_enabled_region_skip,
         on_quota_skip=on_quota_skip,
         on_availability_skip=on_availability_skip,

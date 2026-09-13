@@ -26,10 +26,7 @@ Core domain logic lives in `carbonsight/packages/core/carbonsight_core/` and is 
 Key behavior from the code:
 
 - **Ranking policy**: sort by lowest `expected_co2_kg_mean`, then apply a **cost ceiling** based on `--max-cost-premium` vs the cheapest region.
-- **GPU utilization**: you can fix `JobSpec.gpu_utilization` via:
-  - `--gpu-util 0..1` (highest precedence)
-  - `--nvidia-smi` (samples local `nvidia-smi` utilization)
-  - YAML `carbonsight.gpu_utilization`
+- **GPU utilization**: fix `JobSpec.gpu_utilization` via `--gpu-util 0..1` or `--nvidia-smi` on `advise`/`run`/`train` (otherwise power model samples 0.6–0.9).
 - **Registry required**: the CLI loads a mapping registry JSON (defaults to a seeded file if present).
 - **Live AWS pricing (optional)**: `CARBONSIGHT_LIVE_AWS_PRICING=1` or `--live-pricing` uses EC2 spot history when `--spot`, and Pricing API on-demand when `--no-spot` (or `advise` without `--spot`). `--static-pricing` forces static tables. JSON may include `notes` like `cost:live_spot`, `cost:live_ondemand`, or `cost:static_*_fallback`.
 - **Credentials required for recommendations**: if WattTime credentials aren’t in env, the CLI prints an empty list (`--json`) or a message.
@@ -45,7 +42,7 @@ Relevant code:
 
 - Run the same estimate + ranking pipeline
 - Choose the best region within the cost premium
-- Patch the YAML with `resources.cloud` and `resources.region`
+- Patch the YAML with `resources.infra` (`cloud/region`) and drop legacy `cloud`/`region`/`zone` keys
 - Optionally invoke SkyPilot:
   - `sky launch` (default)
   - `sky jobs launch` (`--managed`)
@@ -53,20 +50,23 @@ Relevant code:
 Key behavior from the code:
 
 - **Spot pricing**: `--spot` (default ON) sets `resources.use_spot: true` in the patched YAML. By default, cost uses static on-demand × 35% (`SPOT_PRICE_FRACTION`). With `CARBONSIGHT_LIVE_AWS_PRICING=1` or `--live-pricing`, spot cost uses EC2 `describe_spot_price_history`; on-demand (`--no-spot`) uses Pricing API `get_products`. Falls back to static tables on API errors. `--static-pricing` forces static tables.
-- **Carbon-aware scheduling**: `--max-delay 6h` scans the forecast for the lowest-carbon start time within the delay window and prints a recommendation. Default `0h` (run immediately).
+- **Carbon-aware scheduling (no deadline)**: `--max-delay 6h` scans the forecast for the lowest-carbon start time within the delay window and prints a recommendation. Default `0h` (run immediately). Skipped when `finish_by` is set.
+- **Dynamic planner (deadline)**: YAML `carbonsight.finish_by` or `--finish-by` enables `planning/plan_dynamic_job` — simulates greedy spot, idle/wait, and Safety Net on-demand fallback, then launches in the recommended initial region/mode. Optional `carbon_budget_kg` / `carbon_price` in YAML or via CLI (CLI overrides only when passed).
+- **YAML → SkyPilot**: `duration` and the `carbonsight` block are read for planning then **stripped** from the patched YAML sent to SkyPilot.
 - **Checkpoint resilience**: `--checkpoint` (default ON) wraps the training command with automatic checkpoint saving and resume. Detects the ML framework (HuggingFace, Lightning, PyTorch) via AST analysis, mounts persistent SkyPilot Storage at `/ckpt`, and injects a shim that handles SIGTERM → SIGINT for graceful saves on preemption. Auto-enables `--managed` (SkyPilot managed spot) when spot + checkpoint are both on. Customizable with `--checkpoint-bucket` (explicit S3 URI) and `--checkpoint-interval` (steps, default 500). Disable with `--no-checkpoint`.
 - **Run tracking**: each run is persisted to a SQLite ledger (`~/.carbonsight/runs.db` by default, overridable with `--db` or `CARBONSIGHT_DB`). Baseline is `us-east-1` on-demand/spot (matching `--spot`).
-- **Dry run**: `--dry-run` prints patched YAML and exits
+- **Dry run**: `--dry-run` prints SkyPilot-ready patched YAML and exits
 - **No exec**: `--no-exec` prints patched YAML and exits (after choosing region)
-- **AWS preflight**: enabled by default (`--skip-preflight` to disable); intersects registry with account-enabled regions, checks GPU Service Quotas, and EC2 instance type offerings per region. Instance availability and enabled-regions checks extend `BaseAWSProvider` (`cloud/aws/base.py`); quota checks use raw boto3.
+- **SkyPilot checks**: `--validate-sky` runs `sky launch --dryrun`; `--sky-smoke` launches a minimal echo job with `--down`
+- **AWS preflight**: enabled by default (`--skip-preflight` to disable); intersects registry with account-enabled regions, checks GPU Service Quotas, and EC2 instance type offerings per region. Quota, instance availability, and enabled-regions checks all extend `BaseAWSProvider` (`cloud/aws/base.py`).
 - **After a successful SkyPilot launch**: attempts to compute **actual CO₂** using **historical MOER** over the wall-clock run window and compares to the estimate.
 
 Relevant code:
 
 - CLI implementation: `carbonsight/apps/cli/carbonsight_cli/commands/run.py`
-- Quota checker: `carbonsight/packages/core/carbonsight_core/preflight/quota.py`
-- Instance availability: `carbonsight/packages/core/carbonsight_core/preflight/availability.py`
-- Enabled regions: `carbonsight/packages/core/carbonsight_core/preflight/enabled_regions.py`
+- Quota checker: `carbonsight/packages/core/carbonsight_core/cloud/aws/quota.py`
+- Instance availability: `carbonsight/packages/core/carbonsight_core/cloud/aws/availability.py`
+- Enabled regions: `carbonsight/packages/core/carbonsight_core/cloud/aws/enabled_regions.py`
 - Actual-run carbon: `carbonsight/packages/core/carbonsight_core/estimator/carbon_model.py`
 - Scheduler: `carbonsight/packages/core/carbonsight_core/scheduler.py`
 - Run ledger: `carbonsight/packages/core/carbonsight_core/tracking.py`
@@ -151,18 +151,19 @@ Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and per
 - **No persistent DB for API**: API runs are stored in memory only (`_runs_store`), not Postgres. CLI runs are persisted in SQLite.
 - **No mapping auto-refresh via API**: `POST /v1/mappings/revalidate` validates drift only; use CLI `mappings refresh --write` to update the registry JSON.
 - **Not compliance-grade accounting**: this is an operational estimate from marginal emissions + a simplified power model.
-- **Scheduling is advisory**: `--max-delay` recommends a start time but does not actually wait before launching.
+- **Scheduling is advisory**: `--max-delay` recommends a start time but does not wait before launch. The dynamic planner (`finish_by`) simulates a trajectory and picks an initial launch; it does not re-plan during SkyPilot execution.
 
 ## “Where to look in code”
 
 - **CLI entrypoint**: `carbonsight/apps/cli/carbonsight_cli/main.py`
 - **Core orchestration**: `carbonsight/packages/core/carbonsight_core/region_ranking.py`
 - **Estimator**: `carbonsight/packages/core/carbonsight_core/estimator/`
-- **Live AWS pricing**: `carbonsight/packages/core/carbonsight_core/estimator/aws_estimation/` (`SpotPriceProvider`, `OnDemandPriceProvider`; re-exported from `aws_estimation/__init__.py`)
+- **Live AWS pricing**: `carbonsight/packages/core/carbonsight_core/cloud/aws/` (`SpotPriceProvider`, `OnDemandPriceProvider`; used from `estimator/pricing.py`)
 - **AWS GPU instance catalog**: `carbonsight/packages/core/carbonsight_core/cloud/aws/gpu_catalog.py`
 - **AWS provider base**: `carbonsight/packages/core/carbonsight_core/cloud/aws/base.py` (`BaseAWSProvider` — shared session/client for spot, on-demand, preflight)
 - **Cloud protocols**: `carbonsight/packages/core/carbonsight_core/cloud/base.py`
 - **Scheduler**: `carbonsight/packages/core/carbonsight_core/scheduler.py`
+- **Job planning (static + dynamic, finish-by)**: `carbonsight/packages/core/carbonsight_core/planning/`
 - **Run ledger**: `carbonsight/packages/core/carbonsight_core/tracking.py`
 - **Checkpoint core**: `carbonsight/packages/core/carbonsight_core/checkpoint.py`
 - **Checkpoint shim**: `carbonsight/packages/core/carbonsight_core/checkpoint_shim.py`
