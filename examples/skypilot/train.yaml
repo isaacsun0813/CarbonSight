@@ -2,8 +2,6 @@ name: carbonsight-bitcoin-rnn
 workdir: .
 
 duration: 30m
-carbonsight:
-  finish_by: "2026-09-08T22:00:00Z"
 
 resources:
   infra: aws

@@ -75,7 +75,7 @@ class AwsRegionRankingService:
                 continue
             if self._quota_checker is not None:
                 quota_result = self._quota_checker.check_gpu_quota(
-                    entry.region_code, job.gpu_count, gpu_type=job.gpu_type
+                    entry.region_code, job.gpu_count, gpu_type=job.gpu_type, use_spot=use_spot,
                 )
                 if not quota_result.allowed:
                     if on_quota_skip is not None:
