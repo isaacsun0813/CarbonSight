@@ -4,13 +4,18 @@ import math
 import os
 import subprocess
 import tempfile
+import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 
 import typer
 import yaml
 from carbonsight_core.checkpoint import (
+    CheckpointYamlPatch,
     Framework,
     apply_checkpoint_patch_to_yaml,
     build_checkpoint_config,
@@ -32,9 +37,14 @@ from carbonsight_core.paths import (
     resolve_registry_json_file,
 )
 from carbonsight_core.planning import (
-    JobMode,
-    PlanConstraints,
+    DynamicEventType,
+    DynamicJob,
+    DynamicPlanEvent,
     DynamicPlanResult,
+    JobMode,
+    JobRuntimeState,
+    PlanConstraints,
+    RegionPlanInput,
     build_region_plan_inputs,
     plan_dynamic_job,
 )
@@ -59,9 +69,9 @@ from carbonsight_cli.commands.advise import (
 BASELINE_REGION = "us-east-1"
 
 
-def _echo_dynamic_plan(dyn) -> None:
+def _echo_dynamic_plan(dyn, *, title: str = "Dynamic plan (advisory simulation)") -> None:
     """Print concise dynamic plan trajectory."""
-    typer.echo("\nDynamic plan (advisory simulation):")
+    typer.echo(f"\n{title}:")
     typer.echo(
         f"  Deadline met: {dyn.deadline_met}  "
         f"Cost: ${dyn.total_cost_usd:.2f}  Carbon: {dyn.total_carbon_kg:.2f}kg"
@@ -81,24 +91,42 @@ def _echo_dynamic_plan(dyn) -> None:
 
 
 def _apply_cloud_region_to_resources(
-    resources: dict, cloud: str, region: str, *, use_spot: bool = False,
+    resources: dict,
+    cloud: str,
+    region: str,
+    *,
+    use_spot: bool = False,
+    force_on_demand: bool = False,
 ) -> None:
-    """Set SkyPilot ``resources.infra`` and drop legacy cloud/region/zone keys."""
+    """Set SkyPilot ``resources.infra`` and drop legacy cloud/region/zone keys.
+
+    ``force_on_demand`` writes ``use_spot: false`` so a YAML that already says spot cannot
+    override an on-demand launch chosen by the planner.
+    """
     resources["infra"] = f"{cloud}/{region}"
     for key in ("cloud", "region", "zone"):
         resources.pop(key, None)
     if use_spot:
         resources["use_spot"] = True
+    elif force_on_demand:
+        resources["use_spot"] = False
 
 
 def patch_sky_yaml_with_cloud_region(
-    yaml_path: Path, cloud: str, region: str, *, use_spot: bool = False,
+    yaml_path: Path,
+    cloud: str,
+    region: str,
+    *,
+    use_spot: bool = False,
+    force_on_demand: bool = False,
 ) -> str:
     """Inject resources.infra (cloud/region) into SkyPilot YAML; return SkyPilot-ready text."""
     data = yaml.safe_load(yaml_path.read_text()) or {}
     if "resources" not in data:
         data["resources"] = {}
-    _apply_cloud_region_to_resources(data["resources"], cloud, region, use_spot=use_spot)
+    _apply_cloud_region_to_resources(
+        data["resources"], cloud, region, use_spot=use_spot, force_on_demand=force_on_demand,
+    )
     return yaml.dump(
         strip_carbonsight_only_yaml_keys(data),
         default_flow_style=False,
@@ -124,8 +152,16 @@ def launch_skypilot_with_patched_yaml(
     dryrun: bool = False,
     down: bool = False,
     cwd: Path | None = None,
+    detach: bool = False,
+    cluster_name: str | None = None,
+    idle_minutes_to_autostop: int | None = None,
 ) -> int:
-    """Write YAML to temp file, run sky launch or sky jobs launch. Returns process exit code."""
+    """
+    Write YAML to temp file, run sky launch or sky jobs launch. Returns process exit code.
+
+    ``detach`` (``-d``), ``cluster_name`` (``-c``) and ``idle_minutes_to_autostop`` (``-i``)
+    apply to plain ``sky launch`` only; they let a caller submit the job and poll it.
+    """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(patched_yaml)
         tmp_path = Path(f.name)
@@ -138,12 +174,424 @@ def launch_skypilot_with_patched_yaml(
             cmd.append("--dryrun")
         if down:
             cmd.append("--down")
+        if not managed:
+            if detach:
+                cmd.append("--detach-run")
+            if cluster_name:
+                cmd.extend(["--cluster", cluster_name])
+            if idle_minutes_to_autostop is not None:
+                cmd.extend(["--idle-minutes-to-autostop", str(idle_minutes_to_autostop)])
         cmd.append(str(tmp_path))
 
         typer.echo(f"Running: {' '.join(cmd)}")
         return subprocess.run(cmd, cwd=cwd).returncode
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def build_patched_yaml_text(
+    yaml_path: Path,
+    cloud: str,
+    region: str,
+    *,
+    use_spot: bool = False,
+    ckpt_patch: CheckpointYamlPatch | None = None,
+    force_on_demand: bool = False,
+) -> str:
+    """SkyPilot-ready YAML text for one launch: cloud/region, spot flag, optional checkpoint patch."""
+    if ckpt_patch is None:
+        return patch_sky_yaml_with_cloud_region(
+            yaml_path, cloud, region, use_spot=use_spot, force_on_demand=force_on_demand,
+        )
+    data = yaml.safe_load(yaml_path.read_text()) or {}
+    if "resources" not in data:
+        data["resources"] = {}
+    _apply_cloud_region_to_resources(
+        data["resources"], cloud, region, use_spot=use_spot, force_on_demand=force_on_demand,
+    )
+    data = apply_checkpoint_patch_to_yaml(data, ckpt_patch)
+    return yaml.dump(
+        strip_carbonsight_only_yaml_keys(data),
+        default_flow_style=False,
+        sort_keys=False,
+    )
+
+
+# --- Real SkyPilot execution for the dynamic (deadline) path -------------------------------
+
+Clock = Callable[[], datetime]
+Sleep = Callable[[float], None]
+
+# Job states printed by ``sky queue`` and how the dynamic loop treats them.
+_SKY_JOB_STATES = frozenset({
+    "INIT", "PENDING", "SETTING_UP", "RUNNING",
+    "SUCCEEDED", "FAILED", "FAILED_SETUP", "FAILED_DRIVER", "CANCELLED",
+})
+_SKY_CLUSTER_STATES = frozenset({"UP", "INIT", "STOPPED"})
+
+AUTOSTOP_IDLE_MINUTES = 10
+
+
+class SkyStatus(str, Enum):
+    """What the dynamic loop sees for the launched job."""
+
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    PREEMPTED = "preempted"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
+_SKY_JOB_TO_STATUS = {
+    "INIT": SkyStatus.RUNNING,
+    "PENDING": SkyStatus.RUNNING,
+    "SETTING_UP": SkyStatus.RUNNING,
+    "RUNNING": SkyStatus.RUNNING,
+    "SUCCEEDED": SkyStatus.SUCCEEDED,
+    "FAILED": SkyStatus.FAILED,
+    "FAILED_SETUP": SkyStatus.FAILED,
+    "FAILED_DRIVER": SkyStatus.FAILED,
+    "CANCELLED": SkyStatus.FAILED,
+}
+
+
+def parse_sky_queue_job_state(text: str) -> str | None:
+    """First job state token found in ``sky queue <cluster>`` output (one job per cluster)."""
+    for line in text.splitlines():
+        for token in line.split():
+            if token in _SKY_JOB_STATES:
+                return token
+    return None
+
+
+def parse_sky_cluster_status(text: str, cluster_name: str) -> str | None:
+    """Cluster state (UP / INIT / STOPPED) for ``cluster_name`` in ``sky status`` output, else None."""
+    for line in text.splitlines():
+        tokens = line.split()
+        if tokens and tokens[0] == cluster_name:
+            for token in tokens[1:]:
+                if token in _SKY_CLUSTER_STATES:
+                    return token
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class SkyHandle:
+    """One launched SkyPilot cluster."""
+
+    cluster_name: str
+    region: str
+    mode: JobMode
+
+
+class SkyRunner:
+    """Launch, poll and tear down one SkyPilot cluster per launch (subprocess boundary)."""
+
+    def __init__(
+        self,
+        yaml_for_launch: Callable[[str, bool], str],
+        *,
+        cwd: Path | None,
+        run_id: str,
+        yes: bool = False,
+        idle_minutes_to_autostop: int = AUTOSTOP_IDLE_MINUTES,
+        run_fn: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        launch_fn: Callable[..., int] = launch_skypilot_with_patched_yaml,
+    ) -> None:
+        self._yaml_for_launch = yaml_for_launch
+        self._cwd = cwd
+        self._run_id = run_id
+        self._yes = yes
+        self._idle_minutes = idle_minutes_to_autostop
+        self._run_fn = run_fn
+        self._launch_fn = launch_fn
+        self._launches = 0
+
+    def launch(self, region: str, mode: JobMode) -> SkyHandle | None:
+        """Submit the job detached on a fresh cluster. None when SkyPilot reports failure."""
+        self._launches += 1
+        handle = SkyHandle(
+            cluster_name=f"cs-{self._run_id}-{self._launches}", region=region, mode=mode,
+        )
+        patched = self._yaml_for_launch(region, mode == JobMode.SPOT)
+        # Autodown after idle is the safety net if this process dies; teardown() is the normal path.
+        code = self._launch_fn(
+            patched,
+            managed=False,
+            yes=self._yes,
+            down=True,
+            cwd=self._cwd,
+            detach=True,
+            cluster_name=handle.cluster_name,
+            idle_minutes_to_autostop=self._idle_minutes,
+        )
+        if code != 0:
+            self.teardown(handle)
+            return None
+        # The user confirmed the first launch; do not re-prompt on relaunches in an unattended loop.
+        self._yes = True
+        return handle
+
+    def poll(self, handle: SkyHandle) -> SkyStatus:
+        """Job state from ``sky queue``; if the cluster is unreachable, tell preemption from a blip."""
+        queue = self._run_fn(
+            ["sky", "queue", handle.cluster_name], capture_output=True, text=True,
+        )
+        if queue.returncode == 0:
+            job_state = parse_sky_queue_job_state(queue.stdout)
+            return _SKY_JOB_TO_STATUS.get(job_state, SkyStatus.UNKNOWN)
+        status = self._run_fn(
+            ["sky", "status", "--refresh", handle.cluster_name],
+            capture_output=True,
+            text=True,
+        )
+        if status.returncode != 0:
+            return SkyStatus.UNKNOWN
+        if parse_sky_cluster_status(status.stdout, handle.cluster_name) == "UP":
+            return SkyStatus.UNKNOWN  # reachable per status; the queue call was a transient error
+        return SkyStatus.PREEMPTED
+
+    def teardown(self, handle: SkyHandle) -> None:
+        """Best-effort ``sky down``; never raises."""
+        result = self._run_fn(
+            ["sky", "down", "--yes", handle.cluster_name], capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            typer.echo(
+                f"Warning: `sky down {handle.cluster_name}` failed; check for a leftover cluster.",
+                err=True,
+            )
+
+
+@dataclass(slots=True)
+class DynamicLoopOutcome:
+    """Result of the dynamic event loop."""
+
+    state: JobRuntimeState
+    handle: SkyHandle | None = None
+    failed: str | None = None
+    interrupted: bool = False
+    # (cloud_region, start_utc, end_utc) for each launched segment, from the real clock.
+    segments: list[tuple[str, datetime, datetime]] = field(default_factory=list)
+
+
+def _run_dynamic_loop(
+    dyn: DynamicJob,
+    state: JobRuntimeState,
+    runner: SkyRunner,
+    *,
+    clock: Clock,
+    sleep: Sleep,
+    poll_seconds: float,
+    idle_tick_hours: float,
+    max_launch_failures: int = 5,
+    max_unknown_polls: int = 10,
+) -> DynamicLoopOutcome:
+    """
+    Time-constrained loop that routes each iteration to the matching ``DynamicJob`` method.
+
+    All scheduling decisions stay in ``DynamicJob``; this function only observes the clock and
+    the cluster (via ``runner``) and performs the launch/teardown side effects.
+    """
+    job = dyn.job
+    deadline = dyn.constraints.deadline_utc
+    out = DynamicLoopOutcome(state=state)
+    handle: SkyHandle | None = None
+    seg_start: datetime | None = None
+    launch_failures = 0
+    unknown_polls = 0
+
+    try:
+        while state.progress_hours < job.duration_hours:
+            now = clock()
+            if now >= deadline:
+                break
+
+            if state.mode != JobMode.IDLE:
+                assert handle is not None
+                status = runner.poll(handle)
+                if status is SkyStatus.UNKNOWN:
+                    unknown_polls += 1
+                    if unknown_polls > max_unknown_polls:
+                        out.failed = f"could not read job status on {handle.cluster_name}"
+                        break
+                    sleep(poll_seconds)
+                    continue
+                unknown_polls = 0
+                if status is SkyStatus.FAILED:
+                    out.failed = f"job failed on {handle.cluster_name}"
+                    break
+
+                tick_hours = max((now - state.now_utc).total_seconds() / 3600.0, 0.0)
+                if status is SkyStatus.PREEMPTED:
+                    runner.teardown(handle)
+                    if seg_start is not None:
+                        out.segments.append((handle.region, seg_start, now))
+                    handle, seg_start = None, None
+                    state = dyn.advance_work(
+                        replace(state, now_utc=now), tick_hours, preempted=True,
+                    )
+                elif status is SkyStatus.SUCCEEDED:
+                    state = dyn.advance_work(state, tick_hours, completed=True)
+                    runner.teardown(handle)
+                    if seg_start is not None:
+                        out.segments.append((handle.region, seg_start, now))
+                    handle, seg_start = None, None
+                else:
+                    state = dyn.advance_work(state, tick_hours)
+                sleep(poll_seconds)
+                continue
+
+            state = replace(state, now_utc=now)
+            decision = dyn.decide(state)
+            chosen = decision.chosen
+
+            if chosen is None:
+                state = dyn.wait_tick(state, decision, idle_tick_hours)
+                sleep(idle_tick_hours * 3600.0)
+                continue
+
+            new_handle = runner.launch(chosen.region, chosen.mode)
+            if new_handle is None:
+                launch_failures += 1
+                dyn.trackers[chosen.region].record_probe(now, available=False)
+                dyn.events.append(
+                    DynamicPlanEvent(
+                        time_utc=now,
+                        event_type=DynamicEventType.IDLE,
+                        region=chosen.region,
+                        mode=JobMode.IDLE,
+                        progress_hours=state.progress_hours,
+                        cost_usd_delta=0.0,
+                        carbon_kg_delta=0.0,
+                        notes=f"launch failed: {chosen.region} {chosen.mode.value}",
+                    )
+                )
+                if launch_failures >= max_launch_failures:
+                    out.failed = f"launch failed {launch_failures} times in a row"
+                    break
+                sleep(poll_seconds)
+                continue
+
+            launch_failures = 0
+            handle = new_handle
+            if decision.safety_net:
+                state = dyn.fallback_to_ondemand(state, decision, run_to_completion=False)
+            else:
+                state = dyn.launch_instance(state, decision)
+            seg_start = clock()
+            state = replace(state, now_utc=seg_start)
+            sleep(poll_seconds)
+    except KeyboardInterrupt:
+        out.interrupted = True
+
+    if handle is not None and seg_start is not None:
+        end = clock()
+        if end > seg_start:
+            out.segments.append((handle.region, seg_start, end))
+    out.state = state
+    out.handle = handle
+    return out
+
+
+def _echo_actual_segments(
+    job: JobSpec,
+    watt_time: WattTimeClient,
+    region_inputs: list[RegionPlanInput],
+    segments: list[tuple[str, datetime, datetime]],
+) -> None:
+    """Sum historical-MOER carbon over each launched segment (estimates, not certified)."""
+    if not segments:
+        return
+    wt_regions = {r.cloud_region: r.watttime_regions for r in region_inputs}
+    estimator = JobCarbonEstimator(watt_time)
+    total_co2 = 0.0
+    total_cost = 0.0
+    total_hours = 0.0
+    for region, start, end in segments:
+        try:
+            actual = estimator.compute_actual_run(
+                job=job,
+                cloud="aws",
+                cloud_region=region,
+                watttime_regions=wt_regions[region],
+                actual_start=start,
+                actual_end=end,
+                estimated_co2_kg=0.0,
+            )
+        except (KeyError, ValueError, WattTimeError) as err:
+            typer.echo(f"Warning: could not compute actual CO₂ for {region}: {err}", err=True)
+            continue
+        total_co2 += actual.actual_co2_kg
+        total_cost += actual.actual_cost_usd
+        total_hours += actual.actual_duration_hours
+    typer.echo(
+        f"\nActual CO₂ (estimate over {len(segments)} segment(s)): {total_co2:.3f}kg | "
+        f"Instance time: {total_hours:.1f}h | Cost: ${total_cost:.2f}"
+    )
+
+
+def _execute_dynamic_run(
+    job: JobSpec,
+    constraints: PlanConstraints,
+    region_inputs: list[RegionPlanInput],
+    runner: SkyRunner,
+    watt_time: WattTimeClient,
+    *,
+    poll_seconds: float,
+    idle_tick_hours: float,
+    clock: Clock,
+    sleep: Sleep,
+) -> int:
+    """Run the dynamic loop against a real cluster. Returns a process exit code."""
+    t0 = clock()  # time snapshot: constraints and DynamicJob are anchored here
+    constraints = replace(constraints, now_utc=t0)
+    events: list[DynamicPlanEvent] = []
+    dyn = DynamicJob(job, constraints, region_inputs, events, simulate_preemption=False)
+    state = dyn.make_initial_state()
+
+    typer.echo(
+        f"\nDynamic run: deadline {constraints.deadline_utc.isoformat()}, "
+        f"polling every {poll_seconds:g}s, idle tick {idle_tick_hours:g}h."
+    )
+    outcome = _run_dynamic_loop(
+        dyn,
+        state,
+        runner,
+        clock=clock,
+        sleep=sleep,
+        poll_seconds=poll_seconds,
+        idle_tick_hours=idle_tick_hours,
+    )
+    result = dyn.finalize(outcome.state)
+    _echo_dynamic_plan(result, title="Dynamic run (events; cost/carbon are estimates)")
+    _echo_actual_segments(job, watt_time, region_inputs, outcome.segments)
+
+    if outcome.handle is not None:
+        name = outcome.handle.cluster_name
+        typer.echo(
+            f"Warning: cluster {name} is still up. Inspect or tear it down with: sky down {name}",
+            err=True,
+        )
+    if outcome.interrupted:
+        typer.echo("Interrupted.", err=True)
+        return 130
+    if outcome.failed:
+        typer.echo(f"Error: {outcome.failed}", err=True)
+        return 1
+    if outcome.state.progress_hours < job.duration_hours:
+        typer.echo("Error: finish-by deadline reached before the job finished.", err=True)
+        return 1
+    if (
+        constraints.carbon_budget_kg is not None
+        and result.total_carbon_kg > constraints.carbon_budget_kg
+    ):
+        typer.echo(
+            f"Warning: estimated carbon {result.total_carbon_kg:.2f}kg exceeds budget "
+            f"{constraints.carbon_budget_kg:.2f}kg.",
+            err=True,
+        )
+    return 0
 
 
 def _resolve_db_path(db_opt: Path | None) -> Path:
@@ -160,18 +608,19 @@ def _echo_finish_by_source(effective_finish_by: datetime, cli_finish_by: datetim
     typer.echo(f"Finish-by ({source}): {effective_finish_by.isoformat()}")
 
 
-def _pick_region_with_dynamic_plan(
+def _build_dynamic_plan_inputs(
     reg: Registry,
     watt_time: WattTimeClient,
     job: JobSpec,
     estimates: list[EstimateResult],
     *,
+    now_utc: datetime,
     effective_finish_by: datetime,
     effective_carbon_budget: float | None,
     effective_carbon_price: float,
     max_cost_premium: float,
-) -> tuple[str, bool, EstimateResult, DynamicPlanResult]:
-    now_utc = datetime.now(UTC)
+) -> tuple[PlanConstraints, list[RegionPlanInput]]:
+    """Constraints (deadline = finish-by) and per-region WattTime forecasts for dynamic planning."""
     if effective_finish_by <= now_utc:
         typer.echo("Error: finish-by must be in the future.", err=True)
         raise typer.Exit(1)
@@ -197,7 +646,17 @@ def _pick_region_with_dynamic_plan(
     if not region_inputs:
         typer.echo("No regions with WattTime forecasts for dynamic planning.", err=True)
         raise typer.Exit(1)
+    return constraints, region_inputs
 
+
+def _pick_region_with_dynamic_plan(
+    job: JobSpec,
+    estimates: list[EstimateResult],
+    constraints: PlanConstraints,
+    region_inputs: list[RegionPlanInput],
+    *,
+    effective_finish_by: datetime,
+) -> tuple[str, bool, EstimateResult, DynamicPlanResult]:
     dyn = plan_dynamic_job(job, constraints, region_inputs)
     _echo_dynamic_plan(dyn)
     if not dyn.deadline_met or dyn.initial_launch is None:
@@ -297,8 +756,20 @@ def run_launch(
     carbon_price: float | None = None,
     validate_sky: bool = False,
     sky_smoke: bool = False,
+    poll_seconds: float = 60.0,
+    idle_tick_hours: float = 1.0,
+    clock: Clock | None = None,
+    sleep: Sleep | None = None,
 ) -> None:
-    """Shared implementation for ``run`` and ``train``."""
+    """Shared implementation for ``run`` and ``train``.
+
+    With a finish-by deadline the launch is an event loop (``_execute_dynamic_run``); ``clock``
+    and ``sleep`` default to wall-clock time and are injectable for tests.
+    """
+    if poll_seconds <= 0 or idle_tick_hours <= 0:
+        typer.echo("Error: --poll-seconds and --idle-tick-hours must be positive.", err=True)
+        raise typer.Exit(1)
+
     if not yaml_path.exists():
         typer.echo(f"Error: file not found: {yaml_path}", err=True)
         raise typer.Exit(1)
@@ -392,15 +863,23 @@ def run_launch(
 
     if effective_finish_by is not None:
         _echo_finish_by_source(effective_finish_by, finish_by)
-        region, use_spot, best, _dyn = _pick_region_with_dynamic_plan(
+        plan_constraints, region_inputs = _build_dynamic_plan_inputs(
             reg,
             watt_time,
             job,
             estimates,
+            now_utc=datetime.now(UTC),
             effective_finish_by=effective_finish_by,
             effective_carbon_budget=effective_carbon_budget,
             effective_carbon_price=effective_carbon_price,
             max_cost_premium=max_cost_premium,
+        )
+        region, use_spot, best, _dyn = _pick_region_with_dynamic_plan(
+            job,
+            estimates,
+            plan_constraints,
+            region_inputs,
+            effective_finish_by=effective_finish_by,
         )
     else:
         cloud, region, best = _pick_static_region(estimates, max_cost_premium)
@@ -458,25 +937,16 @@ def run_launch(
         )
         ckpt_patch = build_checkpoint_yaml_patch(ckpt_cfg, original_run, shim_local_path())
 
-        if use_spot and not managed:
+        # The dynamic loop owns recovery (unmanaged launches), so managed only applies to static runs.
+        if use_spot and not managed and effective_finish_by is None:
             managed = True
             typer.echo("Auto-enabling --managed for spot + checkpoint resilience.")
 
         typer.echo(f"Checkpoint: framework={framework.value}, storage={ckpt_cfg.storage_name or checkpoint_bucket}")
 
-    if ckpt_patch:
-        data = yaml.safe_load(yaml_path.read_text()) or {}
-        if "resources" not in data:
-            data["resources"] = {}
-        _apply_cloud_region_to_resources(data["resources"], cloud, region, use_spot=use_spot)
-        data = apply_checkpoint_patch_to_yaml(data, ckpt_patch)
-        patched = yaml.dump(
-            strip_carbonsight_only_yaml_keys(data),
-            default_flow_style=False,
-            sort_keys=False,
-        )
-    else:
-        patched = patch_sky_yaml_with_cloud_region(yaml_path, cloud, region, use_spot=use_spot)
+    patched = build_patched_yaml_text(
+        yaml_path, cloud, region, use_spot=use_spot, ckpt_patch=ckpt_patch,
+    )
 
     sky_cwd = yaml_path.parent.resolve()
 
@@ -518,6 +988,36 @@ def run_launch(
         raise typer.Exit(exit_code)
 
     _require_sky_cli()
+
+    if effective_finish_by is not None:
+        # Deadline path: monitored event loop (launch, poll, relaunch after preemption).
+        runner = SkyRunner(
+            lambda launch_region, spot: build_patched_yaml_text(
+                yaml_path,
+                cloud,
+                launch_region,
+                use_spot=spot,
+                ckpt_patch=ckpt_patch,
+                force_on_demand=not spot,
+            ),
+            cwd=sky_cwd,
+            run_id=rec.run_id,
+            yes=yes,
+        )
+        loop_exit_code = _execute_dynamic_run(
+            job,
+            plan_constraints,
+            region_inputs,
+            runner,
+            watt_time,
+            poll_seconds=poll_seconds,
+            idle_tick_hours=idle_tick_hours,
+            clock=clock or (lambda: datetime.now(UTC)),
+            sleep=sleep or time.sleep,
+        )
+        if loop_exit_code != 0:
+            raise typer.Exit(loop_exit_code)
+        return
 
     start_time = datetime.now(UTC)
     exit_code = launch_skypilot_with_patched_yaml(
@@ -638,6 +1138,16 @@ def run_cmd(
         "--sky-smoke",
         help="Launch a minimal echo job via SkyPilot with `--down` (provisions briefly, then tears down).",
     ),
+    poll_seconds: float = typer.Option(
+        60.0,
+        "--poll-seconds",
+        help="With a finish-by deadline: seconds between SkyPilot job status checks.",
+    ),
+    idle_tick_hours: float = typer.Option(
+        1.0,
+        "--idle-tick-hours",
+        help="With a finish-by deadline: hours to wait between decisions while waiting for a better launch window.",
+    ),
 ) -> None:
     """Pick the greenest affordable region, patch YAML, and launch via SkyPilot."""
     parsed_finish_by = parse_finish_by(finish_by) if finish_by else None
@@ -665,4 +1175,6 @@ def run_cmd(
         carbon_price=carbon_price,
         validate_sky=validate_sky,
         sky_smoke=sky_smoke,
+        poll_seconds=poll_seconds,
+        idle_tick_hours=idle_tick_hours,
     )

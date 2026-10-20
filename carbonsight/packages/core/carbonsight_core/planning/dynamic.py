@@ -363,6 +363,10 @@ class DynamicJob:
     - ``finalize``: after-loop processing into a ``DynamicPlanResult``
 
     ``decide`` runs one scheduling decision for the idle state.
+
+    By default the instance simulates spot lifetimes (``simulate_preemption=True``).
+    A driver that observes a real cluster sets it to False and reports preemption /
+    completion through ``advance_work(..., preempted=..., completed=...)``.
     """
 
     def __init__(
@@ -373,7 +377,9 @@ class DynamicJob:
         events: list[DynamicPlanEvent],
         *,
         checkpoint_region: str | None = None,
+        simulate_preemption: bool = True,
     ) -> None:
+        self.simulate_preemption = simulate_preemption
         self.job = job
         self.constraints = constraints
         self.regions = regions
@@ -406,9 +412,42 @@ class DynamicJob:
         )
         return pick_next_state(state, self.constraints, candidates, c_od_min=self.c_od_min)
 
-    def advance_work(self, state: JobRuntimeState, tick_hours: float) -> JobRuntimeState:
-        """Branch A: work is in progress (spot or on-demand); run up to one tick."""
+    def _preempt(self, state: JobRuntimeState, notes: str) -> JobRuntimeState:
+        """Record a preemption and fall back to idle at the checkpoint region."""
+        self.trackers[state.region].record_probe(state.now_utc, available=False)
+        self.events.append(
+            DynamicPlanEvent(
+                time_utc=state.now_utc,
+                event_type=DynamicEventType.PREEMPT,
+                region=state.region,
+                mode=state.mode,
+                progress_hours=state.progress_hours,
+                cost_usd_delta=0.0,
+                carbon_kg_delta=0.0,
+                notes=notes,
+            )
+        )
+        self.spot_run_start = None
+        return replace(state, mode=JobMode.IDLE, region=self.checkpoint or state.region)
+
+    def advance_work(
+        self,
+        state: JobRuntimeState,
+        tick_hours: float,
+        *,
+        preempted: bool = False,
+        completed: bool = False,
+    ) -> JobRuntimeState:
+        """
+        Branch A: work is in progress (spot or on-demand); run up to one tick.
+
+        ``preempted``: the instance was observed to be gone (real cluster); take the
+        PREEMPT path. ``completed``: the job was observed to finish; clamp progress to
+        the full duration after accounting for this tick, so COMPLETE fires.
+        """
         job = self.job
+        if preempted:
+            return self._preempt(state, "spot preempted (observed)")
         remaining = job.duration_hours - state.progress_hours
         region_input = self.region_map[state.region]
         candidate = _scheduler_candidate_for_region(
@@ -426,28 +465,18 @@ class DynamicJob:
 
         run_hours = min(tick_hours, remaining)
         spot_lifetime_exceeded = False
-        if state.mode == JobMode.SPOT and self.spot_run_start is not None:
+        if (
+            self.simulate_preemption
+            and state.mode == JobMode.SPOT
+            and self.spot_run_start is not None
+        ):
             # if spot, check its sampled lifetime budget
             elapsed_spot = (state.now_utc - self.spot_run_start).total_seconds() / 3600.0
             run_hours = min(run_hours, max(self.spot_lifetime_budget - elapsed_spot, 0.0))
             spot_lifetime_exceeded = run_hours <= 1e-9
         if spot_lifetime_exceeded:
             # spot instance is gone: preempt, fall back to idle at the checkpoint region
-            self.trackers[state.region].record_probe(state.now_utc, available=False)
-            self.events.append(
-                DynamicPlanEvent(
-                    time_utc=state.now_utc,
-                    event_type=DynamicEventType.PREEMPT,
-                    region=state.region,
-                    mode=JobMode.SPOT,
-                    progress_hours=state.progress_hours,
-                    cost_usd_delta=0.0,
-                    carbon_kg_delta=0.0,
-                    notes="spot lifetime exceeded",
-                )
-            )
-            self.spot_run_start = None
-            return replace(state, mode=JobMode.IDLE, region=self.checkpoint or state.region)
+            return self._preempt(state, "spot lifetime exceeded")
 
         run_end = state.now_utc + timedelta(hours=run_hours)
         run_cost = candidate.cost_rate_usd_per_hr * run_hours
@@ -463,6 +492,8 @@ class DynamicJob:
             cumulative_carbon_kg=state.cumulative_carbon_kg + run_carbon,
             total_work_hours=state.total_work_hours,
         )
+        if completed and state.progress_hours < job.duration_hours:
+            state = replace(state, progress_hours=job.duration_hours)
         if state.progress_hours >= job.duration_hours:
             self.events.append(
                 DynamicPlanEvent(
@@ -483,11 +514,21 @@ class DynamicJob:
         self,
         state: JobRuntimeState,
         decision: SchedulerDecision,
+        *,
+        run_to_completion: bool = True,
     ) -> JobRuntimeState:
-        """Branch B: Safety Net fired; launch on-demand and run to completion."""
+        """
+        Branch B: Safety Net fired; launch on-demand.
+
+        ``run_to_completion=True`` (simulation) also runs the remaining work in one go.
+        ``run_to_completion=False`` (real cluster) only records the SAFETY_NET launch and
+        returns an ON_DEMAND state; the driver observes the job until it finishes.
+        """
         chosen = decision.chosen
         if chosen is None:
             raise ValueError("fallback_to_ondemand requires decision.chosen")
+        if not run_to_completion:
+            return self._launch(state, decision, event_type=DynamicEventType.SAFETY_NET)
         if self.initial_launch is None:
             self.initial_launch = chosen
         region_input = self.region_map[chosen.region]
@@ -523,9 +564,18 @@ class DynamicJob:
         decision: SchedulerDecision,
     ) -> JobRuntimeState:
         """Branch D: launch the chosen (region, mode); state resumes after cold start."""
+        return self._launch(state, decision, event_type=DynamicEventType.LAUNCH)
+
+    def _launch(
+        self,
+        state: JobRuntimeState,
+        decision: SchedulerDecision,
+        *,
+        event_type: DynamicEventType,
+    ) -> JobRuntimeState:
         chosen = decision.chosen
         if chosen is None:
-            raise ValueError("launch_instance requires decision.chosen")
+            raise ValueError("launch requires decision.chosen")
         constraints = self.constraints
         if self.initial_launch is None:
             self.initial_launch = chosen
@@ -538,7 +588,7 @@ class DynamicJob:
         self.events.append(
             DynamicPlanEvent(
                 time_utc=cold_end,
-                event_type=DynamicEventType.LAUNCH,
+                event_type=event_type,
                 region=chosen.region,
                 mode=chosen.mode,
                 progress_hours=state.progress_hours,

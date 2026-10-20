@@ -171,6 +171,73 @@ class TestDynamicJob:
         assert not result.deadline_met
         assert result.events[-1].event_type == DynamicEventType.MISSED_DEADLINE
 
+    def _launched(self, **kwargs):
+        t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=2.0)
+        dyn = DynamicJob(job, _constraints(t0, 12.0), self._regions(t0), [], **kwargs)
+        chosen = SchedulerCandidate(
+            region="us-west-2",
+            mode=JobMode.SPOT,
+            cost_rate_usd_per_hr=1.0,
+            carbon_rate_kg_per_hr=0.1,
+            expected_lifetime_hours=0.5,
+        )
+        decision = SchedulerDecision(chosen=chosen, safety_net=False, utility=1.0, reason="test")
+        return dyn, dyn.launch_instance(dyn.make_initial_state(), decision), job
+
+    def test_simulated_preemption_by_default(self) -> None:
+        dyn, state, _ = self._launched()
+        state = dyn.advance_work(state, tick_hours=1.0)  # 0.5h lifetime budget: runs 0.5h
+        assert state.progress_hours == 0.5
+        state = dyn.advance_work(state, tick_hours=1.0)
+        assert state.mode == JobMode.IDLE
+        assert dyn.events[-1].event_type == DynamicEventType.PREEMPT
+
+    def test_no_simulated_preemption_when_observing_real_cluster(self) -> None:
+        dyn, state, _ = self._launched(simulate_preemption=False)
+        state = dyn.advance_work(state, tick_hours=1.0)
+        state = dyn.advance_work(state, tick_hours=0.5)
+        assert state.mode == JobMode.SPOT
+        assert state.progress_hours == 1.5
+        assert all(e.event_type != DynamicEventType.PREEMPT for e in dyn.events)
+
+    def test_observed_preemption_returns_to_checkpoint_region(self) -> None:
+        dyn, state, _ = self._launched(simulate_preemption=False)
+        state = dyn.advance_work(state, tick_hours=0.5)
+        progress = state.progress_hours
+        state = dyn.advance_work(state, tick_hours=0.5, preempted=True)
+        assert state.mode == JobMode.IDLE
+        assert state.region == "us-west-2"
+        assert state.progress_hours == progress
+        assert dyn.events[-1].event_type == DynamicEventType.PREEMPT
+        assert "observed" in dyn.events[-1].notes
+
+    def test_observed_completion_clamps_progress(self) -> None:
+        dyn, state, job = self._launched(simulate_preemption=False)
+        state = dyn.advance_work(state, tick_hours=0.25, completed=True)
+        assert state.progress_hours == job.duration_hours
+        assert state.mode == JobMode.IDLE
+        assert dyn.events[-1].event_type == DynamicEventType.COMPLETE
+        # only the 0.25h that actually ran is charged
+        assert state.cumulative_cost_usd < 1.0 + 0.25 * 100
+
+    def test_fallback_without_run_to_completion_only_launches(self) -> None:
+        t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=2.0)
+        # slack (2.5h - 2h) < 2 * cold_start (1h): the Safety Net fires immediately
+        constraints = PlanConstraints(
+            deadline_utc=t0 + timedelta(hours=2.5), now_utc=t0, cold_start_hours=0.5,
+        )
+        dyn = DynamicJob(job, constraints, self._regions(t0), [])
+        state = dyn.make_initial_state()
+        decision = dyn.decide(state)
+        assert decision.safety_net and decision.chosen is not None
+        state = dyn.fallback_to_ondemand(state, decision, run_to_completion=False)
+        assert state.mode == JobMode.ON_DEMAND
+        assert state.progress_hours == 0.0
+        assert [e.event_type for e in dyn.events] == [DynamicEventType.SAFETY_NET]
+        assert dyn.initial_launch == decision.chosen
+
     def test_wait_tick_advances_time_and_records_idle(self) -> None:
         t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
         job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
