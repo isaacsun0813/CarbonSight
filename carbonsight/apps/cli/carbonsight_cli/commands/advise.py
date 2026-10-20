@@ -1,6 +1,7 @@
 """carbonsight advise --yaml train.yaml [--explain] [--json]"""
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -58,31 +59,113 @@ def parse_duration_hours(raw: Any) -> float:
     return num if num > 0 else 1.0
 
 
+def parse_finish_by(raw: Any) -> datetime:
+    """Parse ISO-8601 finish-by timestamp; ensure timezone-aware UTC."""
+    if isinstance(raw, datetime):
+        dt = raw
+    else:
+        dt = datetime.fromisoformat(str(raw).strip())
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def finish_by_from_yaml(
+    path: Path,
+    *,
+    carbonsight_block: dict | None = None,
+) -> datetime | None:
+    """Read optional ``carbonsight.finish_by`` from a SkyPilot YAML file."""
+    cs = carbonsight_block if carbonsight_block is not None else carbonsight_block_from_yaml(path)
+    if cs.get("finish_by") is None:
+        return None
+    return parse_finish_by(cs["finish_by"])
+
+
+def carbonsight_block_from_yaml(path: Path) -> dict:
+    """Return the ``carbonsight`` mapping from a task YAML, or ``{}``."""
+    data: dict = yaml.safe_load(path.read_text()) or {}
+    cs = data.get("carbonsight")
+    return cs if isinstance(cs, dict) else {}
+
+
+def resolve_finish_by(
+    cli_finish_by: datetime | None,
+    yaml_path: Path,
+    *,
+    carbonsight_block: dict | None = None,
+) -> datetime | None:
+    """Deadline for dynamic planning: explicit CLI wins; else YAML ``carbonsight.finish_by``."""
+    if cli_finish_by is not None:
+        return cli_finish_by
+    return finish_by_from_yaml(yaml_path, carbonsight_block=carbonsight_block)
+
+
+def resolve_carbon_budget_kg(
+    cli_carbon_budget_kg: float | None,
+    yaml_path: Path,
+    *,
+    carbonsight_block: dict | None = None,
+) -> float | None:
+    """Carbon budget: explicit CLI wins; else optional YAML ``carbonsight.carbon_budget_kg``."""
+    if cli_carbon_budget_kg is not None:
+        return cli_carbon_budget_kg
+    cs = carbonsight_block if carbonsight_block is not None else carbonsight_block_from_yaml(yaml_path)
+    raw = cs.get("carbon_budget_kg")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_carbon_price(
+    cli_carbon_price: float | None,
+    yaml_path: Path,
+    *,
+    carbonsight_block: dict | None = None,
+) -> float:
+    """Shadow carbon price: explicit CLI wins; else YAML ``carbonsight.carbon_price``; else 0."""
+    if cli_carbon_price is not None:
+        return cli_carbon_price
+    cs = carbonsight_block if carbonsight_block is not None else carbonsight_block_from_yaml(yaml_path)
+    raw = cs.get("carbon_price")
+    if raw is None:
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+CARBONSIGHT_ONLY_YAML_TOP_LEVEL_KEYS = ("carbonsight", "duration")
+
+
+def strip_carbonsight_only_yaml_keys(data: dict) -> dict:
+    """Remove CarbonSight planning keys before handing YAML to SkyPilot."""
+    cleaned = dict(data)
+    for key in CARBONSIGHT_ONLY_YAML_TOP_LEVEL_KEYS:
+        cleaned.pop(key, None)
+    return cleaned
+
+
 def job_spec_from_sky_yaml(path: Path) -> JobSpec:
     """SkyPilot-style YAML → JobSpec.
 
-    Optional ``carbonsight: { gpu_utilization: 0.75 }`` fixes GPU utilization for the power model
-    (same effect as ``--gpu-util`` / ``--nvidia-smi`` on the CLI).
+    GPU utilization for the power model is set via CLI ``--gpu-util`` or ``--nvidia-smi``.
     """
     data: dict = yaml.safe_load(path.read_text()) or {}
     resources = data.get("resources") or {}
     acc = resources.get("accelerators") or ""
     gpu_type, gpu_count = parse_sky_accelerators_string(acc if isinstance(acc, str) else "")
     duration = parse_duration_hours(data.get("duration"))
-    gpu_utilization: float | None = None
-    cs = data.get("carbonsight")
-    if isinstance(cs, dict) and cs.get("gpu_utilization") is not None:
-        try:
-            gpu_utilization = float(cs["gpu_utilization"])
-        except (TypeError, ValueError):
-            gpu_utilization = None
     return JobSpec(
         gpu_type=gpu_type,
         gpu_count=gpu_count,
         duration_hours=duration,
         cpu_count=resources.get("cpus"),
         mem_gib=resources.get("memory"),
-        gpu_utilization=gpu_utilization,
     )
 
 
@@ -94,8 +177,7 @@ def apply_gpu_telemetry_cli(
 ) -> tuple[JobSpec, bool]:
     """Apply CLI GPU telemetry. Returns ``(job, nvidia_smi_failed)``.
 
-    Precedence: ``--gpu-util`` overrides everything; else ``--nvidia-smi`` samples this host;
-    else YAML ``carbonsight.gpu_utilization`` on ``job`` is kept.
+    Precedence: ``--gpu-util`` overrides ``--nvidia-smi``; otherwise power model samples 0.6–0.9.
     """
     if gpu_util is not None:
         return job.model_copy(update={"gpu_utilization": gpu_util}), False
@@ -248,7 +330,7 @@ def advise(
     gpu_util: float | None = typer.Option(
         None,
         "--gpu-util",
-        help="Observed GPU utilization in [0, 1] (overrides YAML carbonsight.gpu_utilization).",
+        help="Observed GPU utilization in [0, 1] for the power model.",
     ),
     nvidia_smi: bool = typer.Option(
         False,

@@ -11,18 +11,26 @@ from carbonsight_core.config import Config
 
 CACHE_TTL_SECONDS = 15 * 60  # 15 minutes
 
-# AWS Service Quotas codes for each GPU instance family.
+# AWS Service Quotas codes (vCPU quotas) per GPU family, for on-demand and spot launches.
 # Find yours: aws service-quotas list-service-quotas --service-code ec2
-# These are the "Running On-Demand <family>" vCPU quotas.
-_GPU_QUOTA_CODES: dict[str, str] = {
-    "A100": "L-3819A6DF",  # p4d (A100 40GB) and p4de (A100 80GB)
-    "H100": "L-B2E278C4",  # p5 (H100 SXM5)
-    "V100": "L-417A185B",  # p3 / p3dn
-    "T4":   "L-DB2E81BA",  # g4dn
+_ON_DEMAND_QUOTA_CODES: dict[str, str] = {
+    "T4":   "L-DB2E81BA",  # Running On-Demand G and VT instances (g4dn)
     "A10G": "L-DB2E81BA",  # g5 (same G-and-VT bucket as T4)
     "L4":   "L-DB2E81BA",  # g6
+    "A100": "L-417A185B",  # Running On-Demand P instances (p4d / p4de)
+    "V100": "L-417A185B",  # p3 / p3dn
+    "H100": "L-417A185B",  # p5
 }
-_DEFAULT_QUOTA_CODE = "L-DB2E81BA"  # G and VT — safe fallback
+_SPOT_QUOTA_CODES: dict[str, str] = {
+    "T4":   "L-3819A6DF",  # All G and VT Spot Instance Requests
+    "A10G": "L-3819A6DF",
+    "L4":   "L-3819A6DF",
+    "A100": "L-7212CCBC",  # All P Spot Instance Requests
+    "V100": "L-7212CCBC",
+    "H100": "L-7212CCBC",
+}
+_DEFAULT_ON_DEMAND_QUOTA_CODE = "L-DB2E81BA"  # G and VT - safe fallback
+_DEFAULT_SPOT_QUOTA_CODE = "L-3819A6DF"
 DEFAULT_QUOTA_SERVICE_CODE = "ec2"
 
 
@@ -50,9 +58,11 @@ class QuotaChecker(BaseAWSProvider):
         super().__init__(config, cache_ttl_seconds=cache_ttl_seconds)
 
     @staticmethod
-    def quota_code_for_gpu(gpu_type: str) -> str:
-        """Return the AWS Service Quotas code for the given GPU type."""
-        return _GPU_QUOTA_CODES.get(gpu_type.upper(), _DEFAULT_QUOTA_CODE)
+    def quota_code_for_gpu(gpu_type: str, *, use_spot: bool = False) -> str:
+        """Return the AWS Service Quotas code for the GPU type (spot or on-demand family)."""
+        if use_spot:
+            return _SPOT_QUOTA_CODES.get(gpu_type.upper(), _DEFAULT_SPOT_QUOTA_CODE)
+        return _ON_DEMAND_QUOTA_CODES.get(gpu_type.upper(), _DEFAULT_ON_DEMAND_QUOTA_CODE)
 
     def check_gpu_quota(
         self,
@@ -61,6 +71,7 @@ class QuotaChecker(BaseAWSProvider):
         *,
         gpu_type: str = "T4",
         service_code: str = DEFAULT_QUOTA_SERVICE_CODE,
+        use_spot: bool = False,
     ) -> QuotaResult:
         """
         Return QuotaResult: allowed=True if current vCPU quota >= requested_gpus.
@@ -68,7 +79,7 @@ class QuotaChecker(BaseAWSProvider):
         for the purpose of a go/no-go preflight (conservative).
         Fails open: if boto3 is missing or the API errors, region is allowed.
         """
-        quota_code = self.quota_code_for_gpu(gpu_type)
+        quota_code = self.quota_code_for_gpu(gpu_type, use_spot=use_spot)
 
         if not HAS_BOTO:
             return QuotaResult(
@@ -83,7 +94,7 @@ class QuotaChecker(BaseAWSProvider):
             return QuotaResult(
                 region=region, allowed=allowed, current_quota=cached,
                 requested=requested_gpus, quota_code=quota_code,
-                reason="" if allowed else f"quota {cached} < requested {requested_gpus} (cached)",
+                reason="" if allowed else f"quota {cached} < requested {requested_gpus} ({quota_code}, cached)",
             )
 
         try:
@@ -95,7 +106,7 @@ class QuotaChecker(BaseAWSProvider):
             return QuotaResult(
                 region=region, allowed=allowed, current_quota=value,
                 requested=requested_gpus, quota_code=quota_code,
-                reason="" if allowed else f"quota {value} < requested {requested_gpus}",
+                reason="" if allowed else f"quota {value} < requested {requested_gpus} ({quota_code})",
             )
         except ClientError as e:
             return QuotaResult(

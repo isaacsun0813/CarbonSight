@@ -58,6 +58,15 @@ def _time_weighted_moer(
     return weighted_sum / total_seconds
 
 
+def time_weighted_moer(
+    points: list[dict[str, Any]],
+    actual_start: datetime,
+    actual_end: datetime,
+) -> float:
+    """Public alias for time-weighted average MOER over a window (lb/MWh)."""
+    return _time_weighted_moer(points, actual_start, actual_end)
+
+
 class JobCarbonEstimator:
     """Forecast and actual CO₂ for a job using one WattTime client (token cache is per-client)."""
 

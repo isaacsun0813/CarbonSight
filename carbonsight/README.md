@@ -24,7 +24,7 @@ pip install -e ".[dev]"
 
 ## Configure (your WattTime account)
 
-Use **your own** [WattTime](https://www.watttime.org/) API credentials—copy [`.env.example`](.env.example) to `.env` or export:
+Use **your own** [WattTime](https://www.watttime.org/) API credentials—copy [`.env.example`](.env.example) to `.env` (loaded automatically from `carbonsight/` or repo root) or export:
 
 ```bash
 export WATTTIME_USERNAME=...
@@ -33,21 +33,37 @@ export WATTTIME_PASSWORD=...
 
 ## Minimal flow
 
-### Option A — YAML only
+### Option A — one task YAML (recommended)
 
-1. Write or reuse a **SkyPilot-style YAML** (`resources`, `duration`, `run:`). Example: [`../examples/skypilot/train.yaml`](../examples/skypilot/train.yaml).
-2. **Advise** — ranked regions (greenest first, optional cost ceiling):
+Write a **SkyPilot-style YAML** with optional CarbonSight planning fields. Example: [`../examples/skypilot/train.yaml`](../examples/skypilot/train.yaml).
+
+```yaml
+duration: 30m
+carbonsight:
+  finish_by: "2026-09-08T22:00:00Z"
+resources:
+  accelerators: T4:1
+run: |
+  python train.py
+```
+
+CarbonSight reads `duration` and `carbonsight.*` for estimates/planning, then **strips** those keys before SkyPilot launch. GPU power: pass `--gpu-util 0.75` or `--nvidia-smi` on the CLI (not stored in YAML).
+
+1. **Advise** — ranked regions (greenest first, optional cost ceiling):
 
    ```bash
    carbonsight advise --yaml path/to/train.yaml --json
    ```
 
-3. **Run** (optional) — pick greenest affordable region, patch YAML, call SkyPilot:
+2. **Run** — pick region, patch YAML, call SkyPilot:
 
    ```bash
-   carbonsight run path/to/train.yaml --dry-run   # see patched YAML
-   carbonsight run path/to/train.yaml --yes       # needs `sky` CLI + cloud creds
+   carbonsight run path/to/train.yaml --dry-run        # SkyPilot-ready patched YAML
+   carbonsight run path/to/train.yaml --validate-sky   # sky launch --dryrun
+   carbonsight run path/to/train.yaml --yes            # needs `sky` CLI + cloud creds
    ```
+
+   With `finish_by` in YAML (or `--finish-by`), `run` uses the **dynamic planner** for deadline-aware region/mode choice.
 
 ### Option B — `train` (no YAML hand-authoring)
 
@@ -61,7 +77,7 @@ carbonsight train path/to/train.py --launch --yes       # launch with SkyPilot
 
 Defaults: `A100:1`, `1h`, 8 CPUs, 32 GiB. Override with `--accelerators`, `--duration`, `--cpus`, `--memory`, `--name`.
 
-Optional: `--gpu-util 0.72` or `--nvidia-smi` to anchor GPU power; optional YAML block `carbonsight.gpu_utilization` when using `advise`/`run` with a file.
+Optional: `--gpu-util 0.72` or `--nvidia-smi` to anchor GPU power (see `examples/skypilot/train.yaml` comments).
 
 ## Commands
 
@@ -69,7 +85,9 @@ Optional: `--gpu-util 0.72` or `--nvidia-smi` to anchor GPU power; optional YAML
 |---------|---------|
 | `carbonsight train SCRIPT.py [--json] [--launch ...]` | Build a SkyPilot task from `python SCRIPT.py`, then same as advise or run |
 | `carbonsight advise --yaml FILE [--json] [--max-cost-premium P]` | Rank regions by CO₂ (and cost), filter expensive outliers |
-| `carbonsight run FILE [--dry-run] [--no-exec] [--skip-preflight]` | Advise + optional AWS quota check + patch YAML + `sky launch` / `sky jobs launch` |
+| `carbonsight run FILE [--dry-run] [--no-exec] [--skip-preflight]` | Advise + optional AWS preflight + patch YAML + `sky launch` / `sky jobs launch` |
+| | `--finish-by`, `--carbon-budget`, `--carbon-price` override YAML only when set; else use `carbonsight.*` in the file |
+| | `--validate-sky` (`sky launch --dryrun`), `--sky-smoke` (minimal job + `--down`) |
 | `carbonsight mappings validate [--json]` | Compare stored `wt_regions` to live `region-from-loc` (mixture-aware); exit `1` on drift; skipped without creds |
 | `carbonsight mappings refresh [--write]` | Re-resolve WattTime regions from site coords; dry-run by default |
 | `carbonsight backtest run [--json]` | Synthetic MOER/price policy experiment |
