@@ -8,6 +8,7 @@ from carbonsight_core.planning.constraints import (
     pick_best_candidate,
 )
 from carbonsight_core.planning.dynamic import (
+    DynamicJob,
     make_runtime_state,
     pick_next_state,
     plan_dynamic_job,
@@ -47,6 +48,7 @@ from carbonsight_core.planning.utility import (
 
 __all__ = [
     "DynamicEventType",
+    "DynamicJob",
     "DynamicPlanEvent",
     "DynamicPlanResult",
     "JobMode",

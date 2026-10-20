@@ -7,9 +7,12 @@ import pytest
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning import (
     DynamicEventType,
+    DynamicJob,
     JobMode,
     PlanConstraints,
     RegionPlanInput,
+    SchedulerCandidate,
+    SchedulerDecision,
     plan_dynamic_job,
 )
 
@@ -118,3 +121,62 @@ class TestPlanDynamicJob:
         result = plan_dynamic_job(job, _constraints(t0, 4.0), [])
         assert not result.deadline_met
         assert result.initial_launch is None
+
+
+class TestDynamicJob:
+    def _regions(self, t0: datetime) -> list[RegionPlanInput]:
+        return [
+            RegionPlanInput(
+                cloud_region="us-west-2",
+                watttime_regions=[("PACW", 1.0)],
+                forecast_points=_forecast(t0, [200.0] * 12),
+            ),
+        ]
+
+    def test_methods_append_to_caller_events(self) -> None:
+        t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
+        events: list = []
+        dyn = DynamicJob(job, _constraints(t0, 8.0), self._regions(t0), events)
+
+        state = dyn.make_initial_state()
+        chosen = SchedulerCandidate(
+            region="us-west-2",
+            mode=JobMode.SPOT,
+            cost_rate_usd_per_hr=1.0,
+            carbon_rate_kg_per_hr=0.1,
+            expected_lifetime_hours=4.0,
+        )
+        decision = SchedulerDecision(chosen=chosen, safety_net=False, utility=1.0, reason="test")
+        state = dyn.launch_instance(state, decision)
+        assert state.mode == JobMode.SPOT
+        assert dyn.initial_launch == chosen
+        assert dyn.checkpoint == "us-west-2"
+        assert [e.event_type for e in events] == [DynamicEventType.LAUNCH]
+
+        state = dyn.advance_work(state, tick_hours=1.0)
+        assert state.progress_hours >= job.duration_hours
+        assert events[-1].event_type == DynamicEventType.COMPLETE
+        assert dyn.events is events
+
+        result = dyn.finalize(state)
+        assert result.deadline_met
+        assert result.events is events
+
+    def test_finalize_missed_deadline(self) -> None:
+        t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=4.0)
+        dyn = DynamicJob(job, _constraints(t0, 8.0), self._regions(t0), [])
+        result = dyn.finalize(dyn.make_initial_state())
+        assert not result.deadline_met
+        assert result.events[-1].event_type == DynamicEventType.MISSED_DEADLINE
+
+    def test_wait_tick_advances_time_and_records_idle(self) -> None:
+        t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
+        dyn = DynamicJob(job, _constraints(t0, 8.0), self._regions(t0), [])
+        state = dyn.make_initial_state()
+        decision = SchedulerDecision(chosen=None, safety_net=False, utility=0.0, reason="wait")
+        state = dyn.wait_tick(state, decision, tick_hours=0.5)
+        assert state.now_utc == t0 + timedelta(hours=0.5)
+        assert dyn.events[-1].event_type == DynamicEventType.IDLE
