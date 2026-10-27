@@ -114,7 +114,23 @@ class TestPlanDynamicJob:
             regions,
             tick_hours=1.0,
         )
-        assert not result.deadline_met
+        # The work finishes in time; only the carbon budget is blown. Don't report a missed deadline.
+        assert result.deadline_met
+        assert not result.carbon_budget_met
+        assert all(e.event_type != DynamicEventType.MISSED_DEADLINE for e in result.events)
+
+    def test_carbon_budget_met_when_under_budget(self) -> None:
+        t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
+        regions = [
+            RegionPlanInput(
+                cloud_region="us-east-1",
+                watttime_regions=[("PJM_DC", 1.0)],
+                forecast_points=_forecast(t0, [5000.0] * 8),
+            ),
+        ]
+        result = plan_dynamic_job(job, _constraints(t0, 8.0, carbon_budget_kg=1e6), regions)
+        assert result.deadline_met and result.carbon_budget_met
 
     def test_empty_regions(self) -> None:
         t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)

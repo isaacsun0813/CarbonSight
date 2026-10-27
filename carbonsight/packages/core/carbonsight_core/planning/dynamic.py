@@ -661,7 +661,11 @@ class DynamicJob:
         )
 
     def finalize(self, state: JobRuntimeState) -> DynamicPlanResult:
-        """After-loop processing: missed-deadline event, carbon-budget check, result."""
+        """After-loop processing: missed-deadline event, carbon-budget check, result.
+
+        ``deadline_met`` is only about finishing the work in time; the carbon budget is reported
+        separately in ``carbon_budget_met``.
+        """
         deadline_met = state.progress_hours >= self.job.duration_hours
         if not deadline_met:
             self.events.append(
@@ -678,11 +682,11 @@ class DynamicJob:
             )
 
         budget = self.constraints.carbon_budget_kg
-        if budget is not None and state.cumulative_carbon_kg > budget:
-            deadline_met = False
+        carbon_budget_met = budget is None or state.cumulative_carbon_kg <= budget
 
         return DynamicPlanResult(
             deadline_met=deadline_met,
+            carbon_budget_met=carbon_budget_met,
             events=self.events,
             initial_launch=self.initial_launch,
             final_state=state,

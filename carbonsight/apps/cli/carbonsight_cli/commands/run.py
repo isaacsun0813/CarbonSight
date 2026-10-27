@@ -90,6 +90,8 @@ def _echo_dynamic_plan(dyn, *, title: str = "Dynamic plan (advisory simulation)"
         f"  Deadline met: {dyn.deadline_met}  "
         f"Cost: ${dyn.total_cost_usd:.2f}  Carbon: {dyn.total_carbon_kg:.2f}kg"
     )
+    if not dyn.carbon_budget_met:
+        typer.echo("  Carbon budget exceeded")
     if dyn.initial_launch:
         typer.echo(
             f"  Initial launch: {dyn.initial_launch.region} "
@@ -855,6 +857,14 @@ def _pick_region_with_dynamic_plan(
     _echo_dynamic_plan(dyn)
     if not dyn.deadline_met or dyn.initial_launch is None:
         typer.echo("Dynamic plan: no feasible launch before finish-by.", err=True)
+        raise typer.Exit(1)
+    if not dyn.carbon_budget_met:
+        typer.echo(
+            f"Dynamic plan: finishes before finish-by but estimated carbon "
+            f"{dyn.total_carbon_kg:.2f}kg exceeds the budget "
+            f"{constraints.carbon_budget_kg:.2f}kg.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     region = dyn.initial_launch.region

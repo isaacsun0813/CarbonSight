@@ -1,8 +1,11 @@
 """Dynamic event loop in ``run.py``: fake clock + fake SkyPilot runner (no real sky calls)."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+import typer
 from carbonsight_core.cloud.aws.probe import ProbeResult
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning import (
@@ -468,3 +471,20 @@ def test_execute_dynamic_run_exit_codes(monkeypatch) -> None:
         sleep=clock.sleep,
     )
     assert late == 1
+
+
+class TestBudgetVsDeadlineMessages:
+    def _call(self, budget: float | None):
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
+        constraints = _constraints(8.0)
+        constraints = replace(constraints, carbon_budget_kg=budget)
+        return run_mod._pick_region_with_dynamic_plan(
+            job, [], constraints, _regions(), effective_finish_by=T0 + timedelta(hours=8)
+        )
+
+    def test_budget_overrun_is_not_reported_as_infeasible_deadline(self, capsys) -> None:
+        with pytest.raises(typer.Exit):
+            self._call(1e-9)
+        err = capsys.readouterr().err
+        assert "exceeds the budget" in err
+        assert "no feasible launch" not in err
