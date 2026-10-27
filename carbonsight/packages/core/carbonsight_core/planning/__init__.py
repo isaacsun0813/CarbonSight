@@ -17,11 +17,13 @@ from carbonsight_core.planning.dynamic import (
 from carbonsight_core.planning.inputs import build_region_plan_inputs
 from carbonsight_core.planning.static import enumerate_candidates, plan_static_job
 from carbonsight_core.planning.survival import (
+    ASSUMED_SPOT_MEAN_LIFETIME_HOURS,
     MEAN_SPOT_LIFETIME_HOURS,
     NelsonAalenModel,
     SpotObservation,
     VirtualInstanceTracker,
     conservative_volatility,
+    replay_observations,
     volatility_ratio,
 )
 from carbonsight_core.planning.types import (
@@ -47,6 +49,7 @@ from carbonsight_core.planning.utility import (
 )
 
 __all__ = [
+    "ASSUMED_SPOT_MEAN_LIFETIME_HOURS",
     "DynamicEventType",
     "DynamicJob",
     "DynamicPlanEvent",
@@ -81,6 +84,7 @@ __all__ = [
     "plan_dynamic_job",
     "plan_static_job",
     "progress_value",
+    "replay_observations",
     "safety_net_triggered",
     "volatility_ratio",
 ]

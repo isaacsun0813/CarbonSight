@@ -13,6 +13,7 @@ from carbonsight_core.planning import (
     RegionPlanInput,
     SchedulerCandidate,
     SchedulerDecision,
+    SpotObservation,
     plan_dynamic_job,
 )
 
@@ -247,3 +248,108 @@ class TestDynamicJob:
         state = dyn.wait_tick(state, decision, tick_hours=0.5)
         assert state.now_utc == t0 + timedelta(hours=0.5)
         assert dyn.events[-1].event_type == DynamicEventType.IDLE
+
+
+class TestDynamicJobObservations:
+    T0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+
+    def _regions(self) -> list[RegionPlanInput]:
+        return [
+            RegionPlanInput(
+                cloud_region="us-west-2",
+                watttime_regions=[("PACW", 1.0)],
+                forecast_points=_forecast(self.T0, [200.0] * 24),
+            ),
+        ]
+
+    def _job(self, **kwargs) -> DynamicJob:
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=2.0)
+        return DynamicJob(job, _constraints(self.T0, 12.0), self._regions(), [], **kwargs)
+
+    def _spot_decision(self, lifetime: float = 4.0) -> SchedulerDecision:
+        chosen = SchedulerCandidate(
+            region="us-west-2",
+            mode=JobMode.SPOT,
+            cost_rate_usd_per_hr=1.0,
+            carbon_rate_kg_per_hr=0.1,
+            expected_lifetime_hours=lifetime,
+        )
+        return SchedulerDecision(chosen=chosen, safety_net=False, utility=1.0, reason="test")
+
+    def test_no_t0_seed(self) -> None:
+        dyn = self._job()
+        assert dyn.trackers["us-west-2"].observations == []
+        assert dyn.prior_sources() == {"us-west-2": "assumed default 4h (no observations)"}
+
+    def test_idle_time_does_not_shrink_predicted_lifetime(self) -> None:
+        dyn = self._job()
+        tracker = dyn.trackers["us-west-2"]
+        assert tracker.predict_lifetime_hours(self.T0) == tracker.predict_lifetime_hours(
+            self.T0 + timedelta(hours=10)
+        )
+
+    def test_launch_and_preemption_are_source_tagged(self) -> None:
+        seen: list = []
+        dyn = self._job(
+            simulate_preemption=False, on_observation=lambda region, obs: seen.append((region, obs))
+        )
+        state = dyn.launch_instance(dyn.make_initial_state(), self._spot_decision())
+        dyn.advance_work(state, tick_hours=0.5, preempted=True)
+        assert [(r, o.source, o.available) for r, o in seen] == [
+            ("us-west-2", "launch", True),
+            ("us-west-2", "preemption", False),
+        ]
+
+    def test_ondemand_launch_is_not_a_spot_observation(self) -> None:
+        seen: list = []
+        dyn = self._job(on_observation=lambda region, obs: seen.append(obs))
+        chosen = SchedulerCandidate(
+            region="us-west-2",
+            mode=JobMode.ON_DEMAND,
+            cost_rate_usd_per_hr=1.0,
+            carbon_rate_kg_per_hr=0.1,
+            expected_lifetime_hours=0.0,
+        )
+        decision = SchedulerDecision(chosen=chosen, safety_net=False, utility=1.0, reason="t")
+        dyn.launch_instance(dyn.make_initial_state(), decision)
+        assert seen == []
+
+    def test_history_is_replayed_without_repersisting(self) -> None:
+        seen: list = []
+        history = {
+            "us-west-2": [
+                SpotObservation(self.T0 - timedelta(days=1), True, "launch", "old"),
+                SpotObservation(self.T0 - timedelta(days=1) + timedelta(hours=1), False, "preemption", "old"),
+            ]
+        }
+        dyn = self._job(observations=history, on_observation=lambda r, o: seen.append(o))
+        assert seen == []
+        assert dyn.trackers["us-west-2"].model.complete_samples == [1.0]
+        assert dyn.prior_sources()["us-west-2"].startswith("history: 2 observations")
+
+    def test_lifetime_bucket_hours_is_applied(self) -> None:
+        dyn = self._job(lifetime_bucket_hours=2.0)
+        assert dyn.trackers["us-west-2"].model.bucket_hours == 2.0
+
+    def test_simulated_preemption_is_labeled(self) -> None:
+        dyn = self._job()
+        state = dyn.launch_instance(dyn.make_initial_state(), self._spot_decision(lifetime=0.5))
+        state = dyn.advance_work(state, tick_hours=1.0)
+        dyn.advance_work(state, tick_hours=1.0)
+        note = dyn.events[-1].notes
+        assert dyn.events[-1].event_type == DynamicEventType.PREEMPT
+        assert "simulated preemption" in note and "not an AWS measurement" in note
+
+    def test_plan_dynamic_job_accepts_history(self) -> None:
+        # plan_dynamic_job has no callback parameter at all, so the simulation cannot persist.
+        history = {
+            "us-west-2": [
+                SpotObservation(self.T0 - timedelta(days=1), True, "launch", "old"),
+                SpotObservation(self.T0 - timedelta(days=1, hours=-2), False, "preemption", "old"),
+            ]
+        }
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=2.0)
+        result = plan_dynamic_job(
+            job, _constraints(self.T0, 12.0), self._regions(), observations=history
+        )
+        assert result.deadline_met

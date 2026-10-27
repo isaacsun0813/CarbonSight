@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from carbonsight_core.cloud.aws.probe import ProbeResult
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning import (
     DynamicEventType,
@@ -243,6 +244,108 @@ class TestDynamicLoop:
         assert set(_types(dyn)) == {DynamicEventType.IDLE}
         assert len(dyn.events) == 3  # one per hour until the deadline
         assert out.state.progress_hours == 0.0
+
+
+class FakeProber:
+    """Scripted per-call probe results; records the clock time of each call."""
+
+    def __init__(self, clock: FakeClock, results: list[bool | None]) -> None:
+        self.clock = clock
+        self._results = list(results)
+        self.calls: list[tuple[str, datetime]] = []
+
+    def __call__(self, region: str) -> ProbeResult:
+        self.calls.append((region, self.clock.now))
+        available = self._results.pop(0) if self._results else True
+        return ProbeResult(region, "p4d.24xlarge", available, "fake")
+
+
+class WaitingJob(DynamicJob):
+    def decide(self, state):  # type: ignore[override]
+        return SchedulerDecision(chosen=None, safety_net=False, utility=0.0, reason="wait")
+
+
+class TestInlineProbes:
+    def _waiting(self, deadline_hours: float) -> DynamicJob:
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
+        return WaitingJob(
+            job, _constraints(deadline_hours), _regions(), [], simulate_preemption=False
+        )
+
+    def test_probe_interval_is_honored(self) -> None:
+        dyn = self._waiting(5.0)
+        clock = FakeClock(T0)
+        prober = FakeProber(clock, [True, False, True])
+        _loop(
+            dyn, FakeRunner([], []), clock,
+            prober=prober, probe_interval_hours=2.0, idle_tick_hours=1.0,
+        )
+        assert [c[1] for c in prober.calls] == [T0, T0 + timedelta(hours=2), T0 + timedelta(hours=4)]
+        obs = dyn.trackers[REGION].observations
+        assert [(o.available, o.source) for o in obs] == [
+            (True, "probe"), (False, "probe"), (True, "probe"),
+        ]
+        # a probe-observed 1 -> 0 transition became a virtual lifetime sample
+        assert dyn.trackers[REGION].model.complete_samples == [2.0]
+
+    def test_probes_skipped_when_interval_is_zero(self) -> None:
+        dyn = self._waiting(3.0)
+        clock = FakeClock(T0)
+        prober = FakeProber(clock, [])
+        _loop(dyn, FakeRunner([], []), clock, prober=prober, probe_interval_hours=0.0)
+        assert prober.calls == []
+        assert dyn.trackers[REGION].observations == []
+
+    def test_no_prober_means_no_probes(self) -> None:
+        dyn = self._waiting(3.0)
+        _loop(dyn, FakeRunner([], []), FakeClock(T0), probe_interval_hours=1.0)
+        assert dyn.trackers[REGION].observations == []
+
+    def test_inconclusive_results_are_not_recorded(self) -> None:
+        dyn = self._waiting(3.0)
+        clock = FakeClock(T0)
+        prober = FakeProber(clock, [None, None, None])
+        _loop(dyn, FakeRunner([], []), clock, prober=prober, probe_interval_hours=1.0)
+        assert len(prober.calls) == 3
+        assert dyn.trackers[REGION].observations == []
+
+    def test_failed_spot_launch_is_tagged_launch(self) -> None:
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
+        dyn = ScriptedJob(job, _constraints(10.0), _regions(), [], simulate_preemption=False)
+        runner = FakeRunner([False, True], [[SkyStatus.SUCCEEDED]])
+        _loop(dyn, runner, FakeClock(T0))
+        sources = [(o.source, o.available) for o in dyn.trackers[REGION].observations]
+        assert sources == [("launch", False), ("launch", True)]
+
+
+class TestLifetimePriorWiring:
+    def test_prior_line_assumed_without_history(self, capsys) -> None:
+        run_mod._echo_lifetime_prior({}, 0.25)
+        assert "assumed default 4h (no observations)" in capsys.readouterr().out
+
+    def test_load_history_and_prior_line_from_store(self, tmp_path, capsys) -> None:
+        from carbonsight_core.spot_history import SpotObservationStore, StoredObservation
+
+        db = tmp_path / "runs.db"
+        with SpotObservationStore(db) as store:
+            store.add_many(
+                [
+                    StoredObservation(T0, REGION, "p4d.24xlarge", True, "launch", "r1"),
+                    StoredObservation(
+                        T0 + timedelta(hours=3), REGION, "p4d.24xlarge", False, "preemption", "r1"
+                    ),
+                ]
+            )
+        history = run_mod._load_spot_history(db, [REGION, "eu-west-1"], "p4d.24xlarge")
+        assert len(history[REGION]) == 2 and history["eu-west-1"] == []
+        run_mod._echo_lifetime_prior(history, 0.25)
+        out = capsys.readouterr().out
+        assert "from 2 observations" in out and "1 lifetime samples" in out
+        assert run_mod._load_spot_history(db, [REGION], "") == {}
+
+    def test_bucket_follows_probe_interval(self) -> None:
+        assert run_mod._lifetime_bucket_hours(0.0) == 0.25
+        assert run_mod._lifetime_bucket_hours(2.0) == 2.0
 
 
 class TestSkyOutputParsers:

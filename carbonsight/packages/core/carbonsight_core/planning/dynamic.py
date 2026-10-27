@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
+from functools import partial
 
 from carbonsight_core.estimator.pricing import estimate_job_cost
 from carbonsight_core.models import JobSpec
-from carbonsight_core.planning.survival import VirtualInstanceTracker
+from carbonsight_core.planning.survival import (
+    DEFAULT_BUCKET_HOURS,
+    NelsonAalenModel,
+    SpotObservation,
+    VirtualInstanceTracker,
+    replay_observations,
+)
 from carbonsight_core.planning.types import (
     DynamicEventType,
     DynamicPlanEvent,
@@ -20,12 +28,12 @@ from carbonsight_core.planning.types import (
     SchedulerDecision,
 )
 from carbonsight_core.planning.utility import (
+    calc_utility,
     carbon_rate_kg_per_hr,
+    deadline_pressure,
     estimate_window_carbon_kg,
     parse_forecast_utc,
     progress_value,
-    calc_utility,
-    deadline_pressure,
 )
 
 
@@ -378,6 +386,9 @@ class DynamicJob:
         *,
         checkpoint_region: str | None = None,
         simulate_preemption: bool = True,
+        observations: Mapping[str, Sequence[SpotObservation]] | None = None,
+        on_observation: Callable[[str, SpotObservation], None] | None = None,
+        lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
     ) -> None:
         self.simulate_preemption = simulate_preemption
         self.job = job
@@ -385,16 +396,32 @@ class DynamicJob:
         self.regions = regions
         self.events = events
         self.region_map = {r.cloud_region: r for r in regions}
+        # No blanket "available at t0" seed: an untouched tracker has no observations and
+        # predicts from the labeled assumed prior until real observations arrive.
         self.trackers = {
-            r.cloud_region: VirtualInstanceTracker(region=r.cloud_region) for r in regions
+            r.cloud_region: VirtualInstanceTracker(
+                region=r.cloud_region,
+                model=NelsonAalenModel(bucket_hours=lifetime_bucket_hours),
+            )
+            for r in regions
         }
-        for tracker in self.trackers.values():
-            tracker.record_probe(constraints.now_utc, available=True)
+        history = observations or {}
+        for region, tracker in self.trackers.items():
+            replay_observations(tracker, history.get(region, ()))
+        # Attach the callback only after replay so stored history is never re-persisted.
+        # The advisory simulation leaves it unset and so never writes anything.
+        if on_observation is not None:
+            for region, tracker in self.trackers.items():
+                tracker.on_observation = partial(on_observation, region)
         self.c_od_min = _cheapest_ondemand_rate(regions, job)
         self.checkpoint = checkpoint_region or ""
         self.initial_launch: SchedulerCandidate | None = None
         self.spot_run_start: datetime | None = None
         self.spot_lifetime_budget: float = 0.0
+
+    def prior_sources(self) -> dict[str, str]:
+        """Per-region label of where the spot lifetime estimate comes from."""
+        return {region: t.prior_source() for region, t in self.trackers.items()}
 
     def make_initial_state(self) -> JobRuntimeState:
         """Idle starting state at ``constraints.now_utc``."""
@@ -414,7 +441,9 @@ class DynamicJob:
 
     def _preempt(self, state: JobRuntimeState, notes: str) -> JobRuntimeState:
         """Record a preemption and fall back to idle at the checkpoint region."""
-        self.trackers[state.region].record_probe(state.now_utc, available=False)
+        self.trackers[state.region].record_probe(
+            state.now_utc, available=False, source="preemption"
+        )
         self.events.append(
             DynamicPlanEvent(
                 time_utc=state.now_utc,
@@ -470,13 +499,17 @@ class DynamicJob:
             and state.mode == JobMode.SPOT
             and self.spot_run_start is not None
         ):
-            # if spot, check its sampled lifetime budget
+            # if spot, check the (deterministic, model-predicted) lifetime budget
             elapsed_spot = (state.now_utc - self.spot_run_start).total_seconds() / 3600.0
             run_hours = min(run_hours, max(self.spot_lifetime_budget - elapsed_spot, 0.0))
             spot_lifetime_exceeded = run_hours <= 1e-9
         if spot_lifetime_exceeded:
             # spot instance is gone: preempt, fall back to idle at the checkpoint region
-            return self._preempt(state, "spot lifetime exceeded")
+            prior = self.trackers[state.region].prior_source()
+            return self._preempt(
+                state,
+                f"simulated preemption (modeled lifetime, not an AWS measurement; prior: {prior})",
+            )
 
         run_end = state.now_utc + timedelta(hours=run_hours)
         run_cost = candidate.cost_rate_usd_per_hr * run_hours
@@ -598,8 +631,10 @@ class DynamicJob:
             )
         )
         self.checkpoint = chosen.region
-        self.trackers[chosen.region].record_probe(cold_end, available=True)
         is_spot = chosen.mode == JobMode.SPOT
+        if is_spot:
+            # Only a spot launch says anything about spot availability.
+            self.trackers[chosen.region].record_probe(cold_end, available=True, source="launch")
         self.spot_run_start = cold_end if is_spot else None
         self.spot_lifetime_budget = chosen.expected_lifetime_hours if is_spot else 0.0
         return JobRuntimeState(
@@ -650,12 +685,16 @@ def plan_dynamic_job(
     *,
     tick_hours: float = 1.0,
     checkpoint_region: str | None = None,
+    observations: Mapping[str, Sequence[SpotObservation]] | None = None,
+    lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
 ) -> DynamicPlanResult:
     """
     Simulate greedy spot + wait + Safety Net until work completes or deadline missed.
 
     Returns advisory trajectory and first launch decision for CLI integration.
     Thin driver over ``DynamicJob``; a real executor loop can drive the same methods.
+    Spot lifetimes come from ``observations`` (read-only history) or the labeled assumed
+    prior; simulated preemptions are model output, never recorded or persisted.
     """
     if not regions:
         empty = make_runtime_state(job, constraints)
@@ -668,7 +707,15 @@ def plan_dynamic_job(
             total_carbon_kg=0.0,
         )
 
-    dyn = DynamicJob(job, constraints, regions, [], checkpoint_region=checkpoint_region)
+    dyn = DynamicJob(
+        job,
+        constraints,
+        regions,
+        [],
+        checkpoint_region=checkpoint_region,
+        observations=observations,
+        lifetime_bucket_hours=lifetime_bucket_hours,
+    )
     state = dyn.make_initial_state()
 
     max_iters = int(
