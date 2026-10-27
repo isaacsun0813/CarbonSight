@@ -353,3 +353,27 @@ class TestDynamicJobObservations:
             job, _constraints(self.T0, 12.0), self._regions(), observations=history
         )
         assert result.deadline_met
+
+    def test_advisor_bands_make_hybrid_prior(self) -> None:
+        dyn = self._job(advisor_bands={"us-west-2": 4})
+        assert dyn.prior_sources() == {"us-west-2": "assumed default 4h x advisor band >20%"}
+        assert dyn.trackers["us-west-2"].prior_hazard is not None
+
+    def test_no_advisor_bands_keeps_flat_prior(self) -> None:
+        dyn = self._job()
+        assert dyn.trackers["us-west-2"].prior_hazard is None
+
+    def test_prior_refreshes_after_observed_preemption(self) -> None:
+        dyn = self._job(simulate_preemption=False, advisor_bands={"us-west-2": 4})
+        state = dyn.launch_instance(dyn.make_initial_state(), self._spot_decision())
+        state = dyn.advance_work(state, tick_hours=1.0)
+        dyn.advance_work(state, tick_hours=1.0, preempted=True)
+        dyn.decide(dyn.make_initial_state())
+        assert dyn.prior_sources()["us-west-2"].startswith("history: 1 events")
+
+    def test_plan_dynamic_job_accepts_advisor_bands(self) -> None:
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=2.0)
+        result = plan_dynamic_job(
+            job, _constraints(self.T0, 12.0), self._regions(), advisor_bands={"us-west-2": 0}
+        )
+        assert result.deadline_met

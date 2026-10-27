@@ -7,10 +7,14 @@ import pytest
 from carbonsight_core.planning.survival import (
     ASSUMED_SPOT_MEAN_LIFETIME_HOURS,
     MEAN_SPOT_LIFETIME_HOURS,
+    MIN_EVENTS_FOR_NELSON_AALEN,
     NelsonAalenModel,
     SpotObservation,
     VirtualInstanceTracker,
+    advisor_band_weights,
     conservative_volatility,
+    pooled_hazard_scale,
+    refresh_hybrid_priors,
     replay_observations,
 )
 
@@ -156,3 +160,94 @@ class TestPriorSourceAndCallback:
 
     def test_assumed_constant_alias(self) -> None:
         assert MEAN_SPOT_LIFETIME_HOURS == ASSUMED_SPOT_MEAN_LIFETIME_HOURS
+
+
+class TestHybridPrior:
+    T0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _trackers(*regions: str) -> dict[str, VirtualInstanceTracker]:
+        return {r: VirtualInstanceTracker(region=r) for r in regions}
+
+    def test_weights_normalized_to_mean_one(self) -> None:
+        weights = advisor_band_weights({"a": 0, "b": 4})
+        assert sum(weights.values()) / 2 == pytest.approx(1.0)
+        assert weights["b"] / weights["a"] == pytest.approx(10.0)  # 0.25 / 0.025
+
+    def test_same_band_everywhere_is_neutral(self) -> None:
+        assert advisor_band_weights({"a": 4, "b": 4}) == {"a": 1.0, "b": 1.0}
+
+    def test_invalid_bands_are_ignored(self) -> None:
+        assert advisor_band_weights({"a": 9, "b": -1}) == {}
+
+    def test_no_data_scale_is_assumed_default(self) -> None:
+        scale, events = pooled_hazard_scale(self._trackers("a").values())
+        assert events == 0
+        assert scale == pytest.approx(1.0 / ASSUMED_SPOT_MEAN_LIFETIME_HOURS)
+
+    def test_advisor_tilts_regions_but_keeps_mean_hazard(self) -> None:
+        trackers = self._trackers("calm", "busy")
+        refresh_hybrid_priors(trackers, {"calm": 0, "busy": 4})
+        calm = trackers["calm"].predict_lifetime_hours(self.T0)
+        busy = trackers["busy"].predict_lifetime_hours(self.T0)
+        assert calm > busy
+        # Weights average to 1, so mean hazard is still 1 / assumed mean.
+        mean_hazard = (trackers["calm"].prior_hazard + trackers["busy"].prior_hazard) / 2
+        assert mean_hazard == pytest.approx(1.0 / ASSUMED_SPOT_MEAN_LIFETIME_HOURS)
+
+    def test_equal_bands_reduce_to_assumed_default(self) -> None:
+        trackers = self._trackers("a", "b")
+        refresh_hybrid_priors(trackers, {"a": 4, "b": 4})
+        assert trackers["a"].predict_lifetime_hours(self.T0) == pytest.approx(
+            ASSUMED_SPOT_MEAN_LIFETIME_HOURS
+        )
+
+    def test_gamma_exponential_posterior(self) -> None:
+        trackers = self._trackers("a")
+        trackers["a"].model.record_complete(1.0)
+        trackers["a"].model.record_complete(3.0)
+        refresh_hybrid_priors(trackers, {"a": 4})
+        # scale = (1+2)/(1*4+4) = 0.375; posterior = (1+2)/(1/0.375 + 4)
+        expected_hazard = 3.0 / (1.0 / 0.375 + 4.0)
+        assert trackers["a"].predict_lifetime_hours(self.T0) == pytest.approx(1.0 / expected_hazard)
+
+    def test_censored_exposure_lengthens_lifetime(self) -> None:
+        plain = self._trackers("a")
+        censored = self._trackers("a")
+        censored["a"].model.record_censored(10.0)
+        refresh_hybrid_priors(plain, {"a": 4})
+        refresh_hybrid_priors(censored, {"a": 4})
+        assert censored["a"].predict_lifetime_hours(self.T0) > plain["a"].predict_lifetime_hours(
+            self.T0
+        )
+
+    def test_switches_to_nelson_aalen_at_enough_events(self) -> None:
+        hybrid = self._trackers("a")
+        plain = self._trackers("a")
+        for tracker in (hybrid["a"], plain["a"]):
+            for hours in (1.0, 2.0, 2.0, 3.0, 4.0):
+                tracker.model.record_complete(hours)
+        assert len(hybrid["a"].model.complete_samples) >= MIN_EVENTS_FOR_NELSON_AALEN
+        refresh_hybrid_priors(hybrid, {"a": 0})
+        assert hybrid["a"].predict_lifetime_hours(self.T0) == pytest.approx(
+            plain["a"].predict_lifetime_hours(self.T0)
+        )
+
+    def test_no_prior_keeps_legacy_behavior(self) -> None:
+        tracker = VirtualInstanceTracker(region="a")
+        assert tracker.prior_hazard is None
+        assert tracker.predict_lifetime_hours(self.T0) == pytest.approx(
+            NelsonAalenModel().expected_remaining_lifetime(0.0)
+        )
+
+    def test_label_tiers(self) -> None:
+        trackers = self._trackers("a", "b")
+        refresh_hybrid_priors(trackers, {"a": 1})
+        assert trackers["a"].prior_source() == "assumed default 4h x advisor band 5-10%"
+        assert trackers["b"].prior_source() == (
+            "assumed default 4h (no advisor band for this region)"
+        )
+        trackers["a"].model.record_complete(2.0)
+        refresh_hybrid_priors(trackers, {"a": 1})
+        assert trackers["a"].prior_source().startswith("history: 1 events, 2.0h exposure")
+        assert trackers["b"].prior_source().startswith("pooled history (1 events)")

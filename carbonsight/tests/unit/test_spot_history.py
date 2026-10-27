@@ -150,3 +150,44 @@ class TestAuthStub:
 
         SpotObservationStore(tmp_path / "runs.db", authenticator=Allow()).close()
         assert calls == [1]
+
+
+class TestAdvisorBandColumn:
+    def test_band_round_trips(self, tmp_path) -> None:
+        with SpotObservationStore(tmp_path / "runs.db") as store:
+            store.add(
+                StoredObservation(
+                    observed_utc=T0,
+                    region="us-west-2",
+                    instance_type="p4d.24xlarge",
+                    available=True,
+                    advisor_band=3,
+                )
+            )
+            store.add(_obs(1, False))
+            rows = store.observations("us-west-2", "p4d.24xlarge")
+        assert [r.advisor_band for r in rows] == [3, None]
+
+    def test_legacy_db_is_migrated_in_place(self, tmp_path) -> None:
+        import sqlite3
+
+        path = tmp_path / "runs.db"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE spot_observations (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "observed_utc TEXT NOT NULL, cloud TEXT NOT NULL, region TEXT NOT NULL, "
+            "instance_type TEXT NOT NULL, available INTEGER NOT NULL, source TEXT NOT NULL, "
+            "run_id TEXT, detail TEXT NOT NULL DEFAULT '')"
+        )
+        conn.execute(
+            "INSERT INTO spot_observations (observed_utc, cloud, region, instance_type, "
+            "available, source) VALUES (?, 'aws', 'us-west-2', 'p4d.24xlarge', 1, 'probe')",
+            (T0.isoformat(),),
+        )
+        conn.commit()
+        conn.close()
+        with SpotObservationStore(path) as store:
+            store.add(_obs(1, False))
+            rows = store.observations("us-west-2", "p4d.24xlarge")
+        assert [r.advisor_band for r in rows] == [None, None]
+        assert len(rows) == 2

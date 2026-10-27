@@ -12,7 +12,7 @@ placeholder assumption, not a measurement of real AWS Spot interruption behavior
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -22,6 +22,20 @@ ASSUMED_SPOT_MEAN_LIFETIME_HOURS = 4.0
 MEAN_SPOT_LIFETIME_HOURS = ASSUMED_SPOT_MEAN_LIFETIME_HOURS
 
 DEFAULT_BUCKET_HOURS = 0.25
+
+# --- Hybrid prior: advisor bands as *relative* regional weights, own data as the scale ---
+# Spot Instance Advisor "frequency of interruption" bands (trailing 30 days), band index 0..4:
+# <5%, 5-10%, 10-15%, 15-20%, >20%. The advisor's absolute units are ill-defined (and the top
+# band is open-ended), so bands are only used as relative hazard weights between regions;
+# the absolute level comes from our own observations (or the assumed placeholder).
+ADVISOR_BAND_LABELS = ("<5%", "5-10%", "10-15%", "15-20%", ">20%")
+# Midpoint of each band as -ln(1 - p); the top band uses a floor value (it has no upper bound).
+ADVISOR_BAND_WEIGHTS = (0.025, 0.075, 0.125, 0.175, 0.25)
+# Gamma-exponential prior strength in pseudo-events: small, so a few real events dominate.
+PRIOR_PSEUDO_EVENTS = 1.0
+# Once a region has this many observed preemptions, switch from the constant-hazard
+# (Gamma-exponential) estimate to the age-dependent Nelson-Aalen model.
+MIN_EVENTS_FOR_NELSON_AALEN = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +198,11 @@ class VirtualInstanceTracker:
     streak_start_utc: datetime | None = None
     # Called with each *new* observation (never for replayed history), e.g. to persist it.
     on_observation: Callable[[SpotObservation], None] | None = None
+    # Hybrid prior (set by ``refresh_hybrid_priors``): regional prior hazard per hour and the
+    # label describing where it comes from. None keeps the legacy flat assumed prior.
+    prior_hazard: float | None = None
+    prior_label: str | None = None
+    advisor_band: int | None = None
 
     def _apply(self, obs: SpotObservation) -> None:
         self.observations.append(obs)
@@ -220,13 +239,35 @@ class VirtualInstanceTracker:
             return 0.0
         return (now_utc - self.streak_start_utc).total_seconds() / 3600.0
 
+    def _exposure_hours(self, now_utc: datetime) -> float:
+        """Total virtual-instance time: closed lifetimes plus the streak still open."""
+        return (
+            sum(self.model.complete_samples)
+            + sum(self.model.censored_samples)
+            + self.current_age_hours(now_utc)
+        )
+
     def predict_lifetime_hours(self, now_utc: datetime) -> float:
         gamma_star = conservative_volatility(self.observations, self.model)
+        if (
+            self.prior_hazard is not None
+            and len(self.model.complete_samples) < MIN_EVENTS_FOR_NELSON_AALEN
+        ):
+            # Gamma-exponential: posterior hazard = (k + d) / (k / prior_hazard + exposure).
+            # Constant hazard, so the estimate is the same whatever the current age.
+            d = len(self.model.complete_samples)
+            exposure = self._exposure_hours(now_utc)
+            hazard = (PRIOR_PSEUDO_EVENTS + d) / (
+                PRIOR_PSEUDO_EVENTS / self.prior_hazard + exposure
+            )
+            return max(1.0 / (hazard * gamma_star), 0.25)
         age = self.current_age_hours(now_utc)
         return self.model.expected_remaining_lifetime(age, gamma_star=gamma_star)
 
     def prior_source(self) -> str:
         """Human-readable origin of the lifetime estimate (never implies AWS measurements)."""
+        if self.prior_label is not None:
+            return self.prior_label
         n_obs = len(self.observations)
         if self.model.n_samples:
             return (
@@ -277,3 +318,74 @@ def replay_observations(
         prev = obs
     if close_open_streak and prev is not None:
         close_streak(prev.time_utc)
+
+
+def advisor_band_weights(bands: Mapping[str, int]) -> dict[str, float]:
+    """
+    Relative hazard weight per region from advisor band indices, normalized to mean 1.
+
+    Regions without a valid band are left out (callers treat them as neutral, weight 1). When
+    every region is in the same band all weights are 1, so the advisor adds nothing.
+    """
+    raw = {
+        region: ADVISOR_BAND_WEIGHTS[band]
+        for region, band in bands.items()
+        if isinstance(band, int) and 0 <= band < len(ADVISOR_BAND_WEIGHTS)
+    }
+    if not raw:
+        return {}
+    mean = sum(raw.values()) / len(raw)
+    return {region: w / mean for region, w in raw.items()}
+
+
+def pooled_hazard_scale(trackers: Iterable[VirtualInstanceTracker]) -> tuple[float, int]:
+    """
+    Hazard level (per hour) from all regions' own samples, shrunk toward the assumed prior.
+
+    Returns ``(scale, n_events)``; with no events the scale is exactly ``1 / assumed mean``.
+    (Empirical Bayes: a region's own data also feeds this pooled level, which is fine for a
+    weak prior but means the pooled level is not independent of the regional posterior.)
+    """
+    events = 0
+    exposure = 0.0
+    for tracker in trackers:
+        events += len(tracker.model.complete_samples)
+        exposure += sum(tracker.model.complete_samples) + sum(tracker.model.censored_samples)
+    scale = (PRIOR_PSEUDO_EVENTS + events) / (
+        PRIOR_PSEUDO_EVENTS * ASSUMED_SPOT_MEAN_LIFETIME_HOURS + exposure
+    )
+    return scale, events
+
+
+def refresh_hybrid_priors(
+    trackers: Mapping[str, VirtualInstanceTracker],
+    advisor_bands: Mapping[str, int],
+) -> None:
+    """
+    Set each tracker's regional prior hazard: pooled own-data scale x advisor weight.
+
+    Cheap, so callers may re-run it as observations arrive. The advisor only tilts the prior
+    between regions; it never sets an absolute number of hours.
+    """
+    weights = advisor_band_weights(advisor_bands)
+    scale, pooled_events = pooled_hazard_scale(trackers.values())
+    for region, tracker in trackers.items():
+        weight = weights.get(region, 1.0)
+        band = advisor_bands.get(region)
+        tracker.advisor_band = band if region in weights else None
+        tracker.prior_hazard = scale * weight
+        band_text = (
+            f" x advisor band {ADVISOR_BAND_LABELS[tracker.advisor_band]}"
+            if tracker.advisor_band is not None
+            else " (no advisor band for this region)"
+        )
+        own = len(tracker.model.complete_samples)
+        if own:
+            exposure = sum(tracker.model.complete_samples) + sum(tracker.model.censored_samples)
+            tracker.prior_label = f"history: {own} events, {exposure:.1f}h exposure{band_text}"
+        elif pooled_events:
+            tracker.prior_label = f"pooled history ({pooled_events} events){band_text}"
+        else:
+            tracker.prior_label = (
+                f"assumed default {ASSUMED_SPOT_MEAN_LIFETIME_HOURS:g}h{band_text}"
+            )

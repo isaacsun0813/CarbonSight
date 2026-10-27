@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
@@ -30,6 +30,7 @@ from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.cloud.aws.gpu_catalog import aws_instance_type_for_gpu
 from carbonsight_core.cloud.aws.probe import ProbeResult, SpotLaunchProbe
 from carbonsight_core.cloud.aws.quota import QuotaChecker
+from carbonsight_core.cloud.aws.spot_advisor import SpotAdvisorError, fetch_advisor_bands
 from carbonsight_core.config import Config
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
 from carbonsight_core.estimator.pricing import configure_pricing, estimate_cost_usd
@@ -40,6 +41,7 @@ from carbonsight_core.paths import (
     resolve_registry_json_file,
 )
 from carbonsight_core.planning import (
+    ADVISOR_BAND_LABELS,
     DynamicEventType,
     DynamicJob,
     DynamicPlanEvent,
@@ -389,21 +391,82 @@ class DynamicLoopOutcome:
     segments: list[tuple[str, datetime, datetime]] = field(default_factory=list)
 
 
-def _run_probe_round(dyn: DynamicJob, prober: Prober, now: datetime) -> None:
-    """Probe every candidate region once; record only conclusive results."""
-    for region in dyn.region_map:
-        result = prober(region)
-        if result.terminate_error:
-            typer.echo(
-                f"Warning: probe instance {result.instance_id} in {region} may still be running "
-                f"({result.terminate_error}); terminate it manually.",
-                err=True,
-            )
-        if result.available is None:
-            typer.echo(f"Probe {region}: inconclusive, not recorded ({result.detail})", err=True)
-            continue
-        dyn.trackers[region].record_probe(now, available=result.available, source="probe")
-        typer.echo(f"Probe {region}: {'spot available' if result.available else 'no spot capacity'}")
+def _probe_once(prober: Prober, region: str) -> bool | None:
+    """Probe one region; True/False when conclusive, None (not recorded) otherwise."""
+    result = prober(region)
+    if result.terminate_error:
+        typer.echo(
+            f"Warning: probe instance {result.instance_id} in {region} may still be running "
+            f"({result.terminate_error}); terminate it manually.",
+            err=True,
+        )
+    if result.available is None:
+        typer.echo(f"Probe {region}: inconclusive, not recorded ({result.detail})", err=True)
+        return None
+    typer.echo(f"Probe {region}: {'spot available' if result.available else 'no spot capacity'}")
+    return result.available
+
+
+def _probe_before_plan(
+    prober: Prober,
+    regions: Sequence[str],
+    history: dict[str, list[SpotObservation]],
+    *,
+    store_path: Path,
+    instance_type: str,
+    advisor_bands: Mapping[str, int] | None,
+    now: datetime,
+) -> None:
+    """
+    One AWS probe per region, run once just before planning.
+
+    Results are appended to ``history`` (so the advisory simulation and the real loop both see
+    them) and saved to the local store with the advisor band, like any other observation.
+    """
+    store: SpotObservationStore | None = None
+    try:
+        store = SpotObservationStore(store_path)
+    except (sqlite3.Error, OSError) as err:
+        typer.echo(f"Warning: spot history not persisted ({err}).", err=True)
+    try:
+        for region in regions:
+            available = _probe_once(prober, region)
+            if available is None:
+                continue
+            obs = SpotObservation(now, available, "probe")
+            history.setdefault(region, []).append(obs)
+            if store is not None:
+                try:
+                    store.add(
+                        StoredObservation(
+                            observed_utc=now,
+                            region=region,
+                            instance_type=instance_type,
+                            available=available,
+                            source="probe",
+                            advisor_band=(advisor_bands or {}).get(region),
+                        )
+                    )
+                except sqlite3.Error as err:
+                    typer.echo(f"Warning: probe not persisted ({err}).", err=True)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _make_prober(config: Config, gpu_type: str, instance_type: str) -> Prober | None:
+    """Launch-then-terminate spot probe for the catalog instance type, or None if unknown."""
+    if not instance_type:
+        typer.echo(
+            f"Warning: no EC2 instance type known for {gpu_type!r}; probing disabled.", err=True
+        )
+        return None
+    spot_probe = SpotLaunchProbe(config)
+    typer.echo(
+        f"Probing spot capacity by launching {instance_type} and terminating it immediately. "
+        "This bills real instances and needs vCPU quota."
+    )
+    return lambda probe_region: spot_probe.probe(probe_region, gpu_type)
 
 
 def _run_dynamic_loop(
@@ -417,16 +480,12 @@ def _run_dynamic_loop(
     idle_tick_hours: float,
     max_launch_failures: int = 5,
     max_unknown_polls: int = 10,
-    prober: Prober | None = None,
-    probe_interval_hours: float = 0.0,
 ) -> DynamicLoopOutcome:
     """
     Time-constrained loop that routes each iteration to the matching ``DynamicJob`` method.
 
     All scheduling decisions stay in ``DynamicJob``; this function only observes the clock and
-    the cluster (via ``runner``) and performs the launch/teardown side effects. With a
-    ``prober`` and ``probe_interval_hours > 0`` it also runs launch-then-terminate spot probes
-    inline every interval (the first one immediately); results feed the lifetime history.
+    the cluster (via ``runner``) and performs the launch/teardown side effects.
     """
     job = dyn.job
     deadline = dyn.constraints.deadline_utc
@@ -435,18 +494,12 @@ def _run_dynamic_loop(
     seg_start: datetime | None = None
     launch_failures = 0
     unknown_polls = 0
-    next_probe_at: datetime | None = None
 
     try:
         while state.progress_hours < job.duration_hours:
             now = clock()
             if now >= deadline:
                 break
-
-            if prober is not None and probe_interval_hours > 0:
-                if next_probe_at is None or now >= next_probe_at:
-                    _run_probe_round(dyn, prober, now)
-                    next_probe_at = now + timedelta(hours=probe_interval_hours)
 
             if state.mode != JobMode.IDLE:
                 assert handle is not None
@@ -588,14 +641,13 @@ def _execute_dynamic_run(
     sleep: Sleep,
     observations: Mapping[str, Sequence[SpotObservation]] | None = None,
     on_observation: Callable[[str, SpotObservation], None] | None = None,
-    prober: Prober | None = None,
-    probe_interval_hours: float = 0.0,
+    advisor_bands: Mapping[str, int] | None = None,
 ) -> int:
     """Run the dynamic loop against a real cluster. Returns a process exit code."""
     t0 = clock()  # time snapshot: constraints and DynamicJob are anchored here
     constraints = replace(constraints, now_utc=t0)
     events: list[DynamicPlanEvent] = []
-    bucket_hours = _lifetime_bucket_hours(probe_interval_hours)
+    bucket_hours = DEFAULT_BUCKET_HOURS
     dyn = DynamicJob(
         job,
         constraints,
@@ -605,6 +657,7 @@ def _execute_dynamic_run(
         observations=observations,
         on_observation=on_observation,
         lifetime_bucket_hours=bucket_hours,
+        advisor_bands=advisor_bands,
     )
     state = dyn.make_initial_state()
 
@@ -612,7 +665,7 @@ def _execute_dynamic_run(
         f"\nDynamic run: deadline {constraints.deadline_utc.isoformat()}, "
         f"polling every {poll_seconds:g}s, idle tick {idle_tick_hours:g}h."
     )
-    _echo_lifetime_prior(observations, bucket_hours)
+    _echo_lifetime_prior(observations, bucket_hours, advisor_bands)
     outcome = _run_dynamic_loop(
         dyn,
         state,
@@ -621,8 +674,6 @@ def _execute_dynamic_run(
         sleep=sleep,
         poll_seconds=poll_seconds,
         idle_tick_hours=idle_tick_hours,
-        prober=prober,
-        probe_interval_hours=probe_interval_hours,
     )
     result = dyn.finalize(outcome.state)
     _echo_dynamic_plan(result, title="Dynamic run (events; cost/carbon are estimates)")
@@ -664,11 +715,6 @@ def _resolve_db_path(db_opt: Path | None) -> Path:
     return Path.home() / ".carbonsight" / "runs.db"
 
 
-def _lifetime_bucket_hours(probe_interval_hours: float) -> float:
-    """A lifetime is only known to within the gap between probes, so bucket at that gap."""
-    return probe_interval_hours if probe_interval_hours > 0 else DEFAULT_BUCKET_HOURS
-
-
 def _load_spot_history(
     db_path: Path,
     regions: Sequence[str],
@@ -685,9 +731,32 @@ def _load_spot_history(
         return {}
 
 
+def _load_advisor_bands(instance_type: str, regions: Sequence[str]) -> dict[str, int] | None:
+    """
+    Spot Advisor bands for the candidate regions, or None (fail open) if unavailable.
+
+    The advisor JSON is undocumented and coarse, so it only tilts the lifetime prior between
+    regions (relative weights); it never sets an absolute number of hours.
+    """
+    if not instance_type:
+        return None
+    try:
+        bands = fetch_advisor_bands(instance_type, regions)
+    except SpotAdvisorError as err:
+        typer.echo(f"Warning: spot advisor unavailable ({err}); using the flat assumed prior.", err=True)
+        return None
+    shown = ", ".join(f"{r} {ADVISOR_BAND_LABELS[b]}" for r, b in sorted(bands.items())) or "none listed"
+    typer.echo(
+        f"Spot advisor bands for {instance_type} (trailing 30 days; used only as relative "
+        f"regional weights, not hours): {shown}"
+    )
+    return bands
+
+
 def _echo_lifetime_prior(
     observations: Mapping[str, Sequence[SpotObservation]] | None,
     bucket_hours: float,
+    advisor_bands: Mapping[str, int] | None = None,
 ) -> None:
     """One line saying where the spot lifetime estimate comes from."""
     trackers: list[VirtualInstanceTracker] = []
@@ -711,6 +780,8 @@ def _echo_lifetime_prior(
         )
     else:
         detail = f"assumed default {ASSUMED_SPOT_MEAN_LIFETIME_HOURS:g}h (no observations)"
+    if advisor_bands is not None:
+        detail += "; regional prior scaled by advisor band"
     typer.echo(f"Spot lifetime prior: {detail}")
 
 
@@ -769,15 +840,17 @@ def _pick_region_with_dynamic_plan(
     effective_finish_by: datetime,
     observations: Mapping[str, Sequence[SpotObservation]] | None = None,
     lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
+    advisor_bands: Mapping[str, int] | None = None,
 ) -> tuple[str, bool, EstimateResult, DynamicPlanResult]:
     # Same read-only history as the real loop; the simulation never persists anything.
-    _echo_lifetime_prior(observations, lifetime_bucket_hours)
+    _echo_lifetime_prior(observations, lifetime_bucket_hours, advisor_bands)
     dyn = plan_dynamic_job(
         job,
         constraints,
         region_inputs,
         observations=observations,
         lifetime_bucket_hours=lifetime_bucket_hours,
+        advisor_bands=advisor_bands,
     )
     _echo_dynamic_plan(dyn)
     if not dyn.deadline_met or dyn.initial_launch is None:
@@ -881,7 +954,7 @@ def run_launch(
     idle_tick_hours: float = 1.0,
     clock: Clock | None = None,
     sleep: Sleep | None = None,
-    probe_interval_hours: float = 0.0,
+    probe_before_plan: bool = True,
 ) -> None:
     """Shared implementation for ``run`` and ``train``.
 
@@ -890,9 +963,6 @@ def run_launch(
     """
     if poll_seconds <= 0 or idle_tick_hours <= 0:
         typer.echo("Error: --poll-seconds and --idle-tick-hours must be positive.", err=True)
-        raise typer.Exit(1)
-    if probe_interval_hours < 0:
-        typer.echo("Error: --probe-interval-hours must be >= 0.", err=True)
         raise typer.Exit(1)
 
     if not yaml_path.exists():
@@ -987,7 +1057,9 @@ def run_launch(
     best: EstimateResult
     spot_instance_type = aws_instance_type_for_gpu(job.gpu_type) or ""
     spot_history: dict[str, list[SpotObservation]] = {}
-    bucket_hours = _lifetime_bucket_hours(probe_interval_hours)
+    bucket_hours = DEFAULT_BUCKET_HOURS
+    advisor_bands: dict[str, int] | None = None
+    prober: Prober | None = None
 
     if effective_finish_by is not None:
         _echo_finish_by_source(effective_finish_by, finish_by)
@@ -1002,11 +1074,25 @@ def run_launch(
             effective_carbon_price=effective_carbon_price,
             max_cost_premium=max_cost_premium,
         )
+        candidate_regions = [r.cloud_region for r in region_inputs]
         spot_history = _load_spot_history(
-            _resolve_db_path(db_path),
-            [r.cloud_region for r in region_inputs],
-            spot_instance_type,
+            _resolve_db_path(db_path), candidate_regions, spot_instance_type,
         )
+        advisor_bands = _load_advisor_bands(spot_instance_type, candidate_regions)
+        # Real AWS probes only when this run will actually launch (not dry-run/validate/smoke).
+        launching = not (dry_run or no_exec or validate_sky or sky_smoke)
+        if launching and probe_before_plan:
+            prober = _make_prober(config, job.gpu_type, spot_instance_type)
+        if prober is not None:
+            _probe_before_plan(
+                prober,
+                candidate_regions,
+                spot_history,
+                store_path=_resolve_db_path(db_path),
+                instance_type=spot_instance_type,
+                advisor_bands=advisor_bands,
+                now=datetime.now(UTC),
+            )
         region, use_spot, best, _dyn = _pick_region_with_dynamic_plan(
             job,
             estimates,
@@ -1015,6 +1101,7 @@ def run_launch(
             effective_finish_by=effective_finish_by,
             observations=spot_history,
             lifetime_bucket_hours=bucket_hours,
+            advisor_bands=advisor_bands,
         )
     else:
         cloud, region, best = _pick_static_region(estimates, max_cost_premium)
@@ -1139,27 +1226,6 @@ def run_launch(
             run_id=rec.run_id,
             yes=yes,
         )
-        prober: Prober | None = None
-        if probe_interval_hours > 0:
-            if not spot_instance_type:
-                typer.echo(
-                    f"Warning: no EC2 instance type known for {job.gpu_type!r}; probing disabled.",
-                    err=True,
-                )
-            else:
-                spot_probe = SpotLaunchProbe(config)
-
-                def _probe_region(probe_region: str) -> ProbeResult:
-                    return spot_probe.probe(probe_region, job.gpu_type)
-
-                prober = _probe_region
-
-                typer.echo(
-                    f"Probing spot capacity every {probe_interval_hours:g}h per region by launching "
-                    f"{spot_instance_type} and terminating it immediately. This bills real "
-                    "instances and needs vCPU quota."
-                )
-
         observation_store: SpotObservationStore | None = None
         try:
             if spot_instance_type:
@@ -1182,6 +1248,7 @@ def run_launch(
                             available=obs.available,
                             source=obs.source,
                             run_id=rec.run_id,
+                            advisor_band=(advisor_bands or {}).get(obs_region),
                         )
                     )
                 except sqlite3.Error as err:
@@ -1199,8 +1266,7 @@ def run_launch(
                 sleep=sleep or time.sleep,
                 observations=spot_history,
                 on_observation=_persist_observation,
-                prober=prober,
-                probe_interval_hours=probe_interval_hours,
+                advisor_bands=advisor_bands,
             )
         finally:
             if observation_store is not None:
@@ -1338,13 +1404,13 @@ def run_cmd(
         "--idle-tick-hours",
         help="With a finish-by deadline: hours to wait between decisions while waiting for a better launch window.",
     ),
-    probe_interval_hours: float = typer.Option(
-        0.0,
-        "--probe-interval-hours",
+    probe_before_plan: bool = typer.Option(
+        True,
+        "--probe/--no-probe",
         help=(
-            "With a finish-by deadline: every N hours launch one spot instance per candidate "
-            "region and terminate it immediately to record availability (0 = off). COST: "
-            "successful probes bill real GPU instances and need vCPU quota."
+            "With a finish-by deadline: once, just before planning, launch one spot instance per "
+            "candidate region and terminate it immediately; results feed the lifetime prior. "
+            "COST: successful probes bill real GPU instances and need vCPU quota."
         ),
     ),
 ) -> None:
@@ -1376,5 +1442,5 @@ def run_cmd(
         sky_smoke=sky_smoke,
         poll_seconds=poll_seconds,
         idle_tick_hours=idle_tick_hours,
-        probe_interval_hours=probe_interval_hours,
+        probe_before_plan=probe_before_plan,
     )

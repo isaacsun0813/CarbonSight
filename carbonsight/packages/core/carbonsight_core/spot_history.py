@@ -58,6 +58,9 @@ class StoredObservation:
     run_id: str | None = None
     detail: str = ""
     cloud: str = "aws"
+    # Spot Advisor band index (0 = <5% ... 4 = >20%) at observation time, kept so we can later
+    # check whether the advisor actually predicts our observed lifetimes.
+    advisor_band: int | None = None
 
     def to_observation(self) -> SpotObservation:
         return SpotObservation(self.observed_utc, self.available, self.source, self.run_id)
@@ -97,7 +100,8 @@ CREATE TABLE IF NOT EXISTS spot_observations (
     available INTEGER NOT NULL,
     source TEXT NOT NULL,
     run_id TEXT,
-    detail TEXT NOT NULL DEFAULT ''
+    detail TEXT NOT NULL DEFAULT '',
+    advisor_band INTEGER
 )"""
 
 _CREATE_INDEX = """\
@@ -106,8 +110,8 @@ ON spot_observations (region, instance_type, observed_utc)"""
 
 _INSERT = """\
 INSERT INTO spot_observations (
-    observed_utc, cloud, region, instance_type, available, source, run_id, detail
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"""
+    observed_utc, cloud, region, instance_type, available, source, run_id, detail, advisor_band
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
 
 def _to_iso(value: datetime) -> str:
@@ -140,8 +144,15 @@ class SpotObservationStore:
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute(_CREATE_TABLE)
+        self._migrate()
         self._conn.execute(_CREATE_INDEX)
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first release to an existing table."""
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(spot_observations)")}
+        if "advisor_band" not in columns:
+            self._conn.execute("ALTER TABLE spot_observations ADD COLUMN advisor_band INTEGER")
 
     # -- writes ---------------------------------------------------------------
 
@@ -156,6 +167,7 @@ class SpotObservationStore:
             obs.source,
             obs.run_id,
             obs.detail,
+            obs.advisor_band,
         )
 
     def add(self, obs: StoredObservation) -> None:
@@ -176,7 +188,8 @@ class SpotObservationStore:
         since: datetime | None = None,
     ) -> list[StoredObservation]:
         sql = (
-            "SELECT observed_utc, cloud, region, instance_type, available, source, run_id, detail "
+            "SELECT observed_utc, cloud, region, instance_type, available, source, run_id, detail, "
+            "advisor_band "
             "FROM spot_observations WHERE region = ? AND instance_type = ?"
         )
         params: list[object] = [region, instance_type]
@@ -194,6 +207,7 @@ class SpotObservationStore:
                 source=r[5],
                 run_id=r[6],
                 detail=r[7],
+                advisor_band=r[8],
             )
             for r in self._conn.execute(sql, params).fetchall()
         ]

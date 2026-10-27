@@ -14,6 +14,7 @@ from carbonsight_core.planning.survival import (
     NelsonAalenModel,
     SpotObservation,
     VirtualInstanceTracker,
+    refresh_hybrid_priors,
     replay_observations,
 )
 from carbonsight_core.planning.types import (
@@ -389,8 +390,12 @@ class DynamicJob:
         observations: Mapping[str, Sequence[SpotObservation]] | None = None,
         on_observation: Callable[[str, SpotObservation], None] | None = None,
         lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
+        advisor_bands: Mapping[str, int] | None = None,
     ) -> None:
         self.simulate_preemption = simulate_preemption
+        # Spot Advisor band index per region (relative weights only). None = no advisor data:
+        # the legacy flat assumed prior is used.
+        self.advisor_bands = advisor_bands
         self.job = job
         self.constraints = constraints
         self.regions = regions
@@ -418,6 +423,12 @@ class DynamicJob:
         self.initial_launch: SchedulerCandidate | None = None
         self.spot_run_start: datetime | None = None
         self.spot_lifetime_budget: float = 0.0
+        self._refresh_priors()
+
+    def _refresh_priors(self) -> None:
+        """Recompute hybrid regional priors from the observations seen so far (cheap)."""
+        if self.advisor_bands is not None:
+            refresh_hybrid_priors(self.trackers, self.advisor_bands)
 
     def prior_sources(self) -> dict[str, str]:
         """Per-region label of where the spot lifetime estimate comes from."""
@@ -429,6 +440,7 @@ class DynamicJob:
 
     def decide(self, state: JobRuntimeState) -> SchedulerDecision:
         """One scheduling decision over all (region, mode) candidates."""
+        self._refresh_priors()
         candidates = _build_scheduler_candidates(
             self.job,
             self.constraints,
@@ -477,6 +489,7 @@ class DynamicJob:
         job = self.job
         if preempted:
             return self._preempt(state, "spot preempted (observed)")
+        self._refresh_priors()
         remaining = job.duration_hours - state.progress_hours
         region_input = self.region_map[state.region]
         candidate = _scheduler_candidate_for_region(
@@ -687,6 +700,7 @@ def plan_dynamic_job(
     checkpoint_region: str | None = None,
     observations: Mapping[str, Sequence[SpotObservation]] | None = None,
     lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
+    advisor_bands: Mapping[str, int] | None = None,
 ) -> DynamicPlanResult:
     """
     Simulate greedy spot + wait + Safety Net until work completes or deadline missed.
@@ -715,6 +729,7 @@ def plan_dynamic_job(
         checkpoint_region=checkpoint_region,
         observations=observations,
         lifetime_bucket_hours=lifetime_bucket_hours,
+        advisor_bands=advisor_bands,
     )
     state = dyn.make_initial_state()
 
