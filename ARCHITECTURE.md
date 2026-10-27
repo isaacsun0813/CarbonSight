@@ -23,7 +23,7 @@ carbonsight/
   packages/core/carbonsight_core/   # Brain — WattTime, registry, math, cloud adapters
     cloud/                      # Provider Protocols; AWS base, GPU catalog, live pricing, preflight
   tests/
-  infra/                        # SQL schemas; Postgres not fully wired yet
+  infra/                        # SQL schemas; Postgres not fully wired yet (spot history uses local SQLite, not Postgres)
 ```
 
 Rule I use: if it’s **domain logic** (how CO₂ is computed, how WattTime is called), it goes in **`carbonsight_core`**. If it’s **parsing flags, printing tables, or HTTP**, it’s **`cli`** or **`api`**. Keeps the core testable without spinning up a server.
@@ -41,7 +41,7 @@ Flow that’s in my head:
 - **Power model** answers: *how many watts is this job probably drawing?* (we don’t know utilization, so we randomize — more on that below)
 - **carbon_model** multiplies energy × MOER, converts units, runs Monte Carlo for a range
 
-Optional: **boto** checks account-enabled regions (`describe_regions`), GPU quotas, and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Live spot/on-demand pricing and preflight (quota, availability, enabled-regions) share **`BaseAWSProvider`** (`cloud/aws/base.py`) for session/client setup. Offerings use `ec2:DescribeInstanceTypeOfferings`; enabled regions use one `ec2:DescribeRegions` intersected with the registry (run preflight only). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
+Optional: **boto** checks account-enabled regions (`describe_regions`), GPU quotas (spot or on-demand quota family matching the launch), and **instance type offerings** before `run` so we don’t recommend a region you can’t launch in. Live spot/on-demand pricing and preflight (quota, availability, enabled-regions) share **`BaseAWSProvider`** (`cloud/aws/base.py`) for session/client setup. Offerings use `ec2:DescribeInstanceTypeOfferings`; enabled regions use one `ec2:DescribeRegions` intersected with the registry (run preflight only). **SkyPilot** is what actually provisions the box and runs the `run:` block — we just shell out to `sky launch` / `sky jobs launch` with a patched YAML.
 
 ---
 
@@ -93,7 +93,11 @@ Example: [`examples/skypilot/train.yaml`](../examples/skypilot/train.yaml).
 
 ### Dynamic planner (`finish_by`)
 
-When `carbonsight.finish_by` is set (or `--finish-by`), `run` uses **`planning/plan_dynamic_job`**: simulates greedy spot + idle/wait + Safety Net on-demand fallback against the deadline, then launches in the recommended **initial** region/mode. Advisory only — SkyPilot still handles real spot preemption at runtime.
+When `carbonsight.finish_by` is set (or `--finish-by`), `run` first prints an advisory simulation (**`planning/plan_dynamic_job`**: greedy spot + idle/wait + Safety Net on-demand fallback against the deadline). A real launch then runs a **monitored event loop** in `run.py` driving **`planning/DynamicJob`**: it launches the chosen region/mode with unmanaged, detached `sky launch`, polls the job (`--poll-seconds`), and after an observed preemption or failed launch re-decides and relaunches (checkpoint resume via the existing shim). Waiting for a greener window uses `--idle-tick-hours`. Cost and carbon in the printed trajectory are estimates; a job still running at the deadline is left up (the CLI prints `sky down <cluster>`). `--dry-run`, `--no-exec`, `--validate-sky` and `--sky-smoke` do not start the loop.
+
+**Spot lifetime prior (honesty).** The planner needs an expected spot lifetime per region. With no recorded observations it uses a flat **assumed** prior (`ASSUMED_SPOT_MEAN_LIFETIME_HOURS`, 4h) — a placeholder, **not** AWS data — and both the advisory simulation and the loop print `Spot lifetime prior: assumed default 4h (no observations)`. Preemptions in the advisory simulation are labeled "simulated preemption" and are never recorded. Real observations accumulate in a local SQLite table (`spot_observations`, default `~/.carbonsight/runs.db`, override `--db` / `CARBONSIGHT_DB`; module `carbonsight_core/spot_history.py`, no auth beyond a stub `StoreAuthenticator`): spot launch results (`launch`), observed preemptions (`preemption`) and opt-in probes (`probe`). On the next run that history is replayed into the Nelson–Aalen model (`planning/survival.py`); a streak is closed as right-censored, not chained, when the run changes or an optional max gap is exceeded. Lifetime buckets are 0.25h by default and follow the probe interval when probing. A launch failure counts as "unavailable" even though `sky launch` can fail for non-capacity reasons (quota, auth), so treat history as rough.
+
+**Probes (`--probe-interval-hours N`, default 0 = off).** Inline in the loop, every N hours (first one immediately) `cloud/aws/probe.py` launches one Spot instance of the catalog type per candidate region and terminates it right away (the SkyNomad paper's availability probe). **It bills real GPU instances and needs vCPU quota**; it needs `ec2:RunInstances`/`TerminateInstances` and `ssm:GetParameter`, and uses the default VPC. Only conclusive results are recorded (capacity error = unavailable; quota, auth or throttling errors are logged and skipped). A probe only says capacity existed at that moment, not how long an instance would live. `spot_placement_score_request` in `cloud/aws/gpu_catalog.py` is an unused static request map for a future Spot placement score signal (a 1–10 hint, not a guarantee or lifetime measure). Error codes and AMI/VPC assumptions in the probe have not been verified on a real account.
 
 Without `finish_by`, `run` uses the static greenest-region ranking (and optional `--max-delay` start-time advice).
 

@@ -160,7 +160,7 @@ In each phase below, **Testing** describes only **E2E scenarios** and how they u
 
 | Task | Details |
 |------|--------|
-| **7.1** Postgres schema | Create tables: cloud_region, cloud_site, grid_mapping, run, grid_signal_cache (optional). Add `infra/migrations` (e.g. raw SQL or Alembic). |
+| **7.1** Postgres schema | Create tables: cloud_region, cloud_site, grid_mapping, run, grid_signal_cache (optional). Add `infra/migrations` (e.g. raw SQL or Alembic). *Note:* spot observation history (`spot_observations`) is intentionally local SQLite (`carbonsight_core/spot_history.py`), not part of this Postgres schema. |
 | **7.2** API endpoints | POST /v1/recommendations (body: job spec or YAML ref) → ranked list. POST /v1/runs → record run, return run_id. GET /v1/runs/{id} → status + estimates. GET /v1/regions → cloud regions + mapping confidence. POST /v1/mappings/revalidate → trigger drift job (async or sync). |
 | **7.3** Docker | docker-compose: api (FastAPI + Uvicorn), db (Postgres). Optional worker for revalidation. CLI can run on host with env/secrets. |
 
