@@ -45,6 +45,62 @@ Optional: **boto** checks account-enabled regions (`describe_regions`), GPU quot
 
 ---
 
+## Target system: observations, decisions, and execution
+
+This diagram describes the intended system. Solid arrows show the main data flow; dashed arrows mark feedback paths still to build. Orange marks **INPUTS**, blue marks observation and estimation, purple marks planning, green marks execution, and yellow marks validation that is not yet implemented.
+
+```mermaid
+flowchart TD
+    Inputs["INPUTS<br/>Job + GPU requirements + expected duration<br/>Deadline + cost/carbon constraints"] --> State
+
+    subgraph Learn["Observe and learn spot behavior"]
+        Probes["Availability probes<br/>Current: once before planning<br/>Target: periodic observations"] --> History
+        Events["Launch results + AWS interruptions<br/>Voluntary stops recorded separately"] --> History
+        History["Persistent observation history<br/>Keep source, time, and placement"] --> Model
+        Model["Survival model<br/>Estimate remaining lifetime"] --> Prediction
+        Prediction["Lifetime estimate + source<br/>Target: validated survival probabilities<br/>and uncertainty"]
+    end
+
+    subgraph Decide["Choose the next action"]
+        State["Current job state<br/>Progress + checkpoint + location"] --> Planner
+        Carbon["WattTime forecasts + grid mapping<br/>Job power model"] --> Planner
+        Price["AWS instance prices<br/>Restart + checkpoint transfer costs"] --> Planner
+        Prediction --> Planner
+        Planner["Shared decision engine<br/>Continue, wait, launch, migrate,<br/>or use on-demand fallback"]
+    end
+
+    Planner --> Execute["SkyPilot executor<br/>Perform the chosen action"]
+    Execute --> Monitor["Observe job status<br/>Progress + checkpoints + interruptions"]
+    Monitor --> State
+    Monitor --> Events
+    Monitor --> Done{"Job succeeded?"}
+    Done -->|Yes| Report["Report outcome<br/>Cost + estimated operational carbon"]
+
+    Prediction -.-> Saved["Save prediction before outcome"]
+    Saved -.-> Validation["Compare predictions with later outcomes"]
+    Monitor -.-> Validation
+    Validation -.-> Quality["Measure calibration<br/>and scheduling benefit"]
+
+    classDef inputs fill:#ffedd5,stroke:#c2410c,color:#431407,stroke-width:3px;
+    classDef evidence fill:#dbeafe,stroke:#1d4ed8,color:#172554;
+    classDef planning fill:#ede9fe,stroke:#6d28d9,color:#2e1065;
+    classDef execution fill:#dcfce7,stroke:#15803d,color:#14532d;
+    classDef future fill:#fef9c3,stroke:#a16207,color:#422006,stroke-dasharray:5 5;
+    class Inputs inputs;
+    class Probes,Events,History,Model,Prediction,Carbon,Price evidence;
+    class State,Planner planning;
+    class Execute,Monitor,Done,Report execution;
+    class Saved,Validation,Quality future;
+```
+
+**One decision engine.** Initial planning chooses the first action; dynamic scheduling calls the same decision logic with updated state. A forecast horizon is how far the planner looks ahead, not a fixed itinerary it must store or execute. The target loop refreshes inputs periodically and after meaningful events, and changes placement only when the expected benefit justifies restart and transfer overhead. The current loop only re-decides when idle; it does not migrate a healthy job or refresh forecasts during execution. Progress is elapsed runtime rather than training steps, so observed job success must remain distinct from estimated work completed.
+
+**The survival model exists; validated confidence does not yet.** `planning/survival.py` implements `NelsonAalenModel`, `VirtualInstanceTracker`, and observation replay. It integrates the conditional survival curve over actual time intervals to estimate usable hours within an explicit horizon: remaining work plus startup overhead, capped by time to the deadline. Beyond the last observed age, it assumes an exponential tail with a four-hour mean; with no lifetime samples, that assumption supplies the whole curve. Source labels report observed support, sample count, and the assumed tail. Advisor bands and volatility adjustments do not influence predictions. Unit tests in `tests/unit/test_planner_survival.py` verify numerical behavior; real-world prediction accuracy remains unvalidated. Probe-derived availability streaks are proxies for instance lifetimes, and voluntary stops provide lower bounds rather than interruption events.
+
+**Validation is a separate target.** Save each prediction, its observation time, input provenance, and placement before seeing the outcome. Compare predicted survival with later observations while accounting for incomplete lifetimes. Measure both calibration (whether predicted probabilities match observed frequencies) and completed-job cost, estimated carbon, and deadline outcomes against a simpler policy. This prediction logging and evaluation loop is not implemented yet.
+
+---
+
 ## `advise` — what I’d tell someone who’s never read the code
 
 1. Parse the YAML into a **`JobSpec`** (GPU, count, duration, cpus, memory).
@@ -95,9 +151,9 @@ Example: [`examples/skypilot/train.yaml`](../examples/skypilot/train.yaml).
 
 When `carbonsight.finish_by` is set (or `--finish-by`), `run` first prints an advisory simulation (**`planning/plan_dynamic_job`**: greedy spot + idle/wait + Safety Net on-demand fallback against the deadline). A real launch then runs a **monitored event loop** in `run.py` driving **`planning/DynamicJob`**: it launches the chosen region/mode with unmanaged, detached `sky launch`, polls the job (`--poll-seconds`), and after an observed preemption or failed launch re-decides and relaunches (checkpoint resume via the existing shim). Waiting for a greener window uses `--idle-tick-hours`. Cost and carbon in the printed trajectory are estimates; a job still running at the deadline is left up (the CLI prints `sky down <cluster>`). `--dry-run`, `--no-exec`, `--validate-sky` and `--sky-smoke` do not start the loop.
 
-**Spot lifetime prior (honesty).** The planner needs an expected spot lifetime per region. With no recorded observations it uses a flat **assumed** prior (`ASSUMED_SPOT_MEAN_LIFETIME_HOURS`, 4h) — a placeholder, **not** AWS data — and both the advisory simulation and the loop print `Spot lifetime prior: assumed default 4h (no observations)`. Preemptions in the advisory simulation are labeled "simulated preemption" and are never recorded. Real observations accumulate in a local SQLite table (`spot_observations`, default `~/.carbonsight/runs.db`, override `--db` / `CARBONSIGHT_DB`; module `carbonsight_core/spot_history.py`, no auth beyond a stub `StoreAuthenticator`): spot launch results (`launch`), observed preemptions (`preemption`) and opt-in probes (`probe`). On the next run that history is replayed into the Nelson–Aalen model (`planning/survival.py`); a streak is closed as right-censored, not chained, when the run changes or an optional max gap is exceeded. Lifetime buckets are 0.25h by default and follow the probe interval when probing. A launch failure counts as "unavailable" even though `sky launch` can fail for non-capacity reasons (quota, auth), so treat history as rough.
+**Spot usable-time estimate (honesty).** The planner scores spot options using expected usable hours within the remaining job/deadline window, rather than an unbounded predicted lifetime. History supplies a Nelson–Aalen curve through the last observed age; any later time uses an explicitly assumed exponential tail with mean `ASSUMED_SPOT_MEAN_LIFETIME_HOURS` (4h). A four-hour mean is a placeholder, **not** AWS data, and the exponential fallback does not shrink merely because the instance has aged. The advisory simulation uses the bounded estimate as a deterministic, illustrative preemption budget; those "simulated preemption" events are never recorded as observations. Real execution only records observed interruptions. Observations live in SQLite (`spot_observations`, default `~/.carbonsight/runs.db`, override `--db` / `CARBONSIGHT_DB`; module `carbonsight_core/spot_history.py`). Existing rows, including `advisor_band` metadata, remain readable, but Advisor data is not fetched for planning. A streak is censored at its last observation when runs change or an optional maximum gap is exceeded. Lifetime buckets default to 0.25h; sparse observations do not establish that precision. A failed `sky launch` can still be recorded as unavailable even for quota/auth failures, so the history is rough and the predictions are not calibrated.
 
-**Probes (`--probe-interval-hours N`, default 0 = off).** Inline in the loop, every N hours (first one immediately) `cloud/aws/probe.py` launches one Spot instance of the catalog type per candidate region and terminates it right away (the SkyNomad paper's availability probe). **It bills real GPU instances and needs vCPU quota**; it needs `ec2:RunInstances`/`TerminateInstances` and `ssm:GetParameter`, and uses the default VPC. Only conclusive results are recorded (capacity error = unavailable; quota, auth or throttling errors are logged and skipped). A probe only says capacity existed at that moment, not how long an instance would live. `spot_placement_score_request` in `cloud/aws/gpu_catalog.py` is an unused static request map for a future Spot placement score signal (a 1–10 hint, not a guarantee or lifetime measure). Error codes and AMI/VPC assumptions in the probe have not been verified on a real account.
+**Probes (`--probe/--no-probe`, default on for real deadline launches).** Once before planning, `cloud/aws/probe.py` launches one Spot instance of the catalog type per candidate region and terminates it right away. Dry-run, no-exec, validation, and smoke paths do not probe. Periodic runtime probing is a target, not current behavior. **It bills real GPU instances and needs vCPU quota**; it needs `ec2:RunInstances`/`TerminateInstances` and `ssm:GetParameter`, and uses the default VPC. Only conclusive probe results are recorded (capacity error = unavailable; quota, auth or throttling errors are logged and skipped). A probe only says capacity existed at that moment, not how long an instance would live. `spot_placement_score_request` in `cloud/aws/gpu_catalog.py` is an unused static request map for a future Spot placement score signal (a 1–10 hint, not a guarantee or lifetime measure). Error codes and AMI/VPC assumptions in the probe have not been verified on a real account.
 
 Without `finish_by`, `run` uses the static greenest-region ranking (and optional `--max-delay` start-time advice).
 

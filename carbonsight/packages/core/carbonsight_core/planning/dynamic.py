@@ -14,7 +14,6 @@ from carbonsight_core.planning.survival import (
     NelsonAalenModel,
     SpotObservation,
     VirtualInstanceTracker,
-    refresh_hybrid_priors,
     replay_observations,
 )
 from carbonsight_core.planning.types import (
@@ -89,6 +88,8 @@ def _scheduler_candidate_for_region(
     checkpoint_region: str,
     region_code: str,
     mode: JobMode,
+    *,
+    remaining_work_hours: float,
 ) -> SchedulerCandidate | None:
     """Build one scheduler candidate without enumerating all regions/modes."""
     if region.cloud_region != region_code:
@@ -100,10 +101,11 @@ def _scheduler_candidate_for_region(
     cost_rate = estimate_job_cost(
         job.gpu_type, job.gpu_count, 1.0, region.cloud_region, use_spot=use_spot,
     ).usd
+    horizon = _prediction_horizon(constraints, now_utc, remaining_work_hours)
     lifetime = (
-        trackers[region.cloud_region].predict_lifetime_hours(now_utc)
+        trackers[region.cloud_region].predict_lifetime_hours(now_utc, horizon_hours=horizon)
         if use_spot
-        else max(job.duration_hours, 1.0)
+        else horizon
     )
     return SchedulerCandidate(
         region=region.cloud_region,
@@ -113,6 +115,13 @@ def _scheduler_candidate_for_region(
         migration_usd=migration,
         expected_lifetime_hours=lifetime,
     )
+
+
+def _prediction_horizon(
+    constraints: PlanConstraints, now_utc: datetime, remaining_work_hours: float,
+) -> float:
+    remaining_time = (constraints.deadline_utc - now_utc).total_seconds() / 3600.0
+    return max(0.0, min(remaining_work_hours + constraints.cold_start_hours, remaining_time))
 
 
 def _migration_cost(
@@ -140,8 +149,11 @@ def _build_scheduler_candidates(
     trackers: dict[str, VirtualInstanceTracker],
     now_utc: datetime,
     checkpoint_region: str,
+    *,
+    remaining_work_hours: float,
 ) -> list[SchedulerCandidate]:
     candidates: list[SchedulerCandidate] = []
+    horizon = _prediction_horizon(constraints, now_utc, remaining_work_hours)
     for region in regions:
         moer = _moer_at_time(region.forecast_points, now_utc)
         carb_rate = carbon_rate_kg_per_hr(job, moer)
@@ -152,7 +164,9 @@ def _build_scheduler_candidates(
         od_cost = estimate_job_cost(
             job.gpu_type, job.gpu_count, 1.0, region.cloud_region, use_spot=False,
         ).usd
-        lifetime = trackers[region.cloud_region].predict_lifetime_hours(now_utc)
+        lifetime = trackers[region.cloud_region].predict_lifetime_hours(
+            now_utc, horizon_hours=horizon,
+        )
         candidates.append(
             SchedulerCandidate(
                 region=region.cloud_region,
@@ -170,7 +184,7 @@ def _build_scheduler_candidates(
                 cost_rate_usd_per_hr=od_cost,
                 carbon_rate_kg_per_hr=carb_rate,
                 migration_usd=migration,
-                expected_lifetime_hours=max(job.duration_hours, 1.0),
+                expected_lifetime_hours=horizon,
             )
         )
     return candidates
@@ -390,12 +404,8 @@ class DynamicJob:
         observations: Mapping[str, Sequence[SpotObservation]] | None = None,
         on_observation: Callable[[str, SpotObservation], None] | None = None,
         lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
-        advisor_bands: Mapping[str, int] | None = None,
     ) -> None:
         self.simulate_preemption = simulate_preemption
-        # Spot Advisor band index per region (relative weights only). None = no advisor data:
-        # the legacy flat assumed prior is used.
-        self.advisor_bands = advisor_bands
         self.job = job
         self.constraints = constraints
         self.regions = regions
@@ -423,12 +433,6 @@ class DynamicJob:
         self.initial_launch: SchedulerCandidate | None = None
         self.spot_run_start: datetime | None = None
         self.spot_lifetime_budget: float = 0.0
-        self._refresh_priors()
-
-    def _refresh_priors(self) -> None:
-        """Recompute hybrid regional priors from the observations seen so far (cheap)."""
-        if self.advisor_bands is not None:
-            refresh_hybrid_priors(self.trackers, self.advisor_bands)
 
     def prior_sources(self) -> dict[str, str]:
         """Per-region label of where the spot lifetime estimate comes from."""
@@ -440,7 +444,6 @@ class DynamicJob:
 
     def decide(self, state: JobRuntimeState) -> SchedulerDecision:
         """One scheduling decision over all (region, mode) candidates."""
-        self._refresh_priors()
         candidates = _build_scheduler_candidates(
             self.job,
             self.constraints,
@@ -448,6 +451,7 @@ class DynamicJob:
             self.trackers,
             state.now_utc,
             self.checkpoint,
+            remaining_work_hours=max(0.0, state.total_work_hours - state.progress_hours),
         )
         return pick_next_state(state, self.constraints, candidates, c_od_min=self.c_od_min)
 
@@ -489,7 +493,6 @@ class DynamicJob:
         job = self.job
         if preempted:
             return self._preempt(state, "spot preempted (observed)")
-        self._refresh_priors()
         remaining = job.duration_hours - state.progress_hours
         region_input = self.region_map[state.region]
         candidate = _scheduler_candidate_for_region(
@@ -501,6 +504,7 @@ class DynamicJob:
             self.checkpoint,
             state.region,
             state.mode,
+            remaining_work_hours=remaining,
         )
         if candidate is None:
             return replace(state, mode=JobMode.IDLE)
@@ -562,6 +566,7 @@ class DynamicJob:
         decision: SchedulerDecision,
         *,
         run_to_completion: bool = True,
+        observed_launch_utc: datetime | None = None,
     ) -> JobRuntimeState:
         """
         Branch B: Safety Net fired; launch on-demand.
@@ -574,7 +579,10 @@ class DynamicJob:
         if chosen is None:
             raise ValueError("fallback_to_ondemand requires decision.chosen")
         if not run_to_completion:
-            return self._launch(state, decision, event_type=DynamicEventType.SAFETY_NET)
+            return self._launch(
+                state, decision, event_type=DynamicEventType.SAFETY_NET,
+                observed_launch_utc=observed_launch_utc,
+            )
         if self.initial_launch is None:
             self.initial_launch = chosen
         region_input = self.region_map[chosen.region]
@@ -608,9 +616,14 @@ class DynamicJob:
         self,
         state: JobRuntimeState,
         decision: SchedulerDecision,
+        *,
+        observed_launch_utc: datetime | None = None,
     ) -> JobRuntimeState:
         """Branch D: launch the chosen (region, mode); state resumes after cold start."""
-        return self._launch(state, decision, event_type=DynamicEventType.LAUNCH)
+        return self._launch(
+            state, decision, event_type=DynamicEventType.LAUNCH,
+            observed_launch_utc=observed_launch_utc,
+        )
 
     def _launch(
         self,
@@ -618,6 +631,7 @@ class DynamicJob:
         decision: SchedulerDecision,
         *,
         event_type: DynamicEventType,
+        observed_launch_utc: datetime | None = None,
     ) -> JobRuntimeState:
         chosen = decision.chosen
         if chosen is None:
@@ -626,8 +640,15 @@ class DynamicJob:
         if self.initial_launch is None:
             self.initial_launch = chosen
         region_input = self.region_map[chosen.region]
-        launch_cost = chosen.migration_usd + chosen.cost_rate_usd_per_hr * constraints.cold_start_hours
-        cold_end = state.now_utc + timedelta(hours=constraints.cold_start_hours)
+        cold_end = (
+            observed_launch_utc
+            if observed_launch_utc is not None
+            else state.now_utc + timedelta(hours=constraints.cold_start_hours)
+        )
+        startup_hours = (cold_end - state.now_utc).total_seconds() / 3600.0
+        if startup_hours < 0:
+            raise ValueError("observed launch time precedes launch request")
+        launch_cost = chosen.migration_usd + chosen.cost_rate_usd_per_hr * startup_hours
         cold_carbon, _ = estimate_window_carbon_kg(
             self.job, region_input.forecast_points, state.now_utc, cold_end,
         )
@@ -687,6 +708,7 @@ class DynamicJob:
         return DynamicPlanResult(
             deadline_met=deadline_met,
             carbon_budget_met=carbon_budget_met,
+            lifetime_sources=self.prior_sources(),
             events=self.events,
             initial_launch=self.initial_launch,
             final_state=state,
@@ -704,7 +726,6 @@ def plan_dynamic_job(
     checkpoint_region: str | None = None,
     observations: Mapping[str, Sequence[SpotObservation]] | None = None,
     lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
-    advisor_bands: Mapping[str, int] | None = None,
 ) -> DynamicPlanResult:
     """
     Simulate greedy spot + wait + Safety Net until work completes or deadline missed.
@@ -733,8 +754,8 @@ def plan_dynamic_job(
         checkpoint_region=checkpoint_region,
         observations=observations,
         lifetime_bucket_hours=lifetime_bucket_hours,
-        advisor_bands=advisor_bands,
     )
+    sources = dyn.prior_sources()
     state = dyn.make_initial_state()
 
     max_iters = int(
@@ -765,7 +786,7 @@ def plan_dynamic_job(
 
         state = dyn.launch_instance(state, decision)
 
-    return dyn.finalize(state)
+    return replace(dyn.finalize(state), lifetime_sources=sources)
 
 
 def make_runtime_state(

@@ -146,6 +146,36 @@ class TestDynamicLoop:
         assert len(out.segments) == 1
         assert dyn.finalize(out.state).deadline_met
 
+    def test_early_real_preemption_uses_observed_launch_times(self) -> None:
+        clock = FakeClock(T0)
+
+        class ShortLaunchRunner(FakeRunner):
+            def launch(self, region, mode):
+                clock.sleep(60)
+                return super().launch(region, mode)
+
+        seen = []
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=2)
+        dyn = ScriptedJob(
+            job, _constraints(10, cold_start_hours=0.5), _regions(), [],
+            simulate_preemption=False, on_observation=lambda region, obs: seen.append(obs),
+        )
+        runner = ShortLaunchRunner(
+            [True, True],
+            [[SkyStatus.RUNNING, SkyStatus.PREEMPTED], [SkyStatus.SUCCEEDED]],
+        )
+        out = _loop(dyn, runner, clock, poll_seconds=60)
+
+        assert out.failed is None and out.handle is None
+        assert runner.torn_down == runner.launched
+        assert [(obs.source, obs.time_utc) for obs in seen] == [
+            ("launch", T0 + timedelta(seconds=60)),
+            ("preemption", T0 + timedelta(seconds=180)),
+            ("launch", T0 + timedelta(seconds=300)),
+        ]
+        assert dyn.trackers[REGION].model.complete_samples == [2 / 60]
+        assert dyn.events[0].time_utc == T0 + timedelta(seconds=60)
+
     def test_preempt_then_relaunch(self) -> None:
         job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=2.0)
         dyn = ScriptedJob(job, _constraints(20.0), _regions(), [], simulate_preemption=False)
@@ -178,6 +208,7 @@ class TestDynamicLoop:
 
         assert runner.launch_requests == [(REGION, JobMode.ON_DEMAND)]
         assert _types(dyn)[0] == DynamicEventType.SAFETY_NET
+        assert dyn.events[0].time_utc == T0
         assert _types(dyn)[-1] == DynamicEventType.COMPLETE
         assert len(out.segments) == 1
 
@@ -260,53 +291,15 @@ class TestLaunchObservations:
 
 
 class TestLifetimePriorWiring:
-    def test_prior_line_assumed_without_history(self, capsys) -> None:
-        run_mod._echo_lifetime_prior({}, 0.25)
-        assert "assumed default 4h (no observations)" in capsys.readouterr().out
-
-    def test_load_history_and_prior_line_from_store(self, tmp_path, capsys) -> None:
-        from carbonsight_core.spot_history import SpotObservationStore, StoredObservation
-
-        db = tmp_path / "runs.db"
-        with SpotObservationStore(db) as store:
-            store.add_many(
-                [
-                    StoredObservation(T0, REGION, "p4d.24xlarge", True, "launch", "r1"),
-                    StoredObservation(
-                        T0 + timedelta(hours=3), REGION, "p4d.24xlarge", False, "preemption", "r1"
-                    ),
-                ]
-            )
-        history = run_mod._load_spot_history(db, [REGION, "eu-west-1"], "p4d.24xlarge")
-        assert len(history[REGION]) == 2 and history["eu-west-1"] == []
-        run_mod._echo_lifetime_prior(history, 0.25)
-        out = capsys.readouterr().out
-        assert "from 2 observations" in out and "1 lifetime samples" in out
-        assert run_mod._load_spot_history(db, [REGION], "") == {}
-
-    def test_advisor_bands_printed_with_honest_label(self, monkeypatch, capsys) -> None:
-        monkeypatch.setattr(
-            run_mod, "fetch_advisor_bands", lambda itype, regions: {REGION: 4}
+    def test_prior_line_matches_shared_model_provenance(self, capsys) -> None:
+        dyn = DynamicJob(
+            JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1),
+            _constraints(10), _regions(), [],
         )
-        bands = run_mod._load_advisor_bands("p4d.24xlarge", [REGION])
-        assert bands == {REGION: 4}
+        run_mod._echo_lifetime_prior(dyn.prior_sources())
         out = capsys.readouterr().out
-        assert ">20%" in out and "relative regional weights" in out
-
-    def test_advisor_failure_fails_open(self, monkeypatch, capsys) -> None:
-        def boom(itype, regions):
-            raise run_mod.SpotAdvisorError("down")
-
-        monkeypatch.setattr(run_mod, "fetch_advisor_bands", boom)
-        assert run_mod._load_advisor_bands("p4d.24xlarge", [REGION]) is None
-        assert "spot advisor unavailable" in capsys.readouterr().err
-
-    def test_advisor_skipped_without_instance_type(self) -> None:
-        assert run_mod._load_advisor_bands("", [REGION]) is None
-
-    def test_prior_line_mentions_advisor(self, capsys) -> None:
-        run_mod._echo_lifetime_prior({}, 0.25, {REGION: 1})
-        assert "scaled by advisor band" in capsys.readouterr().out
+        assert "assumed exponential mean 4h" in out
+        assert "bounded by job/deadline horizon" in out
 
     def test_probe_before_plan_feeds_history_and_store(self, tmp_path) -> None:
         from carbonsight_core.spot_history import SpotObservationStore
@@ -326,7 +319,6 @@ class TestLifetimePriorWiring:
             history,
             store_path=db,
             instance_type="p4d.24xlarge",
-            advisor_bands={REGION: 4},
             now=T0,
         )
         assert calls == [REGION, "eu-west-1", "ap-south-1"]  # exactly one probe per region
@@ -335,7 +327,7 @@ class TestLifetimePriorWiring:
         assert history["ap-south-1"] == []  # inconclusive is not recorded
         with SpotObservationStore(db) as store:
             rows = store.observations(REGION, "p4d.24xlarge")
-            assert [(r.source, r.advisor_band) for r in rows] == [("probe", 4)]
+            assert [(r.source, r.advisor_band) for r in rows] == [("probe", None)]
             assert len(store.observations("eu-west-1", "p4d.24xlarge")) == 1
             assert store.observations("ap-south-1", "p4d.24xlarge") == []
 

@@ -1,7 +1,7 @@
 """
 Spot instance survival model (SkyNomad §4.4.1–4.4.2 barebones).
 
-Uses Nelson–Aalen hazard estimation with optional volatility adjustment.
+Uses Nelson–Aalen survival estimates over observed ages and an assumed exponential tail.
 
 Lifetimes come from *observations* we recorded ourselves (launch results, observed
 preemptions, optional launch probes). With no observations the model falls back to an
@@ -12,31 +12,16 @@ placeholder assumption, not a measurement of real AWS Spot interruption behavior
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
-# Placeholder prior used only when there are no lifetime samples. Not measured AWS data.
+# Assumed mean for unobserved lifetime ages, including the no-history case.
 ASSUMED_SPOT_MEAN_LIFETIME_HOURS = 4.0
 # Backwards-compatible alias (the dashboard heuristic uses the same placeholder).
 MEAN_SPOT_LIFETIME_HOURS = ASSUMED_SPOT_MEAN_LIFETIME_HOURS
 
 DEFAULT_BUCKET_HOURS = 0.25
-
-# --- Hybrid prior: advisor bands as *relative* regional weights, own data as the scale ---
-# Spot Instance Advisor "frequency of interruption" bands (trailing 30 days), band index 0..4:
-# <5%, 5-10%, 10-15%, 15-20%, >20%. The advisor's absolute units are ill-defined (and the top
-# band is open-ended), so bands are only used as relative hazard weights between regions;
-# the absolute level comes from our own observations (or the assumed placeholder).
-ADVISOR_BAND_LABELS = ("<5%", "5-10%", "10-15%", "15-20%", ">20%")
-# Midpoint of each band as -ln(1 - p); the top band uses a floor value (it has no upper bound).
-ADVISOR_BAND_WEIGHTS = (0.025, 0.075, 0.125, 0.175, 0.25)
-# Gamma-exponential prior strength in pseudo-events: small, so a few real events dominate.
-PRIOR_PSEUDO_EVENTS = 1.0
-# Once a region has this many observed preemptions, switch from the constant-hazard
-# (Gamma-exponential) estimate to the age-dependent Nelson-Aalen model.
-MIN_EVENTS_FOR_NELSON_AALEN = 5
-
 
 @dataclass(frozen=True, slots=True)
 class SpotObservation:
@@ -71,15 +56,21 @@ class NelsonAalenModel:
     def n_samples(self) -> int:
         return len(self.complete_samples) + len(self.censored_samples)
 
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.bucket_hours) or self.bucket_hours <= 0:
+            raise ValueError("bucket_hours must be finite and positive")
+
     def _bucket(self, hours: float) -> float:
         return _bucket(hours, self.bucket_hours)
 
     def record_complete(self, lifetime_hours: float) -> None:
+        _validate_hours(lifetime_hours)
         key = self._bucket(lifetime_hours)
         self.complete_counts[key] = self.complete_counts.get(key, 0) + 1
         self.complete_samples.append(max(lifetime_hours, 0.0))
 
     def record_censored(self, lifetime_hours: float) -> None:
+        _validate_hours(lifetime_hours)
         key = self._bucket(lifetime_hours)
         self.censored_counts[key] = self.censored_counts.get(key, 0) + 1
         self.censored_samples.append(max(lifetime_hours, 0.0))
@@ -93,99 +84,67 @@ class NelsonAalenModel:
         lifetimes = self._sorted_lifetimes()
         if not lifetimes:
             return 1.0 / ASSUMED_SPOT_MEAN_LIFETIME_HOURS
-        l = self._bucket(lifetime_hours)
-        e_l = self.complete_counts.get(l, 0)
+        event_age = self._bucket(lifetime_hours)
+        e_l = self.complete_counts.get(event_age, 0)
         n_l = sum(
             self.complete_counts.get(x, 0) + self.censored_counts.get(x, 0)
             for x in lifetimes
-            if x >= l
+            if x >= event_age
         )
         if n_l <= 0:
             return 0.0
         return e_l / n_l
 
     def cumulative_hazard(self, lifetime_hours: float) -> float:
-        """H(l) = sum of h(l_i) for l_i <= l."""
+        """Cumulative interruption hazard; unobserved ages use the assumed exponential tail."""
+        _validate_hours(lifetime_hours)
         lifetimes = self._sorted_lifetimes()
         if not lifetimes:
             return lifetime_hours / ASSUMED_SPOT_MEAN_LIFETIME_HOURS
-        total = 0.0
-        for l_i in lifetimes:
-            if l_i <= lifetime_hours:
-                total += self.hazard(l_i)
-        return total
+        measured = sum(self.hazard(age) for age in lifetimes if age <= lifetime_hours)
+        tail = max(0.0, lifetime_hours - lifetimes[-1])
+        return measured + tail / ASSUMED_SPOT_MEAN_LIFETIME_HOURS
 
-    def survival(self, lifetime_hours: float, *, gamma_star: float = 1.0) -> float:
-        """S(l) = exp(-H(l)); volatility-adjusted when gamma_star > 1."""
-        h = self.cumulative_hazard(lifetime_hours)
-        return math.exp(-gamma_star * h)
+    def survival(self, lifetime_hours: float) -> float:
+        return math.exp(-self.cumulative_hazard(lifetime_hours))
 
-    def expected_remaining_lifetime(self, age_hours: float, *, gamma_star: float = 1.0) -> float:
+    def expected_remaining_lifetime(self, age_hours: float, *, horizon_hours: float) -> float:
+        """Expected usable hours within the next horizon, conditional on survival to age.
+
+        Integrate S(age + t) / S(age) over 0 <= t <= horizon. Beyond the last observed
+        age, assume an exponential tail with the labeled placeholder mean.
         """
-        E[L - a | L > a] ≈ sum_{l_i > a} S(l_i) / S(a) on discrete grid.
-
-        Falls back to the assumed exponential prior when there are no samples.
-        """
+        _validate_hours(age_hours)
+        _validate_hours(horizon_hours)
         lifetimes = self._sorted_lifetimes()
-        if not lifetimes:
-            return max(ASSUMED_SPOT_MEAN_LIFETIME_HOURS - age_hours, 0.25)
-        age = self._bucket(age_hours)
-        s_a = self.survival(age, gamma_star=gamma_star)
-        if s_a <= 1e-12:
-            return 0.25
-        tail = [l for l in lifetimes if l > age]
-        if not tail:
-            return 0.25
-        weighted = sum(self.survival(l, gamma_star=gamma_star) for l in tail)
-        return max(weighted / s_a, 0.25)
+        support = lifetimes[-1] if lifetimes else 0.0
+        if age_hours >= support:
+            return -ASSUMED_SPOT_MEAN_LIFETIME_HOURS * math.expm1(
+                -horizon_hours / ASSUMED_SPOT_MEAN_LIFETIME_HOURS
+            )
+        end = min(age_hours + horizon_hours, support)
+        baseline = self.cumulative_hazard(age_hours)
+        start = age_hours
+        area = 0.0
+        for boundary in [t for t in lifetimes if age_hours < t < end] + [end]:
+            area += (boundary - start) * math.exp(
+                -(self.cumulative_hazard(start) - baseline)
+            )
+            start = boundary
+        tail_hours = max(0.0, horizon_hours - (end - age_hours))
+        tail_probability = math.exp(-(self.cumulative_hazard(end) - baseline))
+        return area + tail_probability * -ASSUMED_SPOT_MEAN_LIFETIME_HOURS * math.expm1(
+            -tail_hours / ASSUMED_SPOT_MEAN_LIFETIME_HOURS
+        )
+
+
+def _validate_hours(hours: float) -> None:
+    if not math.isfinite(hours) or hours < 0:
+        raise ValueError("hours must be finite and nonnegative")
 
 
 def _bucket(hours: float, bucket_hours: float = DEFAULT_BUCKET_HOURS) -> float:
-    return round(max(hours, 0.0) / bucket_hours) * bucket_hours
-
-
-def volatility_ratio(
-    observations: list[SpotObservation],
-    model: NelsonAalenModel,
-    *,
-    age_at: list[tuple[datetime, float]],
-) -> float:
-    """
-    gamma_W = observed preemptions / expected preemptions in window.
-
-    age_at: (observation time, instance age hours) for each observation in window.
-    """
-    if not age_at:
-        return 1.0
-    observed = sum(1 for o in observations if not o.available)
-    expected = sum(model.hazard(age) for _, age in age_at)
-    if expected <= 0:
-        return 1.0 if observed == 0 else float(observed)
-    return observed / expected
-
-
-def conservative_volatility(observations: list[SpotObservation], model: NelsonAalenModel) -> float:
-    """gamma* = max gamma_W over suffix windows ending at the latest observation."""
-    if len(observations) < 2:
-        return 1.0
-    sorted_obs = sorted(observations, key=lambda o: o.time_utc)
-    ages: list[tuple[datetime, float]] = []
-    streak_start: datetime | None = None
-    gamma_max = 1.0
-    for i, obs in enumerate(sorted_obs):
-        if obs.available:
-            if streak_start is None:
-                streak_start = obs.time_utc
-            age_h = (obs.time_utc - streak_start).total_seconds() / 3600.0
-        else:
-            streak_start = None
-            age_h = 0.0
-        ages.append((obs.time_utc, age_h))
-        window = sorted_obs[: i + 1]
-        window_ages = ages[: i + 1]
-        gamma_w = volatility_ratio(window, model, age_at=window_ages)
-        gamma_max = max(gamma_max, gamma_w)
-    return gamma_max
+    return round(hours / bucket_hours) * bucket_hours
 
 
 @dataclass
@@ -198,14 +157,11 @@ class VirtualInstanceTracker:
     streak_start_utc: datetime | None = None
     # Called with each *new* observation (never for replayed history), e.g. to persist it.
     on_observation: Callable[[SpotObservation], None] | None = None
-    # Hybrid prior (set by ``refresh_hybrid_priors``): regional prior hazard per hour and the
-    # label describing where it comes from. None keeps the legacy flat assumed prior.
-    prior_hazard: float | None = None
-    prior_label: str | None = None
-    advisor_band: int | None = None
-
     def _apply(self, obs: SpotObservation) -> None:
         self.observations.append(obs)
+        if obs.source == "migration":
+            self.record_proactive_migration(obs.time_utc)
+            return
         if obs.available:
             if self.streak_start_utc is None:
                 self.streak_start_utc = obs.time_utc
@@ -239,47 +195,20 @@ class VirtualInstanceTracker:
             return 0.0
         return (now_utc - self.streak_start_utc).total_seconds() / 3600.0
 
-    def _exposure_hours(self, now_utc: datetime) -> float:
-        """Total virtual-instance time: closed lifetimes plus the streak still open."""
-        return (
-            sum(self.model.complete_samples)
-            + sum(self.model.censored_samples)
-            + self.current_age_hours(now_utc)
+    def predict_lifetime_hours(self, now_utc: datetime, *, horizon_hours: float) -> float:
+        return self.model.expected_remaining_lifetime(
+            self.current_age_hours(now_utc), horizon_hours=horizon_hours,
         )
 
-    def predict_lifetime_hours(self, now_utc: datetime) -> float:
-        gamma_star = conservative_volatility(self.observations, self.model)
-        if (
-            self.prior_hazard is not None
-            and len(self.model.complete_samples) < MIN_EVENTS_FOR_NELSON_AALEN
-        ):
-            # Gamma-exponential: posterior hazard = (k + d) / (k / prior_hazard + exposure).
-            # Constant hazard, so the estimate is the same whatever the current age.
-            d = len(self.model.complete_samples)
-            exposure = self._exposure_hours(now_utc)
-            hazard = (PRIOR_PSEUDO_EVENTS + d) / (
-                PRIOR_PSEUDO_EVENTS / self.prior_hazard + exposure
-            )
-            return max(1.0 / (hazard * gamma_star), 0.25)
-        age = self.current_age_hours(now_utc)
-        return self.model.expected_remaining_lifetime(age, gamma_star=gamma_star)
-
     def prior_source(self) -> str:
-        """Human-readable origin of the lifetime estimate (never implies AWS measurements)."""
-        if self.prior_label is not None:
-            return self.prior_label
-        n_obs = len(self.observations)
         if self.model.n_samples:
+            support = max(self.model._sorted_lifetimes())
             return (
-                f"history: {n_obs} observations, {self.model.n_samples} lifetime samples "
-                f"(bucket {self.model.bucket_hours:g}h)"
+                f"history: {len(self.observations)} observations, {self.model.n_samples} "
+                f"lifetime samples (support {support:g}h, bucket {self.model.bucket_hours:g}h); "
+                f"assumed exponential tail mean {ASSUMED_SPOT_MEAN_LIFETIME_HOURS:g}h"
             )
-        if n_obs:
-            return (
-                f"assumed default {ASSUMED_SPOT_MEAN_LIFETIME_HOURS:g}h "
-                f"({n_obs} observations, no lifetime samples yet)"
-            )
-        return f"assumed default {ASSUMED_SPOT_MEAN_LIFETIME_HOURS:g}h (no observations)"
+        return f"assumed exponential mean {ASSUMED_SPOT_MEAN_LIFETIME_HOURS:g}h (no lifetime samples)"
 
 
 def replay_observations(
@@ -318,74 +247,3 @@ def replay_observations(
         prev = obs
     if close_open_streak and prev is not None:
         close_streak(prev.time_utc)
-
-
-def advisor_band_weights(bands: Mapping[str, int]) -> dict[str, float]:
-    """
-    Relative hazard weight per region from advisor band indices, normalized to mean 1.
-
-    Regions without a valid band are left out (callers treat them as neutral, weight 1). When
-    every region is in the same band all weights are 1, so the advisor adds nothing.
-    """
-    raw = {
-        region: ADVISOR_BAND_WEIGHTS[band]
-        for region, band in bands.items()
-        if isinstance(band, int) and 0 <= band < len(ADVISOR_BAND_WEIGHTS)
-    }
-    if not raw:
-        return {}
-    mean = sum(raw.values()) / len(raw)
-    return {region: w / mean for region, w in raw.items()}
-
-
-def pooled_hazard_scale(trackers: Iterable[VirtualInstanceTracker]) -> tuple[float, int]:
-    """
-    Hazard level (per hour) from all regions' own samples, shrunk toward the assumed prior.
-
-    Returns ``(scale, n_events)``; with no events the scale is exactly ``1 / assumed mean``.
-    (Empirical Bayes: a region's own data also feeds this pooled level, which is fine for a
-    weak prior but means the pooled level is not independent of the regional posterior.)
-    """
-    events = 0
-    exposure = 0.0
-    for tracker in trackers:
-        events += len(tracker.model.complete_samples)
-        exposure += sum(tracker.model.complete_samples) + sum(tracker.model.censored_samples)
-    scale = (PRIOR_PSEUDO_EVENTS + events) / (
-        PRIOR_PSEUDO_EVENTS * ASSUMED_SPOT_MEAN_LIFETIME_HOURS + exposure
-    )
-    return scale, events
-
-
-def refresh_hybrid_priors(
-    trackers: Mapping[str, VirtualInstanceTracker],
-    advisor_bands: Mapping[str, int],
-) -> None:
-    """
-    Set each tracker's regional prior hazard: pooled own-data scale x advisor weight.
-
-    Cheap, so callers may re-run it as observations arrive. The advisor only tilts the prior
-    between regions; it never sets an absolute number of hours.
-    """
-    weights = advisor_band_weights(advisor_bands)
-    scale, pooled_events = pooled_hazard_scale(trackers.values())
-    for region, tracker in trackers.items():
-        weight = weights.get(region, 1.0)
-        band = advisor_bands.get(region)
-        tracker.advisor_band = band if region in weights else None
-        tracker.prior_hazard = scale * weight
-        band_text = (
-            f" x advisor band {ADVISOR_BAND_LABELS[tracker.advisor_band]}"
-            if tracker.advisor_band is not None
-            else " (no advisor band for this region)"
-        )
-        own = len(tracker.model.complete_samples)
-        if own:
-            exposure = sum(tracker.model.complete_samples) + sum(tracker.model.censored_samples)
-            tracker.prior_label = f"history: {own} events, {exposure:.1f}h exposure{band_text}"
-        elif pooled_events:
-            tracker.prior_label = f"pooled history ({pooled_events} events){band_text}"
-        else:
-            tracker.prior_label = (
-                f"assumed default {ASSUMED_SPOT_MEAN_LIFETIME_HOURS:g}h{band_text}"
-            )

@@ -6,7 +6,7 @@ Spot has reclaimed capacity during the trailing month" in ranges <5%, 5-10%, 10-
 callers must treat this as optional and fail open.
 
 The bands are coarse, regional, and have ill-defined units (the top band covers anything up to
-100%), so CarbonSight only uses them as *relative* regional weights, never as hours of life.
+100%), so they are retained as metadata and do not determine predicted hours of life.
 """
 
 from __future__ import annotations

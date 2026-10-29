@@ -30,7 +30,6 @@ from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.cloud.aws.gpu_catalog import aws_instance_type_for_gpu
 from carbonsight_core.cloud.aws.probe import ProbeResult, SpotLaunchProbe
 from carbonsight_core.cloud.aws.quota import QuotaChecker
-from carbonsight_core.cloud.aws.spot_advisor import SpotAdvisorError, fetch_advisor_bands
 from carbonsight_core.config import Config
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
 from carbonsight_core.estimator.pricing import configure_pricing, estimate_cost_usd
@@ -41,7 +40,6 @@ from carbonsight_core.paths import (
     resolve_registry_json_file,
 )
 from carbonsight_core.planning import (
-    ADVISOR_BAND_LABELS,
     DynamicEventType,
     DynamicJob,
     DynamicPlanEvent,
@@ -54,13 +52,7 @@ from carbonsight_core.planning import (
     build_region_plan_inputs,
     plan_dynamic_job,
 )
-from carbonsight_core.planning.survival import (
-    ASSUMED_SPOT_MEAN_LIFETIME_HOURS,
-    DEFAULT_BUCKET_HOURS,
-    NelsonAalenModel,
-    VirtualInstanceTracker,
-    replay_observations,
-)
+from carbonsight_core.planning.survival import DEFAULT_BUCKET_HOURS
 from carbonsight_core.region_ranking import AwsRegionRankingService
 from carbonsight_core.scheduler import pick_lowest_carbon_start
 from carbonsight_core.spot_history import SpotObservationStore, StoredObservation
@@ -416,14 +408,13 @@ def _probe_before_plan(
     *,
     store_path: Path,
     instance_type: str,
-    advisor_bands: Mapping[str, int] | None,
     now: datetime,
 ) -> None:
     """
     One AWS probe per region, run once just before planning.
 
-    Results are appended to ``history`` (so the advisory simulation and the real loop both see
-    them) and saved to the local store with the advisor band, like any other observation.
+    Results are appended to ``history`` for the advisory simulation and real loop, and saved
+    to the local observation store.
     """
     store: SpotObservationStore | None = None
     try:
@@ -446,7 +437,6 @@ def _probe_before_plan(
                             instance_type=instance_type,
                             available=available,
                             source="probe",
-                            advisor_band=(advisor_bands or {}).get(region),
                         )
                     )
                 except sqlite3.Error as err:
@@ -574,12 +564,15 @@ def _run_dynamic_loop(
 
             launch_failures = 0
             handle = new_handle
-            if decision.safety_net:
-                state = dyn.fallback_to_ondemand(state, decision, run_to_completion=False)
-            else:
-                state = dyn.launch_instance(state, decision)
             seg_start = clock()
-            state = replace(state, now_utc=seg_start)
+            if decision.safety_net:
+                state = dyn.fallback_to_ondemand(
+                    state, decision, run_to_completion=False, observed_launch_utc=seg_start,
+                )
+            else:
+                state = dyn.launch_instance(
+                    state, decision, observed_launch_utc=seg_start,
+                )
             sleep(poll_seconds)
     except KeyboardInterrupt:
         out.interrupted = True
@@ -643,7 +636,6 @@ def _execute_dynamic_run(
     sleep: Sleep,
     observations: Mapping[str, Sequence[SpotObservation]] | None = None,
     on_observation: Callable[[str, SpotObservation], None] | None = None,
-    advisor_bands: Mapping[str, int] | None = None,
 ) -> int:
     """Run the dynamic loop against a real cluster. Returns a process exit code."""
     t0 = clock()  # time snapshot: constraints and DynamicJob are anchored here
@@ -659,7 +651,6 @@ def _execute_dynamic_run(
         observations=observations,
         on_observation=on_observation,
         lifetime_bucket_hours=bucket_hours,
-        advisor_bands=advisor_bands,
     )
     state = dyn.make_initial_state()
 
@@ -667,7 +658,7 @@ def _execute_dynamic_run(
         f"\nDynamic run: deadline {constraints.deadline_utc.isoformat()}, "
         f"polling every {poll_seconds:g}s, idle tick {idle_tick_hours:g}h."
     )
-    _echo_lifetime_prior(observations, bucket_hours, advisor_bands)
+    _echo_lifetime_prior(dyn.prior_sources())
     outcome = _run_dynamic_loop(
         dyn,
         state,
@@ -733,58 +724,9 @@ def _load_spot_history(
         return {}
 
 
-def _load_advisor_bands(instance_type: str, regions: Sequence[str]) -> dict[str, int] | None:
-    """
-    Spot Advisor bands for the candidate regions, or None (fail open) if unavailable.
-
-    The advisor JSON is undocumented and coarse, so it only tilts the lifetime prior between
-    regions (relative weights); it never sets an absolute number of hours.
-    """
-    if not instance_type:
-        return None
-    try:
-        bands = fetch_advisor_bands(instance_type, regions)
-    except SpotAdvisorError as err:
-        typer.echo(f"Warning: spot advisor unavailable ({err}); using the flat assumed prior.", err=True)
-        return None
-    shown = ", ".join(f"{r} {ADVISOR_BAND_LABELS[b]}" for r, b in sorted(bands.items())) or "none listed"
-    typer.echo(
-        f"Spot advisor bands for {instance_type} (trailing 30 days; used only as relative "
-        f"regional weights, not hours): {shown}"
-    )
-    return bands
-
-
-def _echo_lifetime_prior(
-    observations: Mapping[str, Sequence[SpotObservation]] | None,
-    bucket_hours: float,
-    advisor_bands: Mapping[str, int] | None = None,
-) -> None:
-    """One line saying where the spot lifetime estimate comes from."""
-    trackers: list[VirtualInstanceTracker] = []
-    for region, obs in (observations or {}).items():
-        tracker = VirtualInstanceTracker(
-            region=region, model=NelsonAalenModel(bucket_hours=bucket_hours)
-        )
-        replay_observations(tracker, obs)
-        trackers.append(tracker)
-    n_obs = sum(len(t.observations) for t in trackers)
-    n_samples = sum(t.model.n_samples for t in trackers)
-    if n_samples:
-        detail = (
-            f"from {n_obs} observations in local history ({n_samples} lifetime samples, "
-            f"{len(trackers)} region(s)); not AWS-published data"
-        )
-    elif n_obs:
-        detail = (
-            f"assumed default {ASSUMED_SPOT_MEAN_LIFETIME_HOURS:g}h "
-            f"({n_obs} observations, no lifetime samples yet)"
-        )
-    else:
-        detail = f"assumed default {ASSUMED_SPOT_MEAN_LIFETIME_HOURS:g}h (no observations)"
-    if advisor_bands is not None:
-        detail += "; regional prior scaled by advisor band"
-    typer.echo(f"Spot lifetime prior: {detail}")
+def _echo_lifetime_prior(sources: Mapping[str, str]) -> None:
+    for region, source in sorted(sources.items()):
+        typer.echo(f"Spot usable-time estimate ({region}): {source}; bounded by job/deadline horizon")
 
 
 def _echo_finish_by_source(effective_finish_by: datetime, cli_finish_by: datetime | None) -> None:
@@ -842,18 +784,16 @@ def _pick_region_with_dynamic_plan(
     effective_finish_by: datetime,
     observations: Mapping[str, Sequence[SpotObservation]] | None = None,
     lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
-    advisor_bands: Mapping[str, int] | None = None,
 ) -> tuple[str, bool, EstimateResult, DynamicPlanResult]:
     # Same read-only history as the real loop; the simulation never persists anything.
-    _echo_lifetime_prior(observations, lifetime_bucket_hours, advisor_bands)
     dyn = plan_dynamic_job(
         job,
         constraints,
         region_inputs,
         observations=observations,
         lifetime_bucket_hours=lifetime_bucket_hours,
-        advisor_bands=advisor_bands,
     )
+    _echo_lifetime_prior(dyn.lifetime_sources)
     _echo_dynamic_plan(dyn)
     if not dyn.deadline_met or dyn.initial_launch is None:
         typer.echo("Dynamic plan: no feasible launch before finish-by.", err=True)
@@ -1068,7 +1008,6 @@ def run_launch(
     spot_instance_type = aws_instance_type_for_gpu(job.gpu_type) or ""
     spot_history: dict[str, list[SpotObservation]] = {}
     bucket_hours = DEFAULT_BUCKET_HOURS
-    advisor_bands: dict[str, int] | None = None
     prober: Prober | None = None
 
     if effective_finish_by is not None:
@@ -1088,7 +1027,6 @@ def run_launch(
         spot_history = _load_spot_history(
             _resolve_db_path(db_path), candidate_regions, spot_instance_type,
         )
-        advisor_bands = _load_advisor_bands(spot_instance_type, candidate_regions)
         # Real AWS probes only when this run will actually launch (not dry-run/validate/smoke).
         launching = not (dry_run or no_exec or validate_sky or sky_smoke)
         if launching and probe_before_plan:
@@ -1100,7 +1038,6 @@ def run_launch(
                 spot_history,
                 store_path=_resolve_db_path(db_path),
                 instance_type=spot_instance_type,
-                advisor_bands=advisor_bands,
                 now=datetime.now(UTC),
             )
         region, use_spot, best, _dyn = _pick_region_with_dynamic_plan(
@@ -1111,7 +1048,6 @@ def run_launch(
             effective_finish_by=effective_finish_by,
             observations=spot_history,
             lifetime_bucket_hours=bucket_hours,
-            advisor_bands=advisor_bands,
         )
     else:
         cloud, region, best = _pick_static_region(estimates, max_cost_premium)
@@ -1258,7 +1194,6 @@ def run_launch(
                             available=obs.available,
                             source=obs.source,
                             run_id=rec.run_id,
-                            advisor_band=(advisor_bands or {}).get(obs_region),
                         )
                     )
                 except sqlite3.Error as err:
@@ -1276,7 +1211,6 @@ def run_launch(
                 sleep=sleep or time.sleep,
                 observations=spot_history,
                 on_observation=_persist_observation,
-                advisor_bands=advisor_bands,
             )
         finally:
             if observation_store is not None:

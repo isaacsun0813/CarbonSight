@@ -120,6 +120,7 @@ class SchedulerCandidate:
     cost_rate_usd_per_hr: float
     carbon_rate_kg_per_hr: float
     migration_usd: float = 0.0
+    # Expected usable time within the job/deadline prediction horizon.
     expected_lifetime_hours: float = 1.0
 
 
@@ -159,3 +160,4 @@ class DynamicPlanResult:
     total_carbon_kg: float
     # Separate from deadline_met: work can finish in time and still exceed carbon_budget_kg.
     carbon_budget_met: bool = True
+    lifetime_sources: dict[str, str] = field(default_factory=dict)

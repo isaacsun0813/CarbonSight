@@ -295,13 +295,13 @@ class TestDynamicJobObservations:
     def test_no_t0_seed(self) -> None:
         dyn = self._job()
         assert dyn.trackers["us-west-2"].observations == []
-        assert dyn.prior_sources() == {"us-west-2": "assumed default 4h (no observations)"}
+        assert dyn.prior_sources() == {"us-west-2": "assumed exponential mean 4h (no lifetime samples)"}
 
     def test_idle_time_does_not_shrink_predicted_lifetime(self) -> None:
         dyn = self._job()
         tracker = dyn.trackers["us-west-2"]
-        assert tracker.predict_lifetime_hours(self.T0) == tracker.predict_lifetime_hours(
-            self.T0 + timedelta(hours=10)
+        assert tracker.predict_lifetime_hours(self.T0, horizon_hours=2) == tracker.predict_lifetime_hours(
+            self.T0 + timedelta(hours=10), horizon_hours=2,
         )
 
     def test_launch_and_preemption_are_source_tagged(self) -> None:
@@ -369,27 +369,31 @@ class TestDynamicJobObservations:
             job, _constraints(self.T0, 12.0), self._regions(), observations=history
         )
         assert result.deadline_met
+        assert result.lifetime_sources["us-west-2"].startswith("history: 2 observations")
 
-    def test_advisor_bands_make_hybrid_prior(self) -> None:
-        dyn = self._job(advisor_bands={"us-west-2": 4})
-        assert dyn.prior_sources() == {"us-west-2": "assumed default 4h x advisor band >20%"}
-        assert dyn.trackers["us-west-2"].prior_hazard is not None
+    def test_simulated_preemptions_do_not_become_input_provenance(self) -> None:
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=8)
+        result = plan_dynamic_job(job, _constraints(self.T0, 16), self._regions())
+        assert any(event.event_type == DynamicEventType.PREEMPT for event in result.events)
+        assert result.lifetime_sources == {
+            "us-west-2": "assumed exponential mean 4h (no lifetime samples)"
+        }
 
-    def test_no_advisor_bands_keeps_flat_prior(self) -> None:
+    def test_candidates_use_remaining_work_and_deadline_horizon(self) -> None:
+        from carbonsight_core.planning.dynamic import _build_scheduler_candidates
+
         dyn = self._job()
-        assert dyn.trackers["us-west-2"].prior_hazard is None
-
-    def test_prior_refreshes_after_observed_preemption(self) -> None:
-        dyn = self._job(simulate_preemption=False, advisor_bands={"us-west-2": 4})
-        state = dyn.launch_instance(dyn.make_initial_state(), self._spot_decision())
-        state = dyn.advance_work(state, tick_hours=1.0)
-        dyn.advance_work(state, tick_hours=1.0, preempted=True)
-        dyn.decide(dyn.make_initial_state())
-        assert dyn.prior_sources()["us-west-2"].startswith("history: 1 events")
-
-    def test_plan_dynamic_job_accepts_advisor_bands(self) -> None:
-        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=2.0)
-        result = plan_dynamic_job(
-            job, _constraints(self.T0, 12.0), self._regions(), advisor_bands={"us-west-2": 0}
+        candidates = _build_scheduler_candidates(
+            dyn.job, dyn.constraints, dyn.regions, dyn.trackers, self.T0, "",
+            remaining_work_hours=0.5,
         )
-        assert result.deadline_met
+        spot = next(c for c in candidates if c.mode == JobMode.SPOT)
+        expected = dyn.trackers["us-west-2"].predict_lifetime_hours(
+            self.T0, horizon_hours=0.5 + dyn.constraints.cold_start_hours,
+        )
+        assert spot.expected_lifetime_hours == expected
+        expired = _build_scheduler_candidates(
+            dyn.job, dyn.constraints, dyn.regions, dyn.trackers,
+            dyn.constraints.deadline_utc, "", remaining_work_hours=0.5,
+        )
+        assert all(c.expected_lifetime_hours == 0 for c in expired)
