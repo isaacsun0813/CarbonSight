@@ -19,8 +19,8 @@ def build_region_plan_inputs(
     """
     Fetch MOER forecast per AWS region for dynamic/static planning.
 
-    Uses primary wt_region only (mixture weighting TODO). Skips regions without
-    mapping or on WattTime errors.
+    Combines mixture mappings using the same weighted-MOER calculation as
+    ``JobCarbonEstimator``. Skips regions without mapping or on WattTime errors.
     """
     horizon_hours = math.ceil(
         (constraints.deadline_utc - constraints.now_utc).total_seconds() / 3600.0
@@ -31,14 +31,37 @@ def build_region_plan_inputs(
     inputs: list[RegionPlanInput] = []
 
     for entry in registry.iter_plannable_aws_regions(allowed):
-        wt_region = entry.wt_regions[0][0]
         try:
-            forecast = watt_time.get_forecast(wt_region, horizon_hours=horizon_hours)
-            points = forecast.get("data", [])
+            forecasts = [
+                (
+                    weight,
+                    watt_time.get_forecast(wt_region, horizon_hours=horizon_hours).get("data", []),
+                )
+                for wt_region, weight in entry.wt_regions
+            ]
         except WattTimeError:
             continue
-        if not points:
+        point_times = {
+            point["point_time"]
+            for _, points in forecasts
+            for point in points
+        }
+        if not point_times:
             continue
+        values_by_region = [
+            (weight, {point["point_time"]: float(point.get("value", 0)) for point in points})
+            for weight, points in forecasts
+        ]
+        points = [
+            {
+                "point_time": point_time,
+                "value": sum(
+                    weight * values.get(point_time, 400.0)
+                    for weight, values in values_by_region
+                ),
+            }
+            for point_time in point_times
+        ]
         inputs.append(
             RegionPlanInput(
                 cloud_region=entry.region_code,

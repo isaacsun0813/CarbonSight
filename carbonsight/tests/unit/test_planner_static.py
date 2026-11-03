@@ -1,11 +1,14 @@
 """Unit tests for static job planner."""
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning import (
     PlanConstraints,
     RegionPlanInput,
+    build_region_plan_inputs,
     plan_static_job,
 )
 
@@ -164,3 +167,32 @@ class TestStaticPlannerEmpty:
         constraints = _constraints(t0, deadline_hours=2.0)
         result = plan_static_job(job, constraints, regions)
         assert result.best is None
+
+
+class TestBuildRegionPlanInputs:
+    def test_combines_watttime_mixture_forecasts(self) -> None:
+        t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        entry = SimpleNamespace(
+            region_code="us-west-2",
+            wt_regions=[("PACW", 0.25), ("NWPP", 0.75)],
+            s_source=0.9,
+        )
+        registry = MagicMock()
+        registry.iter_plannable_aws_regions.return_value = [entry]
+        watt_time = MagicMock()
+        watt_time.get_forecast.side_effect = [
+            {"data": _forecast(t0, [100.0, 200.0])},
+            {"data": _forecast(t0, [500.0, 600.0])},
+        ]
+
+        inputs = build_region_plan_inputs(
+            registry,
+            watt_time,
+            JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0),
+            _constraints(t0, deadline_hours=2.0),
+        )
+
+        assert len(inputs) == 1
+        assert inputs[0].watttime_regions == entry.wt_regions
+        assert [point["value"] for point in inputs[0].forecast_points] == [400.0, 500.0]
+        assert [call.args[0] for call in watt_time.get_forecast.call_args_list] == ["PACW", "NWPP"]
