@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
 
 from carbonsight_core.mapping.registry import Registry
 from carbonsight_core.models import JobSpec

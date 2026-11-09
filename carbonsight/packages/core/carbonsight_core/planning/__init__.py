@@ -47,7 +47,7 @@ from carbonsight_core.planning.utility import (
     carbon_rate_kg_per_hr,
     deadline_pressure,
     estimate_window_carbon_kg,
-    facility_mwh_for_duration,
+    it_mwh_for_duration,
     progress_value,
 )
 
@@ -78,9 +78,9 @@ __all__ = [
     "deadline_pressure",
     "enumerate_candidates",
     "estimate_window_carbon_kg",
-    "facility_mwh_for_duration",
     "filter_by_priority",
     "finish_time",
+    "it_mwh_for_duration",
     "is_deadline_feasible",
     "latest_feasible_start",
     "make_runtime_state",

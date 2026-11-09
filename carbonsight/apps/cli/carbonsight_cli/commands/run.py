@@ -84,11 +84,12 @@ BASELINE_REGION = "us-east-1"
 
 
 def _echo_dynamic_plan(dyn, *, title: str = "Dynamic plan (advisory simulation)") -> None:
-    """Print concise dynamic plan trajectory."""
+    """Print concise dynamic plan trajectory using deterministic expected IT power."""
     typer.echo(f"\n{title}:")
     typer.echo(
         f"  Deadline met: {dyn.deadline_met}  "
-        f"Cost: ${dyn.total_cost_usd:.2f}  Carbon: {dyn.total_carbon_kg:.2f}kg"
+        f"Cost: ${dyn.total_cost_usd:.2f}  "
+        f"IT carbon (planner): {dyn.total_carbon_kg:.2f}kg"
     )
     if not dyn.carbon_budget_met:
         typer.echo("  Carbon budget exceeded")
@@ -625,7 +626,7 @@ def _echo_actual_segments(
         total_cost += actual.actual_cost_usd
         total_hours += actual.actual_duration_hours
     typer.echo(
-        f"\nActual CO₂ (estimate over {len(segments)} segment(s)): {total_co2:.3f}kg | "
+        f"\nActual IT CO₂ (estimate over {len(segments)} segment(s)): {total_co2:.3f}kg | "
         f"Instance time: {total_hours:.1f}h | Cost: ${total_cost:.2f}"
     )
 
@@ -678,7 +679,7 @@ def _execute_dynamic_run(
         idle_tick_hours=idle_tick_hours,
     )
     result = dyn.finalize(outcome.state)
-    _echo_dynamic_plan(result, title="Dynamic run (events; cost/carbon are estimates)")
+    _echo_dynamic_plan(result, title="Dynamic run (events; planner IT carbon is deterministic)")
     _echo_actual_segments(job, watt_time, region_inputs, outcome.segments)
 
     if outcome.handle is not None:
@@ -701,7 +702,7 @@ def _execute_dynamic_run(
         and result.total_carbon_kg > constraints.carbon_budget_kg
     ):
         typer.echo(
-            f"Warning: estimated carbon {result.total_carbon_kg:.2f}kg exceeds budget "
+            f"Warning: planner IT carbon {result.total_carbon_kg:.2f}kg exceeds budget "
             f"{constraints.carbon_budget_kg:.2f}kg.",
             err=True,
         )
@@ -860,7 +861,7 @@ def _pick_region_with_dynamic_plan(
         raise typer.Exit(1)
     if not dyn.carbon_budget_met:
         typer.echo(
-            f"Dynamic plan: finishes before finish-by but estimated carbon "
+            f"Dynamic plan: finishes before finish-by but planner IT carbon "
             f"{dyn.total_carbon_kg:.2f}kg exceeds the budget "
             f"{constraints.carbon_budget_kg:.2f}kg.",
             err=True,
@@ -877,7 +878,9 @@ def _pick_region_with_dynamic_plan(
     typer.echo(
         f"\nChosen (dynamic): aws/{region}  "
         f"mode={dyn.initial_launch.mode.value}  "
-        f"finish-by={effective_finish_by.isoformat()}"
+        f"finish-by={effective_finish_by.isoformat()}  "
+        f"planner IT CO2={dyn.total_carbon_kg:.2f}kg  "
+        f"ranking IT CO2 mean={best.expected_co2_kg_mean:.2f}kg"
     )
     return region, use_spot, best, dyn
 
@@ -892,7 +895,7 @@ def _pick_static_region(
         raise typer.Exit(1)
     typer.echo(
         f"\nChosen: {best.cloud}/{best.cloud_region}  "
-        f"CO2={best.expected_co2_kg_mean:.2f}kg  "
+        f"IT CO2 mean (ranking)={best.expected_co2_kg_mean:.2f}kg  "
         f"Cost=${best.expected_cost_usd:.2f}  "
         f"Confidence={best.mapping_confidence:.2f}"
     )
@@ -1306,7 +1309,7 @@ def run_launch(
         pct = actual.co2_savings_vs_estimate_pct
         sign = "+" if pct >= 0 else ""
         typer.echo(
-            f"\nActual CO₂: {actual.actual_co2_kg:.3f}kg | "
+            f"\nActual IT CO₂ estimate: {actual.actual_co2_kg:.3f}kg | "
             f"Duration: {actual.actual_duration_hours:.1f}h | "
             f"Cost: ${actual.actual_cost_usd:.2f} | "
             f"vs estimate: {sign}{pct:.1f}%"

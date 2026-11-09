@@ -35,7 +35,7 @@ class JobSpec(BaseModel):
 
 
 class EstimateResult(BaseModel):
-    """Result of estimating carbon and cost for one region option."""
+    """IT operational carbon and cost estimate for one region option."""
 
     cloud: str
     cloud_region: str
@@ -43,15 +43,21 @@ class EstimateResult(BaseModel):
         ..., description="(region_code, weight); weights sum to 1.0"
     )
     expected_cost_usd: float = 0.0
-    expected_co2_kg_mean: float = 0.0
-    expected_co2_kg_p10: float = 0.0
-    expected_co2_kg_p90: float = 0.0
+    expected_co2_kg_mean: float = Field(
+        0.0, description="Mean IT operational CO2 estimate; facility overhead excluded",
+    )
+    expected_co2_kg_p10: float = Field(
+        0.0, description="P10 IT operational CO2 estimate; facility overhead excluded",
+    )
+    expected_co2_kg_p90: float = Field(
+        0.0, description="P90 IT operational CO2 estimate; facility overhead excluded",
+    )
     mapping_confidence: float = Field(..., ge=0, le=1)
     notes: list[str] = Field(default_factory=list)
 
 
 class ActualRunResult(BaseModel):
-    """Actual CO₂, cost, and duration measured after a job completes."""
+    """Post-run IT operational CO₂ estimate, cost, and observed duration."""
 
     cloud: str
     cloud_region: str

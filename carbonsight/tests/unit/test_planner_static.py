@@ -9,6 +9,7 @@ from carbonsight_core.planning import (
     PlanConstraints,
     RegionPlanInput,
     build_region_plan_inputs,
+    it_mwh_for_duration,
     plan_static_job,
 )
 
@@ -196,3 +197,14 @@ class TestBuildRegionPlanInputs:
         assert inputs[0].watttime_regions == entry.wt_regions
         assert [point["value"] for point in inputs[0].forecast_points] == [400.0, 500.0]
         assert [call.args[0] for call in watt_time.get_forecast.call_args_list] == ["PACW", "NWPP"]
+
+
+class TestPlanningItEnergy:
+    def test_it_energy_honors_observed_gpu_utilization(self) -> None:
+        low = JobSpec(
+            gpu_type="A100", gpu_count=1, duration_hours=1.0, gpu_utilization=0.1,
+        )
+        high = JobSpec(
+            gpu_type="A100", gpu_count=1, duration_hours=1.0, gpu_utilization=0.9,
+        )
+        assert it_mwh_for_duration(high, 1.0) > it_mwh_for_duration(low, 1.0)
