@@ -66,6 +66,18 @@ Implementation: `carbonsight/apps/cli/carbonsight_cli/commands/train.py`.
 
 ---
 
+## `plan-static` — experimental one-shot advice only
+
+**`carbonsight plan-static --yaml train.yaml --finish-by ...`** enumerates forecasted
+region × start-time × spot/on-demand candidates and prints the best feasible candidate.
+It is an experimental advisory command: it does **not** patch YAML, wait for the selected
+start, or launch SkyPilot. The deadline can also come from `carbonsight.finish_by` in YAML.
+
+Implementation: `carbonsight/apps/cli/carbonsight_cli/commands/plan_static.py` and
+`carbonsight_core/planning/static.py`.
+
+---
+
 ## `run` — same ranking, then actually launch
 
 Same loop as advise, plus optional **quota check** and **instance offerings check** per region (when preflight is enabled). Pick the **greenest** row that still passes the cost filter, **inject `resources.infra` (`cloud/region`) into the YAML** (and strip legacy `cloud`/`region`/`zone` keys), **strip CarbonSight-only keys** (`duration`, `carbonsight`) so SkyPilot only sees valid task fields, write a temp file, call SkyPilot.
@@ -103,7 +115,9 @@ When `carbonsight.finish_by` is set (or `--finish-by`), `run` first prints an ad
 
 **Probe details.** `cloud/aws/probe.py` launches one Spot instance of the catalog type per candidate region and terminates it right away (the SkyNomad paper's availability probe). **It bills real GPU instances and needs vCPU quota**; it needs `ec2:RunInstances`/`TerminateInstances` and `ssm:GetParameter`, and uses the default VPC. Only conclusive results are recorded (capacity error = unavailable; quota, auth or throttling errors are logged and skipped). A probe only says capacity existed at that moment, not how long an instance would live. `spot_placement_score_request` in `cloud/aws/gpu_catalog.py` is an unused static request map for a future Spot placement score signal (a 1–10 hint, not a guarantee or lifetime measure). Error codes and AMI/VPC assumptions in the probe have not been verified on a real account.
 
-Without `finish_by`, `run` uses the static greenest-region ranking (and optional `--max-delay` start-time advice).
+Without `finish_by`, `run` uses the immediate greenest-region ranking. Optional
+`--max-delay` start-time advice is printed only: `run` does not wait before launching.
+`run` does not call the experimental static planner.
 
 ### SkyPilot validation
 

@@ -116,6 +116,7 @@ In each phase below, **Testing** describes only **E2E scenarios** and how they u
 |------|--------|
 | **4.1** Parse job from YAML + args | Parse SkyPilot-style YAML; extract or override GPU type/count, duration, CPU, memory. Build `JobSpec`. |
 | **4.2** `carbonsight advise --yaml train.yaml [--explain] [--json]` | For each candidate region: resolve mapping, get MOER, run estimator, get cost (next phase). Rank by score (carbon + cost weights). Output: ranked table (region, expected CO2 kg, cost, confidence, notes); with `--explain` show top drivers; with `--json` machine-readable. |
+| **4.2a** `carbonsight plan-static --yaml train.yaml [--finish-by ...]` | Experimental one-shot region × start × mode planner. Advisory output only; it does not patch YAML, wait, or control the `run` launch path. |
 | **4.3** Cost model | Use SkyPilot pricing (or cached prices) + optional AWS spot. Integrate into scoring: score = w_carbon * normalized(co2) + w_cost * normalized(cost). |
 | **4.4** `carbonsight run train.yaml [--dry-run] [--no-exec]` | Run advise → preflight (Phase 5) → patch YAML with chosen region → if not dry-run/no-exec, call SkyPilot to launch. Emit patched YAML when dry-run. |
 | **4.5** `carbonsight mappings validate` | Run drift checks (region-from-loc vs stored); print diff and confidence drops. |
