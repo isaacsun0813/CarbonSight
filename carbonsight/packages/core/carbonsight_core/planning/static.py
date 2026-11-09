@@ -1,4 +1,8 @@
-"""Static pre-launch planner: brute-force over region x start x mode."""
+"""Experimental one-shot advisory planner: brute-force over region x start x mode.
+
+This planner is exposed by ``carbonsight plan-static`` but is not used by the
+``run`` launch path.
+"""
 
 from carbonsight_core.estimator.pricing import estimate_job_cost
 from carbonsight_core.models import JobSpec
@@ -16,12 +20,12 @@ from carbonsight_core.planning.types import (
     RegionPlanInput,
 )
 from carbonsight_core.planning.utility import (
+    calc_utility,
     carbon_rate_kg_per_hr,
     deadline_pressure,
     estimate_window_carbon_kg,
     parse_forecast_utc,
     progress_value,
-    calc_utility,
 )
 
 

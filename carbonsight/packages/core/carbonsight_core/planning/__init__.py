@@ -1,4 +1,4 @@
-"""Job planning: static pre-launch and dynamic scheduling."""
+"""Job planning: experimental static advice and dynamic launch scheduling."""
 
 from carbonsight_core.planning.constraints import (
     filter_by_priority,
