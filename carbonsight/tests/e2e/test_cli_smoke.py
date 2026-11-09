@@ -79,8 +79,9 @@ def test_train_script_without_watttime_returns_empty_json() -> None:
     if not stub.is_file():
         return
     env = {**__import__("os").environ, "PYTHONPATH": str(root / "packages" / "core") + ":" + str(root / "apps" / "cli")}
-    env.pop("WATTTIME_USERNAME", None)
-    env.pop("WATTTIME_PASSWORD", None)
+    # Explicit empty values prevent python-dotenv from filling credentials from a local .env.
+    env["WATTTIME_USERNAME"] = ""
+    env["WATTTIME_PASSWORD"] = ""
     result = subprocess.run(
         [sys.executable, "-m", "carbonsight_cli.main", "train", str(stub), "--json"],
         capture_output=True,
