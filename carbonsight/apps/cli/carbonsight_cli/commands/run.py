@@ -937,44 +937,93 @@ def _maybe_echo_carbon_schedule(
         typer.echo(f"Warning: could not compute schedule: {e}", err=True)
 
 
-def run_launch(
-    yaml_path: Path,
-    *,
-    dry_run: bool = False,
-    no_exec: bool = False,
-    skip_preflight: bool = False,
-    managed: bool = False,
-    yes: bool = False,
-    max_cost_premium: float = 0.20,
-    registry_path: Path | None = None,
-    gpu_util: float | None = None,
-    nvidia_smi: bool = False,
-    use_spot: bool = True,
-    max_delay: str = "0h",
-    db_path: Path | None = None,
-    checkpoint: bool = True,
-    checkpoint_bucket: str | None = None,
-    checkpoint_interval: int = 500,
-    script_path: Path | None = None,
-    live_pricing: bool = False,
-    static_pricing: bool = False,
-    finish_by: datetime | None = None,
-    carbon_budget_kg: float | None = None,
-    carbon_price: float | None = None,
-    validate_sky: bool = False,
-    sky_smoke: bool = False,
-    poll_seconds: float = 60.0,
-    idle_tick_hours: float = 1.0,
-    clock: Clock | None = None,
-    sleep: Sleep | None = None,
-    probe_before_plan: bool = True,
-) -> None:
-    """Shared implementation for ``run`` and ``train``.
+@dataclass(frozen=True)
+class LaunchOptions:
+    """Options for ``run_launch`` shared by the ``run`` and ``train`` commands.
 
-    With a finish-by deadline the launch is an event loop (``_execute_dynamic_run``); ``clock``
-    and ``sleep`` default to wall-clock time and are injectable for tests.
+    Frozen: values resolved during a launch (spot mode, managed mode) live on
+    ``_LaunchContext``, never mutated back into these caller-supplied options.
     """
-    if poll_seconds <= 0 or idle_tick_hours <= 0:
+
+    dry_run: bool = False
+    no_exec: bool = False
+    skip_preflight: bool = False
+    managed: bool = False
+    yes: bool = False
+    max_cost_premium: float = 0.20
+    registry_path: Path | None = None
+    gpu_util: float | None = None
+    nvidia_smi: bool = False
+    use_spot: bool = True
+    max_delay: str = "0h"
+    db_path: Path | None = None
+    checkpoint: bool = True
+    checkpoint_bucket: str | None = None
+    checkpoint_interval: int = 500
+    script_path: Path | None = None
+    live_pricing: bool = False
+    static_pricing: bool = False
+    finish_by: datetime | None = None
+    carbon_budget_kg: float | None = None
+    carbon_price: float | None = None
+    validate_sky: bool = False
+    sky_smoke: bool = False
+    poll_seconds: float = 60.0
+    idle_tick_hours: float = 1.0
+    clock: Clock | None = None
+    sleep: Sleep | None = None
+    probe_before_plan: bool = True
+
+
+@dataclass
+class _LaunchContext:
+    """Mutable state threaded through the ``run_launch`` phases.
+
+    ``options`` stays frozen; values resolved during the launch (spot mode,
+    managed mode, chosen region) are written here instead.
+    """
+
+    yaml_path: Path
+    options: LaunchOptions
+    db_path: Path
+    job: JobSpec
+    config: Config
+    watt_time: WattTimeClient
+    registry: Registry
+    estimates: list[EstimateResult]
+    effective_finish_by: datetime | None
+    effective_carbon_budget: float | None
+    effective_carbon_price: float
+    cloud: str = "aws"
+    region: str = ""
+    best: EstimateResult | None = None
+    use_spot: bool = True
+    managed: bool = False
+    spot_history: dict[str, list[SpotObservation]] = field(default_factory=dict)
+    advisor_bands: dict[str, int] | None = None
+    plan_constraints: PlanConstraints | None = None
+    region_inputs: list[RegionPlanInput] | None = None
+    spot_instance_type: str = ""
+    rec: RunRecord | None = None
+    ckpt_patch: CheckpointYamlPatch | None = None
+    patched: str = ""
+    sky_cwd: Path | None = None
+
+    def _patched_yaml_for_launch(self, region: str, spot: bool) -> str:
+        """SkyPilot YAML for one dynamic-loop launch in ``region``."""
+        return build_patched_yaml_text(
+            self.yaml_path,
+            self.cloud,
+            region,
+            use_spot=spot,
+            ckpt_patch=self.ckpt_patch,
+            force_on_demand=not spot,
+        )
+
+
+def _prepare_launch_context(yaml_path: Path, options: LaunchOptions) -> _LaunchContext:
+    """Validate inputs, load the job and registry, and collect region estimates."""
+    if options.poll_seconds <= 0 or options.idle_tick_hours <= 0:
         typer.echo("Error: --poll-seconds and --idle-tick-hours must be positive.", err=True)
         raise typer.Exit(1)
 
@@ -982,12 +1031,14 @@ def run_launch(
         typer.echo(f"Error: file not found: {yaml_path}", err=True)
         raise typer.Exit(1)
 
-    if gpu_util is not None and not (0.0 <= gpu_util <= 1.0):
+    if options.gpu_util is not None and not (0.0 <= options.gpu_util <= 1.0):
         typer.echo("Error: --gpu-util must be between 0 and 1.", err=True)
         raise typer.Exit(1)
 
     job = job_spec_from_sky_yaml(yaml_path)
-    job, nvidia_failed = apply_gpu_telemetry_cli(job, gpu_util=gpu_util, nvidia_smi=nvidia_smi)
+    job, nvidia_failed = apply_gpu_telemetry_cli(
+        job, gpu_util=options.gpu_util, nvidia_smi=options.nvidia_smi
+    )
     if nvidia_failed:
         typer.echo(
             "Warning: --nvidia-smi could not read utilization (no GPU driver here?). "
@@ -995,7 +1046,9 @@ def run_launch(
             err=True,
         )
     package_root = carbonsight_package_root_from_cli_command_file(Path(__file__))
-    rpath = resolve_registry_json_file(registry_path, carbonsight_package_root=package_root, cwd=Path.cwd())
+    rpath = resolve_registry_json_file(
+        options.registry_path, carbonsight_package_root=package_root, cwd=Path.cwd()
+    )
     if not rpath.exists():
         typer.echo("No registry found. Use --registry or add seed_registry.json.", err=True)
         raise typer.Exit(1)
@@ -1007,7 +1060,7 @@ def run_launch(
     configure_pricing(
         config,
         live_aws_pricing=resolve_live_aws_pricing(
-            config, live_pricing=live_pricing, static_pricing=static_pricing,
+            config, live_pricing=options.live_pricing, static_pricing=options.static_pricing,
         ),
     )
     if not config.watttime_username or not config.watttime_password:
@@ -1015,9 +1068,9 @@ def run_launch(
         raise typer.Exit(1)
 
     watt_time = WattTimeClient(config)
-    quota_checker = QuotaChecker() if not skip_preflight else None
-    availability_checker = InstanceAvailabilityChecker(config) if not skip_preflight else None
-    enabled_regions_provider = EnabledRegionsProvider(config) if not skip_preflight else None
+    quota_checker = QuotaChecker() if not options.skip_preflight else None
+    availability_checker = InstanceAvailabilityChecker(config) if not options.skip_preflight else None
+    enabled_regions_provider = EnabledRegionsProvider(config) if not options.skip_preflight else None
     ranking = AwsRegionRankingService(
         reg,
         watt_time,
@@ -1026,13 +1079,7 @@ def run_launch(
         enabled_regions_provider=enabled_regions_provider,
     )
 
-    def _enabled_region_skip(region_code: str, reason: str) -> None:
-        typer.echo(f"  Skipping {region_code}: {reason}", err=True)
-
-    def _quota_skip(region_code: str, reason: str) -> None:
-        typer.echo(f"  Skipping {region_code}: {reason}", err=True)
-
-    def _availability_skip(region_code: str, reason: str) -> None:
+    def _skip(region_code: str, reason: str) -> None:
         typer.echo(f"  Skipping {region_code}: {reason}", err=True)
 
     def _estimate_warn(region_code: str, err: BaseException) -> None:
@@ -1040,10 +1087,10 @@ def run_launch(
 
     estimates = ranking.collect_estimates(
         job,
-        use_spot=use_spot,
-        on_enabled_region_skip=_enabled_region_skip,
-        on_quota_skip=_quota_skip,
-        on_availability_skip=_availability_skip,
+        use_spot=options.use_spot,
+        on_enabled_region_skip=_skip,
+        on_quota_skip=_skip,
+        on_availability_skip=_skip,
         on_estimate_error=_estimate_warn,
     )
 
@@ -1056,75 +1103,106 @@ def run_launch(
 
     carbonsight_block = carbonsight_block_from_yaml(yaml_path)
     effective_finish_by = resolve_finish_by(
-        finish_by, yaml_path, carbonsight_block=carbonsight_block,
+        options.finish_by, yaml_path, carbonsight_block=carbonsight_block,
     )
     effective_carbon_budget = resolve_carbon_budget_kg(
-        carbon_budget_kg, yaml_path, carbonsight_block=carbonsight_block,
+        options.carbon_budget_kg, yaml_path, carbonsight_block=carbonsight_block,
     )
     effective_carbon_price = resolve_carbon_price(
-        carbon_price, yaml_path, carbonsight_block=carbonsight_block,
+        options.carbon_price, yaml_path, carbonsight_block=carbonsight_block,
     )
 
-    cloud = "aws"
-    region: str
-    best: EstimateResult
-    spot_instance_type = aws_instance_type_for_gpu(job.gpu_type) or ""
-    spot_history: dict[str, list[SpotObservation]] = {}
-    bucket_hours = DEFAULT_BUCKET_HOURS
-    advisor_bands: dict[str, int] | None = None
-    prober: Prober | None = None
+    return _LaunchContext(
+        yaml_path=yaml_path,
+        options=options,
+        db_path=_resolve_db_path(options.db_path),
+        job=job,
+        config=config,
+        watt_time=watt_time,
+        registry=reg,
+        estimates=estimates,
+        effective_finish_by=effective_finish_by,
+        effective_carbon_budget=effective_carbon_budget,
+        effective_carbon_price=effective_carbon_price,
+        use_spot=options.use_spot,
+        managed=options.managed,
+        spot_instance_type=aws_instance_type_for_gpu(job.gpu_type) or "",
+    )
 
-    if effective_finish_by is not None:
-        _echo_finish_by_source(effective_finish_by, finish_by)
+
+def _select_region(ctx: _LaunchContext) -> None:
+    """Pick the launch region (dynamic plan with a deadline, else static ranking)."""
+    options = ctx.options
+    if ctx.effective_finish_by is not None:
+        _echo_finish_by_source(ctx.effective_finish_by, options.finish_by)
         plan_constraints, region_inputs = _build_dynamic_plan_inputs(
-            reg,
-            watt_time,
-            job,
-            estimates,
+            ctx.registry,
+            ctx.watt_time,
+            ctx.job,
+            ctx.estimates,
             now_utc=datetime.now(UTC),
-            effective_finish_by=effective_finish_by,
-            effective_carbon_budget=effective_carbon_budget,
-            effective_carbon_price=effective_carbon_price,
-            max_cost_premium=max_cost_premium,
+            effective_finish_by=ctx.effective_finish_by,
+            effective_carbon_budget=ctx.effective_carbon_budget,
+            effective_carbon_price=ctx.effective_carbon_price,
+            max_cost_premium=options.max_cost_premium,
         )
+        ctx.plan_constraints = plan_constraints
+        ctx.region_inputs = region_inputs
         candidate_regions = [r.cloud_region for r in region_inputs]
-        spot_history = _load_spot_history(
-            _resolve_db_path(db_path), candidate_regions, spot_instance_type,
+        ctx.spot_history = _load_spot_history(
+            ctx.db_path, candidate_regions, ctx.spot_instance_type,
         )
-        advisor_bands = _load_advisor_bands(spot_instance_type, candidate_regions)
+        ctx.advisor_bands = _load_advisor_bands(ctx.spot_instance_type, candidate_regions)
         # Real AWS probes only when this run will actually launch (not dry-run/validate/smoke).
-        launching = not (dry_run or no_exec or validate_sky or sky_smoke)
-        if launching and probe_before_plan:
-            prober = _make_prober(config, job.gpu_type, spot_instance_type)
+        launching = not (
+            options.dry_run or options.no_exec or options.validate_sky or options.sky_smoke
+        )
+        prober: Prober | None = None
+        if launching and options.probe_before_plan:
+            prober = _make_prober(ctx.config, ctx.job.gpu_type, ctx.spot_instance_type)
         if prober is not None:
             _probe_before_plan(
                 prober,
                 candidate_regions,
-                spot_history,
-                store_path=_resolve_db_path(db_path),
-                instance_type=spot_instance_type,
-                advisor_bands=advisor_bands,
+                ctx.spot_history,
+                store_path=ctx.db_path,
+                instance_type=ctx.spot_instance_type,
+                advisor_bands=ctx.advisor_bands,
                 now=datetime.now(UTC),
             )
         region, use_spot, best, _dyn = _pick_region_with_dynamic_plan(
-            job,
-            estimates,
+            ctx.job,
+            ctx.estimates,
             plan_constraints,
             region_inputs,
-            effective_finish_by=effective_finish_by,
-            observations=spot_history,
-            lifetime_bucket_hours=bucket_hours,
-            advisor_bands=advisor_bands,
+            effective_finish_by=ctx.effective_finish_by,
+            observations=ctx.spot_history,
+            lifetime_bucket_hours=DEFAULT_BUCKET_HOURS,
+            advisor_bands=ctx.advisor_bands,
         )
+        ctx.region = region
+        ctx.use_spot = use_spot
+        ctx.best = best
     else:
-        cloud, region, best = _pick_static_region(estimates, max_cost_premium)
-        _maybe_echo_carbon_schedule(reg, watt_time, job, region, max_delay)
+        cloud, region, best = _pick_static_region(ctx.estimates, options.max_cost_premium)
+        ctx.cloud = cloud
+        ctx.region = region
+        ctx.best = best
+        _maybe_echo_carbon_schedule(
+            ctx.registry, ctx.watt_time, ctx.job, region, options.max_delay
+        )
 
+
+def _record_run(ctx: _LaunchContext) -> None:
+    """Record the pre-launch estimate in the run ledger (before any launch mode)."""
+    best = ctx.best
+    assert best is not None  # set by _select_region
+    job = ctx.job
     baseline_cost = estimate_cost_usd(
-        job.gpu_type, job.gpu_count, job.duration_hours, BASELINE_REGION, use_spot=use_spot,
+        job.gpu_type, job.gpu_count, job.duration_hours, BASELINE_REGION, use_spot=ctx.use_spot,
     )
     baseline_est = next(
-        (e for e in estimates if e.cloud_region == BASELINE_REGION),
+        (e for e in ctx.estimates if e.cloud_region == BASELINE_REGION),
         None,
     )
     baseline_co2 = baseline_est.expected_co2_kg_mean if baseline_est else best.expected_co2_kg_mean
@@ -1132,81 +1210,157 @@ def run_launch(
     rec = RunRecord(
         run_id=uuid.uuid4().hex[:12],
         created_utc=datetime.now(UTC),
-        cloud_region=region,
+        cloud_region=ctx.region,
         gpu_type=job.gpu_type,
         gpu_count=job.gpu_count,
         duration_hours=job.duration_hours,
-        use_spot=use_spot,
+        use_spot=ctx.use_spot,
         baseline_region=BASELINE_REGION,
         estimated_co2_kg=best.expected_co2_kg_mean,
         baseline_co2_kg=baseline_co2,
         estimated_cost_usd=best.expected_cost_usd,
         baseline_cost_usd=baseline_cost,
     )
-    ledger = RunLedger(_resolve_db_path(db_path))
-    ledger.record(rec)
+    RunLedger(ctx.db_path).record(rec)
+    ctx.rec = rec
 
-    ckpt_patch = None
-    if checkpoint:
-        raw = yaml.safe_load(yaml_path.read_text()) or {}
-        script_source = ""
-        if script_path and script_path.is_file():
-            script_source = script_path.read_text()
-        else:
-            extracted = extract_script_path_from_run_command(raw.get("run", ""))
-            if extracted:
-                candidate = yaml_path.parent / extracted
-                if not candidate.is_file():
-                    candidate = Path.cwd() / extracted
-                if candidate.is_file():
-                    script_source = candidate.read_text()
 
-        framework = detect_framework(script_source) if script_source else Framework.UNKNOWN
-        task_name = raw.get("name", "carbonsight-job")
-        original_run = raw.get("run", "").strip()
+def _build_checkpoint_patch(ctx: _LaunchContext) -> None:
+    """Build the checkpoint YAML patch (if enabled) and resolve managed mode."""
+    options = ctx.options
+    if not options.checkpoint:
+        return
+    yaml_path = ctx.yaml_path
+    raw = yaml.safe_load(yaml_path.read_text()) or {}
+    script_source = ""
+    if options.script_path and options.script_path.is_file():
+        script_source = options.script_path.read_text()
+    else:
+        extracted = extract_script_path_from_run_command(raw.get("run", ""))
+        if extracted:
+            candidate = yaml_path.parent / extracted
+            if not candidate.is_file():
+                candidate = Path.cwd() / extracted
+            if candidate.is_file():
+                script_source = candidate.read_text()
 
-        ckpt_cfg = build_checkpoint_config(
-            task_name, framework,
-            save_interval_steps=checkpoint_interval,
-            bucket_uri=checkpoint_bucket,
-        )
-        ckpt_patch = build_checkpoint_yaml_patch(ckpt_cfg, original_run, shim_local_path())
+    framework = detect_framework(script_source) if script_source else Framework.UNKNOWN
+    task_name = raw.get("name", "carbonsight-job")
+    original_run = raw.get("run", "").strip()
 
-        # The dynamic loop owns recovery (unmanaged launches), so managed only applies to static runs.
-        if use_spot and not managed and effective_finish_by is None:
-            managed = True
-            typer.echo("Auto-enabling --managed for spot + checkpoint resilience.")
+    ckpt_cfg = build_checkpoint_config(
+        task_name, framework,
+        save_interval_steps=options.checkpoint_interval,
+        bucket_uri=options.checkpoint_bucket,
+    )
+    ctx.ckpt_patch = build_checkpoint_yaml_patch(ckpt_cfg, original_run, shim_local_path())
 
-        typer.echo(f"Checkpoint: framework={framework.value}, storage={ckpt_cfg.storage_name or checkpoint_bucket}")
+    # The dynamic loop owns recovery (unmanaged launches), so managed only applies to static runs.
+    if ctx.use_spot and not ctx.managed and ctx.effective_finish_by is None:
+        ctx.managed = True
+        typer.echo("Auto-enabling --managed for spot + checkpoint resilience.")
 
-    patched = build_patched_yaml_text(
-        yaml_path, cloud, region, use_spot=use_spot, ckpt_patch=ckpt_patch,
+    typer.echo(
+        f"Checkpoint: framework={framework.value}, "
+        f"storage={ckpt_cfg.storage_name or options.checkpoint_bucket}"
     )
 
-    sky_cwd = yaml_path.parent.resolve()
 
-    if dry_run:
+def _execute_deadline_launch(ctx: _LaunchContext) -> None:
+    """Deadline path: monitored event loop (launch, poll, relaunch after preemption)."""
+    options = ctx.options
+    rec = ctx.rec
+    assert rec is not None  # set by _record_run
+    assert ctx.plan_constraints is not None and ctx.region_inputs is not None
+    runner = SkyRunner(
+        ctx._patched_yaml_for_launch,
+        cwd=ctx.sky_cwd,
+        run_id=rec.run_id,
+        yes=options.yes,
+    )
+    observation_store: SpotObservationStore | None = None
+    try:
+        if ctx.spot_instance_type:
+            try:
+                observation_store = SpotObservationStore(ctx.db_path)
+            except (sqlite3.Error, OSError) as err:
+                typer.echo(
+                    f"Warning: spot history not persisted ({err}).", err=True,
+                )
+
+        def _persist_observation(obs_region: str, obs: SpotObservation) -> None:
+            if observation_store is None:
+                return
+            try:
+                observation_store.add(
+                    StoredObservation(
+                        observed_utc=obs.time_utc,
+                        region=obs_region,
+                        instance_type=ctx.spot_instance_type,
+                        available=obs.available,
+                        source=obs.source,
+                        run_id=rec.run_id,
+                        advisor_band=(ctx.advisor_bands or {}).get(obs_region),
+                    )
+                )
+            except sqlite3.Error as err:
+                typer.echo(f"Warning: could not persist spot observation ({err}).", err=True)
+
+        loop_exit_code = _execute_dynamic_run(
+            ctx.job,
+            ctx.plan_constraints,
+            ctx.region_inputs,
+            runner,
+            ctx.watt_time,
+            poll_seconds=options.poll_seconds,
+            idle_tick_hours=options.idle_tick_hours,
+            clock=options.clock or (lambda: datetime.now(UTC)),
+            sleep=options.sleep or time.sleep,
+            observations=ctx.spot_history,
+            on_observation=_persist_observation,
+            advisor_bands=ctx.advisor_bands,
+        )
+    finally:
+        if observation_store is not None:
+            observation_store.close()
+    if loop_exit_code != 0:
+        raise typer.Exit(loop_exit_code)
+
+
+def _dispatch_launch(ctx: _LaunchContext) -> None:
+    """Patch the YAML and run the selected launch mode (or a non-launch exit)."""
+    options = ctx.options
+    best = ctx.best
+    assert best is not None  # set by _select_region
+    patched = build_patched_yaml_text(
+        ctx.yaml_path, ctx.cloud, ctx.region, use_spot=ctx.use_spot, ckpt_patch=ctx.ckpt_patch,
+    )
+    ctx.patched = patched
+    sky_cwd = ctx.yaml_path.parent.resolve()
+    ctx.sky_cwd = sky_cwd
+
+    if options.dry_run:
         typer.echo("\n--- Patched YAML for SkyPilot (dry run) ---")
         typer.echo(patched)
         return
 
-    if no_exec:
+    if options.no_exec:
         typer.echo("\n--- Patched YAML for SkyPilot (--no-exec) ---")
         typer.echo(patched)
         typer.echo("Skipping launch (--no-exec).")
         return
 
-    if validate_sky:
+    if options.validate_sky:
         _require_sky_cli()
         typer.echo("\nValidating patched YAML with SkyPilot (`sky launch --dryrun`)...")
         exit_code = launch_skypilot_with_patched_yaml(
-            patched, managed=managed, yes=True, dryrun=True, cwd=sky_cwd,
+            patched, managed=ctx.managed, yes=True, dryrun=True, cwd=sky_cwd,
         )
         if exit_code == 0:
             typer.echo("SkyPilot accepted the patched YAML.")
         raise typer.Exit(exit_code)
 
-    if sky_smoke:
+    if options.sky_smoke:
         _require_sky_cli()
         smoke_data = yaml.safe_load(patched) or {}
         smoke_data["run"] = "echo 'carbonsight sky-smoke ok'\n"
@@ -1224,83 +1378,23 @@ def run_launch(
 
     _require_sky_cli()
 
-    if effective_finish_by is not None:
-        # Deadline path: monitored event loop (launch, poll, relaunch after preemption).
-        runner = SkyRunner(
-            lambda launch_region, spot: build_patched_yaml_text(
-                yaml_path,
-                cloud,
-                launch_region,
-                use_spot=spot,
-                ckpt_patch=ckpt_patch,
-                force_on_demand=not spot,
-            ),
-            cwd=sky_cwd,
-            run_id=rec.run_id,
-            yes=yes,
-        )
-        observation_store: SpotObservationStore | None = None
-        try:
-            if spot_instance_type:
-                try:
-                    observation_store = SpotObservationStore(_resolve_db_path(db_path))
-                except (sqlite3.Error, OSError) as err:
-                    typer.echo(
-                        f"Warning: spot history not persisted ({err}).", err=True,
-                    )
-
-            def _persist_observation(obs_region: str, obs: SpotObservation) -> None:
-                if observation_store is None:
-                    return
-                try:
-                    observation_store.add(
-                        StoredObservation(
-                            observed_utc=obs.time_utc,
-                            region=obs_region,
-                            instance_type=spot_instance_type,
-                            available=obs.available,
-                            source=obs.source,
-                            run_id=rec.run_id,
-                            advisor_band=(advisor_bands or {}).get(obs_region),
-                        )
-                    )
-                except sqlite3.Error as err:
-                    typer.echo(f"Warning: could not persist spot observation ({err}).", err=True)
-
-            loop_exit_code = _execute_dynamic_run(
-                job,
-                plan_constraints,
-                region_inputs,
-                runner,
-                watt_time,
-                poll_seconds=poll_seconds,
-                idle_tick_hours=idle_tick_hours,
-                clock=clock or (lambda: datetime.now(UTC)),
-                sleep=sleep or time.sleep,
-                observations=spot_history,
-                on_observation=_persist_observation,
-                advisor_bands=advisor_bands,
-            )
-        finally:
-            if observation_store is not None:
-                observation_store.close()
-        if loop_exit_code != 0:
-            raise typer.Exit(loop_exit_code)
+    if ctx.effective_finish_by is not None:
+        _execute_deadline_launch(ctx)
         return
 
     start_time = datetime.now(UTC)
     exit_code = launch_skypilot_with_patched_yaml(
-        patched, managed=managed, yes=yes, cwd=sky_cwd,
+        patched, managed=ctx.managed, yes=options.yes, cwd=sky_cwd,
     )
     if exit_code != 0:
         raise typer.Exit(exit_code)
 
     end_time = datetime.now(UTC)
     try:
-        actual = JobCarbonEstimator(watt_time).compute_actual_run(
-            job=job,
-            cloud=cloud,
-            cloud_region=region,
+        actual = JobCarbonEstimator(ctx.watt_time).compute_actual_run(
+            job=ctx.job,
+            cloud=ctx.cloud,
+            cloud_region=ctx.region,
             watttime_regions=best.watttime_regions,
             actual_start=start_time,
             actual_end=end_time,
@@ -1317,6 +1411,18 @@ def run_launch(
     except (ValueError, WattTimeError) as e:
         typer.echo(f"\nWarning: could not compute actual CO₂: {e}", err=True)
 
+
+def run_launch(yaml_path: Path, options: LaunchOptions) -> None:
+    """Shared implementation for ``run`` and ``train``.
+
+    With a finish-by deadline the launch is an event loop (``_execute_dynamic_run``); ``clock``
+    and ``sleep`` default to wall-clock time and are injectable for tests.
+    """
+    ctx = _prepare_launch_context(yaml_path, options)
+    _select_region(ctx)
+    _record_run(ctx)
+    _build_checkpoint_patch(ctx)
+    _dispatch_launch(ctx)
 
 def run_cmd(
     yaml_path: Path = typer.Argument(..., help="Path to SkyPilot-style job YAML"),
@@ -1431,29 +1537,31 @@ def run_cmd(
     parsed_finish_by = parse_finish_by(finish_by) if finish_by else None
     run_launch(
         yaml_path,
-        dry_run=dry_run,
-        no_exec=no_exec,
-        skip_preflight=skip_preflight,
-        managed=managed,
-        yes=yes,
-        max_cost_premium=max_cost_premium,
-        registry_path=registry_path,
-        gpu_util=gpu_util,
-        nvidia_smi=nvidia_smi,
-        use_spot=spot,
-        max_delay=max_delay,
-        db_path=db_path,
-        checkpoint=checkpoint,
-        checkpoint_bucket=checkpoint_bucket,
-        checkpoint_interval=checkpoint_interval,
-        live_pricing=live_pricing,
-        static_pricing=static_pricing,
-        finish_by=parsed_finish_by,
-        carbon_budget_kg=carbon_budget,
-        carbon_price=carbon_price,
-        validate_sky=validate_sky,
-        sky_smoke=sky_smoke,
-        poll_seconds=poll_seconds,
-        idle_tick_hours=idle_tick_hours,
-        probe_before_plan=probe_before_plan,
+        LaunchOptions(
+            dry_run=dry_run,
+            no_exec=no_exec,
+            skip_preflight=skip_preflight,
+            managed=managed,
+            yes=yes,
+            max_cost_premium=max_cost_premium,
+            registry_path=registry_path,
+            gpu_util=gpu_util,
+            nvidia_smi=nvidia_smi,
+            use_spot=spot,
+            max_delay=max_delay,
+            db_path=db_path,
+            checkpoint=checkpoint,
+            checkpoint_bucket=checkpoint_bucket,
+            checkpoint_interval=checkpoint_interval,
+            live_pricing=live_pricing,
+            static_pricing=static_pricing,
+            finish_by=parsed_finish_by,
+            carbon_budget_kg=carbon_budget,
+            carbon_price=carbon_price,
+            validate_sky=validate_sky,
+            sky_smoke=sky_smoke,
+            poll_seconds=poll_seconds,
+            idle_tick_hours=idle_tick_hours,
+            probe_before_plan=probe_before_plan,
+        ),
     )

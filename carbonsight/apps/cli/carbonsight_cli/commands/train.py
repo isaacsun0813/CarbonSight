@@ -8,8 +8,8 @@ from pathlib import Path
 import typer
 import yaml
 
-from carbonsight_cli.commands.advise import run_advise, parse_finish_by
-from carbonsight_cli.commands.run import run_launch
+from carbonsight_cli.commands.advise import parse_finish_by, run_advise
+from carbonsight_cli.commands.run import LaunchOptions, run_launch
 
 
 def _run_line_for_script(script: Path) -> str:
@@ -185,27 +185,29 @@ def train_cmd(
         if launch:
             run_launch(
                 tmp,
-                dry_run=dry_run,
-                no_exec=no_exec,
-                skip_preflight=skip_preflight,
-                managed=managed,
-                yes=yes,
-                max_cost_premium=max_cost_premium,
-                registry_path=registry_path,
-                gpu_util=gpu_util,
-                nvidia_smi=nvidia_smi,
-                use_spot=spot,
-                max_delay=max_delay,
-                db_path=db_path,
-                checkpoint=checkpoint,
-                checkpoint_bucket=checkpoint_bucket,
-                checkpoint_interval=checkpoint_interval,
-                script_path=script,
-                live_pricing=live_pricing,
-                static_pricing=static_pricing,
-                finish_by=parse_finish_by(finish_by) if finish_by else None,
-                carbon_budget_kg=carbon_budget,
-                carbon_price=carbon_price,
+                LaunchOptions(
+                    dry_run=dry_run,
+                    no_exec=no_exec,
+                    skip_preflight=skip_preflight,
+                    managed=managed,
+                    yes=yes,
+                    max_cost_premium=max_cost_premium,
+                    registry_path=registry_path,
+                    gpu_util=gpu_util,
+                    nvidia_smi=nvidia_smi,
+                    use_spot=spot,
+                    max_delay=max_delay,
+                    db_path=db_path,
+                    checkpoint=checkpoint,
+                    checkpoint_bucket=checkpoint_bucket,
+                    checkpoint_interval=checkpoint_interval,
+                    script_path=script,
+                    live_pricing=live_pricing,
+                    static_pricing=static_pricing,
+                    finish_by=parse_finish_by(finish_by) if finish_by else None,
+                    carbon_budget_kg=carbon_budget,
+                    carbon_price=carbon_price,
+                ),
             )
         else:
             run_advise(
