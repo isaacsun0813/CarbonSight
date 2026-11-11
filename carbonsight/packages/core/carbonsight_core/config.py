@@ -2,6 +2,17 @@
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+
+def _load_dotenv_files() -> None:
+    """Load `.env` from cwd and common package/repo roots if present."""
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    here = Path(__file__).resolve()
+    for candidate in (here.parents[3] / ".env", here.parents[4] / ".env"):
+        load_dotenv(candidate)
 
 
 @dataclass
@@ -22,6 +33,8 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        _load_dotenv_files()
+
         def str_to_bool(s: str) -> bool:
             return s.strip().lower() in ("1", "true", "yes")
 

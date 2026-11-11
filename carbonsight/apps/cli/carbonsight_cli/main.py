@@ -1,4 +1,4 @@
-"""CarbonSight CLI entrypoint. Commands: advise, train, run, history, report, dashboard, mappings validate/refresh, backtest run."""
+"""CarbonSight CLI entrypoint."""
 
 import typer
 
@@ -8,6 +8,7 @@ from carbonsight_cli.commands import (
     dashboard,
     history,
     mappings,
+    plan_static,
     report,
     run,
     train,
@@ -16,6 +17,7 @@ from carbonsight_cli.commands import (
 app = typer.Typer(name="carbonsight", help="Greenest cloud advisor and launcher (WattTime + SkyPilot)")
 
 app.command("advise")(advise.advise)
+app.command("plan-static")(plan_static.plan_static_cmd)
 app.command("train")(train.train_cmd)
 app.command("run")(run.run_cmd)
 app.command("history")(history.history_cmd)

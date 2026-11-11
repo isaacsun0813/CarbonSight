@@ -8,8 +8,8 @@ from pathlib import Path
 import typer
 import yaml
 
-from carbonsight_cli.commands.advise import run_advise
-from carbonsight_cli.commands.run import run_launch
+from carbonsight_cli.commands.advise import parse_finish_by, run_advise
+from carbonsight_cli.commands.run import LaunchOptions, run_launch
 
 
 def _run_line_for_script(script: Path) -> str:
@@ -39,7 +39,7 @@ def build_train_yaml_dict(
     return {
         "name": task_name,
         "resources": {
-            "cloud": cloud,
+            "infra": cloud,
             "accelerators": accelerators,
             "cpus": cpus,
             "memory": memory,
@@ -84,7 +84,7 @@ def train_cmd(
     ),
     cpus: int = typer.Option(8, "--cpus", help="CPU count in resources."),
     memory: int = typer.Option(32, "--memory", "-m", help="Memory (GiB) in resources."),
-    cloud: str = typer.Option("aws", "--cloud", help="resources.cloud (provider hint for SkyPilot)."),
+    cloud: str = typer.Option("aws", "--cloud", help="resources.infra provider hint for SkyPilot (e.g. aws)."),
     explain: bool = typer.Option(False, "--explain", help="[advise] Extra context after the table"),
     json_out: bool = typer.Option(False, "--json", help="[advise] Machine-readable JSON"),
     dry_run: bool = typer.Option(False, "--dry-run", help="[launch] Print patched YAML only"),
@@ -146,6 +146,21 @@ def train_cmd(
         "--static-pricing",
         help="Force static cost tables instead of live AWS pricing.",
     ),
+    finish_by: str | None = typer.Option(
+        None,
+        "--finish-by",
+        help="ISO-8601 finish-by deadline for dynamic planning when launching.",
+    ),
+    carbon_budget: float | None = typer.Option(
+        None,
+        "--carbon-budget",
+        help="Hard carbon budget in kg CO2 for dynamic planning.",
+    ),
+    carbon_price: float | None = typer.Option(
+        None,
+        "--carbon-price",
+        help="Shadow price in USD per kg CO2 for dynamic utility scoring.",
+    ),
 ) -> None:
     """Estimate carbon/cost for training ``script`` without writing a YAML by hand.
 
@@ -170,24 +185,29 @@ def train_cmd(
         if launch:
             run_launch(
                 tmp,
-                dry_run=dry_run,
-                no_exec=no_exec,
-                skip_preflight=skip_preflight,
-                managed=managed,
-                yes=yes,
-                max_cost_premium=max_cost_premium,
-                registry_path=registry_path,
-                gpu_util=gpu_util,
-                nvidia_smi=nvidia_smi,
-                use_spot=spot,
-                max_delay=max_delay,
-                db_path=db_path,
-                checkpoint=checkpoint,
-                checkpoint_bucket=checkpoint_bucket,
-                checkpoint_interval=checkpoint_interval,
-                script_path=script,
-                live_pricing=live_pricing,
-                static_pricing=static_pricing,
+                LaunchOptions(
+                    dry_run=dry_run,
+                    no_exec=no_exec,
+                    skip_preflight=skip_preflight,
+                    managed=managed,
+                    yes=yes,
+                    max_cost_premium=max_cost_premium,
+                    registry_path=registry_path,
+                    gpu_util=gpu_util,
+                    nvidia_smi=nvidia_smi,
+                    use_spot=spot,
+                    max_delay=max_delay,
+                    db_path=db_path,
+                    checkpoint=checkpoint,
+                    checkpoint_bucket=checkpoint_bucket,
+                    checkpoint_interval=checkpoint_interval,
+                    script_path=script,
+                    live_pricing=live_pricing,
+                    static_pricing=static_pricing,
+                    finish_by=parse_finish_by(finish_by) if finish_by else None,
+                    carbon_budget_kg=carbon_budget,
+                    carbon_price=carbon_price,
+                ),
             )
         else:
             run_advise(

@@ -15,12 +15,15 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-
-from carbonsight_core.estimator.carbon_model import LB_TO_KG, compute_actual_co2, estimate_job_carbon_in_region
+from carbonsight_core.estimator.carbon_model import (
+    LB_TO_KG,
+    compute_actual_co2,
+    estimate_job_carbon_in_region,
+)
+from carbonsight_core.estimator.power_model import expected_it_power_w
 from carbonsight_core.estimator.pricing import estimate_cost_usd
 from carbonsight_core.models import JobSpec
 from carbonsight_core.watttime import WattTimeError
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -141,9 +144,8 @@ class TestEstimateJobCarbonInRegion:
     def test_co2_math_is_correct(self) -> None:
         """With a fixed seed and known MOER, verify the CO2 formula end-to-end."""
         # At moer=400 lb/MWh and a deterministic seed we can't easily predict the
-        # exact value due to Monte Carlo variance, but we can bound it:
-        # min A100 power ~250W, max ~400W, PUE ~1.1-1.5 → facility ~275-600W
-        # For 1 hour: 0.000275-0.0006 MWh × 400 lb/MWh × 0.453 kg/lb → 0.05-0.11 kg
+        # exact value due to IT-power Monte Carlo variance, but we can bound it.
+        # Facility overhead is intentionally excluded.
         job = _make_job()
         result = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
         assert 0.01 < result.expected_co2_kg_mean < 2.0  # sanity bounds
@@ -258,6 +260,8 @@ class TestComputeActualCo2:
         assert result.actual_co2_kg > 0
         assert result.actual_duration_hours == pytest.approx(1.0)
         assert result.watttime_regions == _ACT_REGIONS
+        expected_kg = expected_it_power_w(self._JOB) / 1_000_000.0 * 400.0 * LB_TO_KG
+        assert result.actual_co2_kg == pytest.approx(expected_kg)
         wt.get_historical.assert_called_once()
 
     # M7-2: empty historical list → ValueError

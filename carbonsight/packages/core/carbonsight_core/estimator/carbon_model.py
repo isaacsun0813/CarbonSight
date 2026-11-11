@@ -1,13 +1,14 @@
 """
-Carbon estimator: E_facility_MWh, time-integrate MOER, Monte Carlo for mean/p10/p90.
-Design: CO2_kg = (E_facility_MWh * MOER_lb_per_MWh) * 0.45359237; support mixture mapping.
+Carbon estimator: E_IT_MWh, time-integrate MOER, Monte Carlo for mean/p10/p90.
+Design: CO2_kg = (E_IT_MWh * MOER_lb_per_MWh) * 0.45359237; support mixture mapping.
+Cooling and other facility overhead are excluded.
 """
 
 import random
 from datetime import UTC, datetime
 from typing import Any
 
-from carbonsight_core.estimator.power_model import sample_power_params
+from carbonsight_core.estimator.power_model import expected_it_power_w, sample_power_params
 from carbonsight_core.estimator.pricing import estimate_cost_usd, estimate_job_cost
 from carbonsight_core.models import ActualRunResult, EstimateResult, JobSpec
 from carbonsight_core.watttime import SUPPORTED_MOER_UNIT, WattTimeClient, WattTimeError
@@ -16,9 +17,9 @@ LB_TO_KG = 0.45359237
 MONTE_CARLO_SAMPLES = 1000
 
 
-def _facility_mwh_per_hour(p_it_w: float, pue: float) -> float:
-    """E_facility_MWh for one hour = (P_IT_W/1000)*1*hour*PUE/1000."""
-    return (p_it_w / 1000.0) * 1.0 * (pue / 1000.0)
+def _it_mwh(p_it_w: float, duration_hours: float) -> float:
+    """IT energy in MWh; cooling and other facility overhead are excluded."""
+    return p_it_w * duration_hours / 1_000_000.0
 
 
 def _time_weighted_moer(
@@ -56,6 +57,15 @@ def _time_weighted_moer(
         weighted_sum += float(p["value"]) * overlap
 
     return weighted_sum / total_seconds
+
+
+def time_weighted_moer(
+    points: list[dict[str, Any]],
+    actual_start: datetime,
+    actual_end: datetime,
+) -> float:
+    """Public alias for time-weighted average MOER over a window (lb/MWh)."""
+    return _time_weighted_moer(points, actual_start, actual_end)
 
 
 class JobCarbonEstimator:
@@ -122,8 +132,8 @@ class JobCarbonEstimator:
 
         for _ in range(MONTE_CARLO_SAMPLES):
             params = sample_power_params(job, rng)
-            facility_mwh_total = _facility_mwh_per_hour(params.p_it_w, params.pue) * job.duration_hours
-            co2_lb = facility_mwh_total * moer_lb
+            it_mwh_total = _it_mwh(params.p_it_w, job.duration_hours)
+            co2_lb = it_mwh_total * moer_lb
             co2_kg = co2_lb * LB_TO_KG
             samples_kg.append(co2_kg)
 
@@ -186,15 +196,8 @@ class JobCarbonEstimator:
                     )
                 avg_moer_lb += weight * _time_weighted_moer(points, actual_start, actual_end)
 
-        rng = random.Random(0)
-        samples_mwh: list[float] = []
-        for _ in range(MONTE_CARLO_SAMPLES):
-            params = sample_power_params(job, rng)
-            facility_mwh = _facility_mwh_per_hour(params.p_it_w, params.pue) * actual_duration_hours
-            samples_mwh.append(facility_mwh)
-        mean_facility_mwh = sum(samples_mwh) / len(samples_mwh)
-
-        actual_co2_kg = mean_facility_mwh * avg_moer_lb * LB_TO_KG
+        expected_it_mwh = _it_mwh(expected_it_power_w(job), actual_duration_hours)
+        actual_co2_kg = expected_it_mwh * avg_moer_lb * LB_TO_KG
         actual_cost_usd = estimate_cost_usd(job.gpu_type, job.gpu_count, actual_duration_hours, cloud_region)
 
         co2_savings_pct = (

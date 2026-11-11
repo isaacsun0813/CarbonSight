@@ -27,7 +27,28 @@ def test_carbonsight_help() -> None:
         )
     assert result.returncode == 0, (result.stderr or result.stdout)
     out = result.stdout or result.stderr
-    assert "advise" in out and "train" in out and "run" in out
+    assert all(command in out for command in ("advise", "plan-static", "train", "run"))
+
+
+def test_plan_static_help_marks_command_experimental_and_advisory() -> None:
+    """The static planner must not imply that it controls launch."""
+    root = Path(__file__).resolve().parents[2]
+    env = {
+        **__import__("os").environ,
+        "PYTHONPATH": str(root / "packages" / "core") + ":" + str(root / "apps" / "cli"),
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "carbonsight_cli.main", "plan-static", "--help"],
+        capture_output=True,
+        text=True,
+        cwd=root,
+        env=env,
+    )
+    assert result.returncode == 0, (result.stderr or result.stdout)
+    out = (result.stdout or result.stderr).lower()
+    assert "experimental" in out
+    assert "advisory" in out
+    assert "never launch or wait" in out
 
 
 def test_advise_parses_yaml() -> None:
@@ -58,8 +79,9 @@ def test_train_script_without_watttime_returns_empty_json() -> None:
     if not stub.is_file():
         return
     env = {**__import__("os").environ, "PYTHONPATH": str(root / "packages" / "core") + ":" + str(root / "apps" / "cli")}
-    env.pop("WATTTIME_USERNAME", None)
-    env.pop("WATTTIME_PASSWORD", None)
+    # Explicit empty values prevent python-dotenv from filling credentials from a local .env.
+    env["WATTTIME_USERNAME"] = ""
+    env["WATTTIME_PASSWORD"] = ""
     result = subprocess.run(
         [sys.executable, "-m", "carbonsight_cli.main", "train", str(stub), "--json"],
         capture_output=True,

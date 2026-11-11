@@ -16,6 +16,6 @@ carbonsight advise --yaml ../examples/skypilot/train.yaml --json
 carbonsight train ../examples/skypilot/train_stub.py --json
 ```
 
-CarbonSight uses **`resources`** (GPUs, CPUs, memory) and **`duration`** from the YAML—it does not read your Python file. Replace `train_stub.py` with your real `train.py` and adjust resources to match your workload.
+CarbonSight uses **`resources`** (GPUs, CPUs, memory), optional top-level **`duration`**, and optional **`carbonsight`** (`finish_by`, `carbon_budget_kg`, `carbon_price`) from the YAML—it does not read your Python file. Those CarbonSight fields are removed before SkyPilot sees the task. GPU utilization: `--gpu-util` or `--nvidia-smi` on the CLI. Replace `train_stub.py` with your real `train.py` and adjust resources to match your workload.
 
 To launch in the cloud you need [SkyPilot](https://skypilot.readthedocs.io/) configured for AWS; then see `carbonsight/README.md` for `carbonsight run`.

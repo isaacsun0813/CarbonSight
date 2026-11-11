@@ -7,6 +7,7 @@ Confidence: 0.35*S_source + 0.25*S_geo + 0.25*S_wt_stability + 0.15*S_recency
 """
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -73,6 +74,18 @@ def mapping_confidence_label(c: float) -> str:
     return "Low"
 
 
+def is_plannable_aws_region(
+    entry: CloudRegionEntry,
+    allowed_codes: frozenset[str] | None = None,
+) -> bool:
+    """AWS region with WattTime mapping, optionally restricted to ``allowed_codes``."""
+    if entry.provider.lower() != "aws" or not entry.wt_regions:
+        return False
+    if allowed_codes is not None and entry.region_code not in allowed_codes:
+        return False
+    return True
+
+
 class Registry:
     """Load from JSON; resolve(cloud, region_code) -> MappingResult."""
 
@@ -120,6 +133,19 @@ class Registry:
             confidence=conf,
             label=mapping_confidence_label(conf),
         )
+
+    def get_entry(self, provider: str, region_code: str) -> CloudRegionEntry | None:
+        """Return registry entry for (provider, region_code), or None."""
+        return self._regions.get((provider.lower(), region_code.lower()))
+
+    def iter_plannable_aws_regions(
+        self,
+        allowed_codes: frozenset[str] | None = None,
+    ) -> Iterator[CloudRegionEntry]:
+        """Yield AWS regions that have WattTime mappings."""
+        for entry in self._regions.values():
+            if is_plannable_aws_region(entry, allowed_codes):
+                yield entry
 
     def all_regions(self) -> list[CloudRegionEntry]:
         """Return all cloud regions (for listing)."""

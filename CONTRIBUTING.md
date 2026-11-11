@@ -28,7 +28,7 @@ ruff check packages/core apps/cli apps/api
 pytest tests/unit tests/e2e -q
 ```
 
-Live WattTime integration tests skip without `WATTTIME_USERNAME` / `WATTTIME_PASSWORD` in the environment.
+Live WattTime integration tests skip without `WATTTIME_USERNAME` / `WATTTIME_PASSWORD` in the environment (or in `carbonsight/.env`, which is loaded automatically).
 
 ## Pull requests
 

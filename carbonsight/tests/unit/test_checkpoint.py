@@ -185,6 +185,7 @@ class TestApplyCheckpointPatchToYaml:
     def test_preserves_existing_fields(self) -> None:
         original = {
             "name": "my-task",
+            "workdir": ".",
             "resources": {"accelerators": "A100:1"},
             "duration": "2h",
             "run": "python train.py\n",
@@ -194,6 +195,7 @@ class TestApplyCheckpointPatchToYaml:
         result = apply_checkpoint_patch_to_yaml(original, patch)
 
         assert result["name"] == "my-task"
+        assert result["workdir"] == "."
         assert result["resources"]["accelerators"] == "A100:1"
         assert result["duration"] == "2h"
 
