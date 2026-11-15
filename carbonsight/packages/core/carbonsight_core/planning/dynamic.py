@@ -224,9 +224,10 @@ def pick_next_state(
     remaining_time = (constraints.deadline_utc - state.now_utc).total_seconds() / 3600.0
     theta = deadline_pressure(remaining_work, remaining_time)
     elapsed = (state.now_utc - constraints.now_utc).total_seconds() / 3600.0
-    theta_bar = (
-        state.progress_hours / max(elapsed, 1e-9) if elapsed > 0 else state.total_work_hours
-    )
+    # theta_bar is a progress rate (work-hours per clock-hour, at most 1.0). At
+    # elapsed == 0 there is no observed rate yet, so use that maximum instead of
+    # total_work_hours, which is a duration and deflates v_t at the first decision.
+    theta_bar = state.progress_hours / max(elapsed, 1e-9) if elapsed > 0 else 1.0
     v_t = progress_value(theta, theta_bar, c_od_min)
 
     should_force_ondemand = safety_net_triggered(state, constraints)
@@ -310,10 +311,16 @@ def _run_ondemand_to_completion(
     progress = state.progress_hours
 
     if state.mode == JobMode.IDLE:
-        cold_end = now + timedelta(hours=constraints.cold_start_hours)
-        cost_delta += chosen.cost_rate_usd_per_hr * constraints.cold_start_hours
+        # Never simulate past the deadline: cold start and work stop there, and
+        # ``finalize`` reports whatever progress was made as a missed deadline.
+        cold_hours = min(
+            constraints.cold_start_hours,
+            max((constraints.deadline_utc - now).total_seconds() / 3600.0, 0.0),
+        )
+        cold_end = now + timedelta(hours=cold_hours)
+        cost_delta += chosen.cost_rate_usd_per_hr * cold_hours
         _, moer = estimate_window_carbon_kg(job, region_input.forecast_points, now, cold_end)
-        carbon_delta += carbon_rate_kg_per_hr(job, moer) * constraints.cold_start_hours
+        carbon_delta += carbon_rate_kg_per_hr(job, moer) * cold_hours
         now = cold_end
         events.append(
             DynamicPlanEvent(
@@ -328,24 +335,29 @@ def _run_ondemand_to_completion(
             )
         )
 
-    run_hours = remaining
+    run_hours = min(
+        remaining,
+        max((constraints.deadline_utc - now).total_seconds() / 3600.0, 0.0),
+    )
+    completed = run_hours >= remaining
     run_end = now + timedelta(hours=run_hours)
     run_cost = chosen.cost_rate_usd_per_hr * run_hours
     run_carbon, _ = estimate_window_carbon_kg(job, region_input.forecast_points, now, run_end)
     progress += run_hours
     now = run_end
-    events.append(
-        DynamicPlanEvent(
-            time_utc=now,
-            event_type=DynamicEventType.COMPLETE,
-            region=chosen.region,
-            mode=JobMode.ON_DEMAND,
-            progress_hours=progress,
-            cost_usd_delta=run_cost,
-            carbon_kg_delta=run_carbon,
-            notes="work complete on-demand",
+    if completed:
+        events.append(
+            DynamicPlanEvent(
+                time_utc=now,
+                event_type=DynamicEventType.COMPLETE,
+                region=chosen.region,
+                mode=JobMode.ON_DEMAND,
+                progress_hours=progress,
+                cost_usd_delta=run_cost,
+                carbon_kg_delta=run_carbon,
+                notes="work complete on-demand",
+            )
         )
-    )
     return JobRuntimeState(
         region=chosen.region,
         mode=JobMode.IDLE,
@@ -666,7 +678,10 @@ class DynamicJob:
         ``deadline_met`` is only about finishing the work in time; the carbon budget is reported
         separately in ``carbon_budget_met``.
         """
-        deadline_met = state.progress_hours >= self.job.duration_hours
+        deadline_met = (
+            state.progress_hours >= self.job.duration_hours
+            and state.now_utc <= self.constraints.deadline_utc
+        )
         if not deadline_met:
             self.events.append(
                 DynamicPlanEvent(
