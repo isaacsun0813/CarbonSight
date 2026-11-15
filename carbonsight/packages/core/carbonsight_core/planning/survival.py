@@ -93,12 +93,12 @@ class NelsonAalenModel:
         lifetimes = self._sorted_lifetimes()
         if not lifetimes:
             return 1.0 / ASSUMED_SPOT_MEAN_LIFETIME_HOURS
-        l = self._bucket(lifetime_hours)
-        e_l = self.complete_counts.get(l, 0)
+        lifetime_bucket = self._bucket(lifetime_hours)
+        e_l = self.complete_counts.get(lifetime_bucket, 0)
         n_l = sum(
             self.complete_counts.get(x, 0) + self.censored_counts.get(x, 0)
             for x in lifetimes
-            if x >= l
+            if x >= lifetime_bucket
         )
         if n_l <= 0:
             return 0.0
@@ -133,10 +133,10 @@ class NelsonAalenModel:
         s_a = self.survival(age, gamma_star=gamma_star)
         if s_a <= 1e-12:
             return 0.25
-        tail = [l for l in lifetimes if l > age]
+        tail = [one_time for one_time in lifetimes if one_time > age]
         if not tail:
             return 0.25
-        weighted = sum(self.survival(l, gamma_star=gamma_star) for l in tail)
+        weighted = sum(self.survival(point, gamma_star=gamma_star) for point in tail)
         return max(weighted / s_a, 0.25)
 
 

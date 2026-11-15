@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 import typer
@@ -249,7 +249,7 @@ _SKY_CLUSTER_STATES = frozenset({"UP", "INIT", "STOPPED"})
 AUTOSTOP_IDLE_MINUTES = 10
 
 
-class SkyStatus(str, Enum):
+class SkyStatus(StrEnum):
     """What the dynamic loop sees for the launched job."""
 
     RUNNING = "running"
