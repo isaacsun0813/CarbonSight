@@ -4,8 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
-
-from carbonsight_cli.commands.advise import (
+from carbonsight_cli.commands.job_setup import (
     resolve_carbon_budget_kg,
     resolve_carbon_price,
     resolve_finish_by,

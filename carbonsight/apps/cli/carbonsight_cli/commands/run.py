@@ -33,13 +33,9 @@ from carbonsight_core.cloud.aws.quota import QuotaChecker
 from carbonsight_core.cloud.aws.spot_advisor import SpotAdvisorError, fetch_advisor_bands
 from carbonsight_core.config import Config
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
-from carbonsight_core.estimator.pricing import configure_pricing, estimate_cost_usd
+from carbonsight_core.estimator.pricing import estimate_cost_usd
 from carbonsight_core.mapping.registry import Registry
 from carbonsight_core.models import EstimateResult, JobSpec
-from carbonsight_core.paths import (
-    carbonsight_package_root_from_cli_command_file,
-    resolve_registry_json_file,
-)
 from carbonsight_core.planning import (
     ADVISOR_BAND_LABELS,
     DynamicEventType,
@@ -67,16 +63,18 @@ from carbonsight_core.spot_history import SpotObservationStore, StoredObservatio
 from carbonsight_core.tracking import RunLedger, RunRecord
 from carbonsight_core.watttime import WattTimeClient, WattTimeError
 
-from carbonsight_cli.commands.advise import (
-    apply_gpu_telemetry_cli,
+from carbonsight_cli.commands.job_setup import (
     carbonsight_block_from_yaml,
-    job_spec_from_sky_yaml,
+    ensure_job_inputs,
+    load_config,
+    load_job_spec,
+    load_registry,
     parse_duration_hours,
     parse_finish_by,
     resolve_carbon_budget_kg,
     resolve_carbon_price,
     resolve_finish_by,
-    resolve_live_aws_pricing,
+    resolve_registry_file,
     strip_carbonsight_only_yaml_keys,
 )
 
@@ -1027,41 +1025,15 @@ def _prepare_launch_context(yaml_path: Path, options: LaunchOptions) -> _LaunchC
         typer.echo("Error: --poll-seconds and --idle-tick-hours must be positive.", err=True)
         raise typer.Exit(1)
 
-    if not yaml_path.exists():
-        typer.echo(f"Error: file not found: {yaml_path}", err=True)
-        raise typer.Exit(1)
+    ensure_job_inputs(yaml_path, options.gpu_util)
 
-    if options.gpu_util is not None and not (0.0 <= options.gpu_util <= 1.0):
-        typer.echo("Error: --gpu-util must be between 0 and 1.", err=True)
-        raise typer.Exit(1)
-
-    job = job_spec_from_sky_yaml(yaml_path)
-    job, nvidia_failed = apply_gpu_telemetry_cli(
-        job, gpu_util=options.gpu_util, nvidia_smi=options.nvidia_smi
+    job = load_job_spec(
+        yaml_path, gpu_util=options.gpu_util, nvidia_smi=options.nvidia_smi
     )
-    if nvidia_failed:
-        typer.echo(
-            "Warning: --nvidia-smi could not read utilization (no GPU driver here?). "
-            "Using default sampled GPU power.",
-            err=True,
-        )
-    package_root = carbonsight_package_root_from_cli_command_file(Path(__file__))
-    rpath = resolve_registry_json_file(
-        options.registry_path, carbonsight_package_root=package_root, cwd=Path.cwd()
-    )
-    if not rpath.exists():
-        typer.echo("No registry found. Use --registry or add seed_registry.json.", err=True)
-        raise typer.Exit(1)
+    reg = load_registry(resolve_registry_file(options.registry_path))
 
-    reg = Registry()
-    reg.load_json(rpath)
-
-    config = Config.from_env()
-    configure_pricing(
-        config,
-        live_aws_pricing=resolve_live_aws_pricing(
-            config, live_pricing=options.live_pricing, static_pricing=options.static_pricing,
-        ),
+    config = load_config(
+        live_pricing=options.live_pricing, static_pricing=options.static_pricing
     )
     if not config.watttime_username or not config.watttime_password:
         typer.echo("Set WATTTIME_USERNAME and WATTTIME_PASSWORD.", err=True)

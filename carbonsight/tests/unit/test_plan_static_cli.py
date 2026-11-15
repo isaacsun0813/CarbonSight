@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
-from carbonsight_cli.commands import plan_static
+from carbonsight_cli.commands import job_setup, plan_static
 from carbonsight_cli.main import app
 from carbonsight_core.planning import RegionPlanInput
 from typer.testing import CliRunner
@@ -35,12 +35,12 @@ def _stub_external_inputs(monkeypatch, tmp_path: Path, *, with_regions: bool = T
         def load_json(self, path: Path) -> None:
             assert path == registry_path
 
-    monkeypatch.setattr(plan_static, "Registry", FakeRegistry)
+    monkeypatch.setattr(job_setup, "Registry", FakeRegistry)
     monkeypatch.setattr(
-        plan_static, "resolve_registry_json_file", lambda *args, **kwargs: registry_path,
+        job_setup, "resolve_registry_json_file", lambda *args, **kwargs: registry_path,
     )
     monkeypatch.setattr(
-        plan_static.Config,
+        job_setup.Config,
         "from_env",
         lambda: SimpleNamespace(
             watttime_username="user",
@@ -48,7 +48,7 @@ def _stub_external_inputs(monkeypatch, tmp_path: Path, *, with_regions: bool = T
             live_aws_pricing=False,
         ),
     )
-    monkeypatch.setattr(plan_static, "configure_pricing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(job_setup, "configure_pricing", lambda *args, **kwargs: None)
     monkeypatch.setattr(plan_static, "WattTimeClient", lambda config: object())
 
     def fake_region_inputs(registry, watt_time, job, constraints):

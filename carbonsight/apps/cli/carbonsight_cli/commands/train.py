@@ -8,7 +8,8 @@ from pathlib import Path
 import typer
 import yaml
 
-from carbonsight_cli.commands.advise import parse_finish_by, run_advise
+from carbonsight_cli.commands.advise import run_advise
+from carbonsight_cli.commands.job_setup import parse_finish_by
 from carbonsight_cli.commands.run import LaunchOptions, run_launch
 
 

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 import typer
 import yaml
+from carbonsight_cli.commands import job_setup
 from carbonsight_cli.commands import run as run_mod
 from carbonsight_core.models import EstimateResult
 
@@ -85,14 +86,14 @@ def harness(tmp_path: Path, monkeypatch):
         calls["launches"].append((patched, kwargs))
         return 0
 
-    monkeypatch.setattr(run_mod, "Registry", FakeRegistry)
+    monkeypatch.setattr(job_setup, "Registry", FakeRegistry)
     monkeypatch.setattr(
-        run_mod, "resolve_registry_json_file", lambda *a, **k: registry_path
+        job_setup, "resolve_registry_json_file", lambda *a, **k: registry_path
     )
     monkeypatch.setattr(
-        run_mod.Config, "from_env", classmethod(lambda cls: FakeConfig())
+        job_setup.Config, "from_env", classmethod(lambda cls: FakeConfig())
     )
-    monkeypatch.setattr(run_mod, "configure_pricing", lambda *a, **k: None)
+    monkeypatch.setattr(job_setup, "configure_pricing", lambda *a, **k: None)
     monkeypatch.setattr(run_mod, "WattTimeClient", lambda config: object())
     monkeypatch.setattr(
         run_mod.AwsRegionRankingService,
@@ -191,7 +192,7 @@ def test_empty_estimates_exits(harness, monkeypatch) -> None:
 def test_missing_credentials_exits(harness, monkeypatch) -> None:
     yaml_path, _calls = harness
     monkeypatch.setattr(
-        run_mod.Config,
+        job_setup.Config,
         "from_env",
         classmethod(lambda cls: FakeConfig(watttime_username="", watttime_password="")),
     )
