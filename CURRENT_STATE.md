@@ -9,7 +9,7 @@ If this doc and code disagree, treat the **code as truth** and update this doc a
 CarbonSight is a Python CLI (and optional API) that helps you **choose a lower-operational-carbon AWS region for GPU jobs** by combining:
 
 - **WattTime marginal emissions** (MOER) for grid regions (forecast + historical)
-- A **GPU/CPU/memory power model** with **PUE** sampling (Monte Carlo uncertainty)
+- A **GPU/CPU/memory IT-power model** with Monte Carlo uncertainty for ranking; cooling and other facility overhead are excluded
 - A **mapping registry** from cloud regions → lat/lon → WattTime grid regions (supports mixtures with weights)
 - A simple **cost estimate** and a **“max cost premium”** filter (pick greenest within budget)
 
@@ -36,6 +36,14 @@ Relevant code:
 - CLI implementation: `carbonsight/apps/cli/carbonsight_cli/commands/advise.py`
 - Ranking orchestration: `carbonsight/packages/core/carbonsight_core/region_ranking.py`
 
+### Experimental one-shot plan (`carbonsight plan-static`)
+
+- Requires `--finish-by` or YAML `carbonsight.finish_by`.
+- Enumerates forecasted region, start-time, and spot/on-demand candidates, then prints the
+  best feasible candidate (or emits it with `--json`).
+- **Advisory only**: it does not patch YAML, wait, or launch, and `carbonsight run` does
+  not call this planner.
+
 ### 2) Pick a region, patch YAML, and optionally launch (`carbonsight run`)
 
 `carbonsight run` does:
@@ -50,15 +58,15 @@ Relevant code:
 Key behavior from the code:
 
 - **Spot pricing**: `--spot` (default ON) sets `resources.use_spot: true` in the patched YAML. By default, cost uses static on-demand × 35% (`SPOT_PRICE_FRACTION`). With `CARBONSIGHT_LIVE_AWS_PRICING=1` or `--live-pricing`, spot cost uses EC2 `describe_spot_price_history`; on-demand (`--no-spot`) uses Pricing API `get_products`. Falls back to static tables on API errors. `--static-pricing` forces static tables.
-- **Carbon-aware scheduling (no deadline)**: `--max-delay 6h` scans the forecast for the lowest-carbon start time within the delay window and prints a recommendation. Default `0h` (run immediately). Skipped when `finish_by` is set.
-- **Dynamic planner (deadline)**: YAML `carbonsight.finish_by` or `--finish-by` enables `planning/plan_dynamic_job` — simulates greedy spot, idle/wait, and Safety Net on-demand fallback, then launches in the recommended initial region/mode. Optional `carbon_budget_kg` / `carbon_price` in YAML or via CLI (CLI overrides only when passed).
+- **Immediate region ranking (no deadline)**: `run` picks from `AwsRegionRankingService`. `--max-delay 6h` scans the forecast for the lowest-carbon start time within the delay window and only prints a recommendation; it does not delay launch. Default `0h` (run immediately). Skipped when `finish_by` is set.
+- **Dynamic planner (deadline)**: YAML `carbonsight.finish_by` or `--finish-by` prints a `planning/plan_dynamic_job` simulation (greedy spot, idle/wait, Safety Net on-demand fallback) and then runs a monitored loop (`planning/DynamicJob` driven from `run.py`): launch, poll, and relaunch after an observed preemption (`--poll-seconds`, `--idle-tick-hours`). The SkyPilot polling/launch path is covered by fake-runner tests only and still needs a manual check on a real AWS account. Spot lifetimes use an **assumed** 4h prior (labeled as such, not AWS data) until observations exist; launches, observed preemptions and pre-plan launch-then-terminate probes are stored in local SQLite (`spot_observations` in `runs.db`) and replayed on later runs. With a deadline the CLI also fetches AWS Spot Instance Advisor bands (undocumented, coarse, trailing 30 days; fails open) and uses them only as relative regional weights on that prior; the posterior switches to Nelson–Aalen after 5 observed preemptions in a region. Before planning it also runs one AWS spot probe per candidate region (`--no-probe` to skip; bills real GPU instances, needs vCPU quota, not verified on a real account). The advisor fetch, the pre-plan probe wiring and the hybrid prior are covered by unit tests with fake data only. Optional `carbon_budget_kg` / `carbon_price` in YAML or via CLI (CLI overrides only when passed).
 - **YAML → SkyPilot**: `duration` and the `carbonsight` block are read for planning then **stripped** from the patched YAML sent to SkyPilot.
 - **Checkpoint resilience**: `--checkpoint` (default ON) wraps the training command with automatic checkpoint saving and resume. Detects the ML framework (HuggingFace, Lightning, PyTorch) via AST analysis, mounts persistent SkyPilot Storage at `/ckpt`, and injects a shim that handles SIGTERM → SIGINT for graceful saves on preemption. Auto-enables `--managed` (SkyPilot managed spot) when spot + checkpoint are both on. Customizable with `--checkpoint-bucket` (explicit S3 URI) and `--checkpoint-interval` (steps, default 500). Disable with `--no-checkpoint`.
 - **Run tracking**: each run is persisted to a SQLite ledger (`~/.carbonsight/runs.db` by default, overridable with `--db` or `CARBONSIGHT_DB`). Baseline is `us-east-1` on-demand/spot (matching `--spot`).
 - **Dry run**: `--dry-run` prints SkyPilot-ready patched YAML and exits
 - **No exec**: `--no-exec` prints patched YAML and exits (after choosing region)
 - **SkyPilot checks**: `--validate-sky` runs `sky launch --dryrun`; `--sky-smoke` launches a minimal echo job with `--down`
-- **AWS preflight**: enabled by default (`--skip-preflight` to disable); intersects registry with account-enabled regions, checks GPU Service Quotas, and EC2 instance type offerings per region. Quota, instance availability, and enabled-regions checks all extend `BaseAWSProvider` (`cloud/aws/base.py`).
+- **AWS preflight**: enabled by default (`--skip-preflight` to disable); intersects registry with account-enabled regions, checks GPU Service Quotas (the spot or on-demand quota family that matches the launch), and EC2 instance type offerings per region. Quota, instance availability, and enabled-regions checks all extend `BaseAWSProvider` (`cloud/aws/base.py`).
 - **After a successful SkyPilot launch**: attempts to compute **actual CO₂** using **historical MOER** over the wall-clock run window and compares to the estimate.
 
 Relevant code:
@@ -148,10 +156,11 @@ Prints total estimated CO₂/cost vs baseline (us-east-1), with absolute and per
 
 ## What it does *not* do yet (important limitations)
 
-- **No persistent DB for API**: API runs are stored in memory only (`_runs_store`), not Postgres. CLI runs are persisted in SQLite.
+- **No persistent DB for API**: API runs are stored in memory only (`_runs_store`), not Postgres. CLI runs and spot observation history are persisted in local SQLite.
+- **Spot lifetimes are not AWS-published data**: the planner's prior is an assumed placeholder until local observations exist, and those are sparse (a few launches, optional probes). The survival estimate is crude; do not read it as real interruption rates.
 - **No mapping auto-refresh via API**: `POST /v1/mappings/revalidate` validates drift only; use CLI `mappings refresh --write` to update the registry JSON.
 - **Not compliance-grade accounting**: this is an operational estimate from marginal emissions + a simplified power model.
-- **Scheduling is advisory**: `--max-delay` recommends a start time but does not wait before launch. The dynamic planner (`finish_by`) simulates a trajectory and picks an initial launch; it does not re-plan during SkyPilot execution.
+- **Scheduling is advisory**: `--max-delay` recommends a start time but does not wait before launch. The dynamic loop (`finish_by`) re-decides only when idle (before launch or after a preemption); it does not migrate a healthy running job, uses forecasts fetched once at start, and tracks progress as elapsed run time rather than training steps.
 
 ## “Where to look in code”
 

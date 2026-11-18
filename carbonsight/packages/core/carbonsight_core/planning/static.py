@@ -1,11 +1,14 @@
-"""Static pre-launch planner: brute-force over region x start x mode."""
+"""Experimental one-shot advisory planner: brute-force over region x start x mode.
+
+This planner is exposed by ``carbonsight plan-static`` but is not used by the
+``run`` launch path.
+"""
 
 from carbonsight_core.estimator.pricing import estimate_job_cost
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning.constraints import (
     filter_by_priority,
     finish_time,
-    latest_feasible_start,
     pick_best_candidate,
 )
 from carbonsight_core.planning.types import (
@@ -16,12 +19,12 @@ from carbonsight_core.planning.types import (
     RegionPlanInput,
 )
 from carbonsight_core.planning.utility import (
+    calc_utility,
     carbon_rate_kg_per_hr,
     deadline_pressure,
     estimate_window_carbon_kg,
     parse_forecast_utc,
     progress_value,
-    calc_utility,
 )
 
 
@@ -60,11 +63,6 @@ def enumerate_candidates(
         if not region.forecast_points:
             continue
         sorted_pts = region.forecast_points
-        latest_start = latest_feasible_start(
-            constraints.deadline_utc,
-            job.duration_hours,
-            constraints.cold_start_hours,
-        )
         migration_usd = _migration_cost(constraints, checkpoint_region, region.cloud_region)
 
         for p in sorted_pts:
@@ -72,9 +70,6 @@ def enumerate_candidates(
             before_planning_window = t_s < constraints.now_utc
             if before_planning_window:
                 continue
-            after_latest_start = t_s > latest_start
-            if after_latest_start:
-                break
 
             t_finish = finish_time(t_s, job.duration_hours, constraints.cold_start_hours)
             carbon_kg, moer_lb = estimate_window_carbon_kg(

@@ -65,6 +65,16 @@ CarbonSight reads `duration` and `carbonsight.*` for estimates/planning, then **
 
    With `finish_by` in YAML (or `--finish-by`), `run` uses the **dynamic planner** for deadline-aware region/mode choice.
 
+3. **Experimental static plan** — print one-shot region/start/mode advice without launching:
+
+   ```bash
+   carbonsight plan-static --yaml path/to/train.yaml --finish-by 2026-11-10T12:00:00Z
+   ```
+
+   This command is advisory only: it does not patch YAML, wait until the selected start,
+   or launch SkyPilot. Without `finish_by`, `run` uses immediate region ranking.
+   `run --max-delay` prints start-time advice but does not delay launch.
+
 ### Option B — `train` (no YAML hand-authoring)
 
 From your **project root** (so paths match what SkyPilot uploads):

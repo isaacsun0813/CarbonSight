@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 
 from carbonsight_core.estimator.carbon_model import LB_TO_KG, time_weighted_moer
-from carbonsight_core.estimator.power_model import PUE_MEAN, power_it_w
+from carbonsight_core.estimator.power_model import expected_it_power_w
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning.types import JobMode
 
@@ -13,10 +13,9 @@ def parse_forecast_utc(ts: str) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
-def facility_mwh_for_duration(job: JobSpec, duration_hours: float, pue: float = PUE_MEAN) -> float:
-    """Facility MWh over duration using mean IT power and fixed PUE."""
-    p_it_w = power_it_w(job)
-    return (p_it_w / 1000.0) * duration_hours * (pue / 1000.0)
+def it_mwh_for_duration(job: JobSpec, duration_hours: float) -> float:
+    """IT MWh over duration; cooling and other facility overhead are excluded."""
+    return expected_it_power_w(job) * duration_hours / 1_000_000.0
 
 
 def estimate_window_carbon_kg(
@@ -24,23 +23,21 @@ def estimate_window_carbon_kg(
     forecast_points: list[dict],
     start_utc: datetime,
     finish_utc: datetime,
-    *,
-    pue: float = PUE_MEAN,
 ) -> tuple[float, float]:
-    """Return (carbon_kg, time_weighted_moer_lb_per_mwh) for [start, finish]."""
+    """Return IT operational carbon and time-weighted MOER for [start, finish]."""
     duration_hours = (finish_utc - start_utc).total_seconds() / 3600.0
     if duration_hours <= 0:
         return 0.0, 0.0
     moer_lb = time_weighted_moer(forecast_points, start_utc, finish_utc)
-    facility_mwh = facility_mwh_for_duration(job, duration_hours, pue=pue)
-    carbon_kg = moer_lb * facility_mwh * LB_TO_KG
+    it_mwh = it_mwh_for_duration(job, duration_hours)
+    carbon_kg = moer_lb * it_mwh * LB_TO_KG
     return carbon_kg, moer_lb
 
 
-def carbon_rate_kg_per_hr(job: JobSpec, moer_lb_per_mwh: float, pue: float = PUE_MEAN) -> float:
-    """Instantaneous carbon emission rate (kg/hr) at given MOER."""
-    facility_mwh_per_hr = facility_mwh_for_duration(job, 1.0, pue=pue)
-    return moer_lb_per_mwh * facility_mwh_per_hr * LB_TO_KG
+def carbon_rate_kg_per_hr(job: JobSpec, moer_lb_per_mwh: float) -> float:
+    """Instantaneous IT operational carbon rate (kg/hr) at given MOER."""
+    it_mwh_per_hr = it_mwh_for_duration(job, 1.0)
+    return moer_lb_per_mwh * it_mwh_per_hr * LB_TO_KG
 
 
 def progress_value(theta: float, theta_bar: float, c_od_min: float) -> float:

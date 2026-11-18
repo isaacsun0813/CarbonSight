@@ -2,10 +2,13 @@
 
 import random
 
-import pytest
-
 from carbonsight_core.estimator.carbon_model import estimate_job_carbon_in_region
-from carbonsight_core.estimator.power_model import _sample_u_gpu, sample_power_params
+from carbonsight_core.estimator.power_model import (
+    _sample_u_gpu,
+    expected_it_power_w,
+    power_it_w,
+    sample_power_params,
+)
 from carbonsight_core.models import JobSpec
 from carbonsight_core.telemetry.nvidia_smi import parse_nvidia_smi_utilization_csv
 
@@ -30,6 +33,15 @@ class TestNvidiaSmiParse:
 
 
 class TestPowerModelGpuUtilization:
+    def test_expected_power_honors_observed_gpu_utilization(self) -> None:
+        job = JobSpec(
+            gpu_type="A100",
+            gpu_count=1,
+            duration_hours=1.0,
+            gpu_utilization=0.42,
+        )
+        assert expected_it_power_w(job) == power_it_w(job, u_gpu=0.42, u_cpu=0.5)
+
     def test_sample_u_gpu_fixed_when_spec_set(self) -> None:
         job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0, gpu_utilization=0.42)
         rng = random.Random(999)

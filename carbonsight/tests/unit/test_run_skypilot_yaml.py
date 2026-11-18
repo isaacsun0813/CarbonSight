@@ -44,3 +44,20 @@ def test_patch_omits_carbonsight_keys(tmp_path: Path) -> None:
     assert "carbonsight" not in data
     assert data["resources"]["infra"] == "aws/eu-north-1"
     assert data["resources"]["use_spot"] is True
+
+
+def test_force_on_demand_overrides_spot_in_yaml(tmp_path: Path) -> None:
+    y = tmp_path / "job.yaml"
+    y.write_text(
+        yaml.dump(
+            {"name": "t", "resources": {"accelerators": "A100:1", "use_spot": True}, "run": "x\n"},
+            default_flow_style=False,
+            sort_keys=False,
+        )
+    )
+    default = yaml.safe_load(patch_sky_yaml_with_cloud_region(y, "aws", "us-west-2"))
+    assert default["resources"]["use_spot"] is True  # legacy behavior: left untouched
+    forced = yaml.safe_load(
+        patch_sky_yaml_with_cloud_region(y, "aws", "us-west-2", force_on_demand=True)
+    )
+    assert forced["resources"]["use_spot"] is False

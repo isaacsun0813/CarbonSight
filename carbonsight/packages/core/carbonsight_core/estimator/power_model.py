@@ -1,7 +1,9 @@
 """
 Power model per design doc: P_IT = P_base + P_gpu + P_cpu + P_mem + P_net.
 GPU: P_gpu = gpu_count * (P_idle + u * (P_cap - P_idle)); T4 70W, A100 250-400W, H100 700W.
-PUE default 1.20; Normal(1.20, 0.05) truncated [1.05, 1.60] for uncertainty.
+
+This module models IT equipment only. Cooling and other facility overhead are
+excluded because CarbonSight does not have facility-level measurements.
 """
 
 import random
@@ -26,17 +28,13 @@ CPU_IDLE_W = 30.0
 NET_OVERHEAD_W = 20.0
 DEFAULT_GPU_UTIL = 0.7
 DEFAULT_CPU_UTIL = 0.5
-PUE_MEAN = 1.20
-PUE_SIGMA = 0.05
-PUE_MIN, PUE_MAX = 1.05, 1.60
 
 
 @dataclass
 class PowerParams:
-    """Sampled or fixed power parameters."""
+    """Sampled IT-power parameters."""
 
     p_it_w: float
-    pue: float
 
 
 def _gpu_power(job: JobSpec, u_gpu: float) -> float:
@@ -66,13 +64,10 @@ def power_it_w(job: JobSpec, u_gpu: float = DEFAULT_GPU_UTIL, u_cpu: float = DEF
     )
 
 
-def sample_pue(rng: random.Random | None = None) -> float:
-    """PUE ~ Normal(1.20, 0.05) truncated [1.05, 1.60]."""
-    rng = rng or random
-    while True:
-        u = rng.gauss(PUE_MEAN, PUE_SIGMA)
-        if PUE_MIN <= u <= PUE_MAX:
-            return u
+def expected_it_power_w(job: JobSpec) -> float:
+    """Expected IT watts, honoring observed GPU utilization when supplied."""
+    u_gpu = job.gpu_utilization if job.gpu_utilization is not None else DEFAULT_GPU_UTIL
+    return power_it_w(job, u_gpu=u_gpu, u_cpu=DEFAULT_CPU_UTIL)
 
 
 def _sample_u_gpu(job: JobSpec, rng: random.Random) -> float:
@@ -83,10 +78,9 @@ def _sample_u_gpu(job: JobSpec, rng: random.Random) -> float:
 
 
 def sample_power_params(job: JobSpec, rng: random.Random | None = None) -> PowerParams:
-    """Sample u_gpu (unless fixed by JobSpec.gpu_utilization), PUE, u_cpu; return P_IT and PUE."""
+    """Sample GPU/CPU utilization and return IT power; facility overhead is excluded."""
     rng = rng or random
     u_gpu = _sample_u_gpu(job, rng)
     u_cpu = rng.uniform(0.4, 0.6)
     p_it = power_it_w(job, u_gpu, u_cpu)
-    pue = sample_pue(rng)
-    return PowerParams(p_it_w=p_it, pue=pue)
+    return PowerParams(p_it_w=p_it)

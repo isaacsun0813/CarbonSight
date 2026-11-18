@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
+from functools import partial
 
 from carbonsight_core.estimator.pricing import estimate_job_cost
 from carbonsight_core.models import JobSpec
-from carbonsight_core.planning.survival import VirtualInstanceTracker
+from carbonsight_core.planning.survival import (
+    DEFAULT_BUCKET_HOURS,
+    NelsonAalenModel,
+    SpotObservation,
+    VirtualInstanceTracker,
+    refresh_hybrid_priors,
+    replay_observations,
+)
 from carbonsight_core.planning.types import (
     DynamicEventType,
     DynamicPlanEvent,
@@ -20,12 +29,12 @@ from carbonsight_core.planning.types import (
     SchedulerDecision,
 )
 from carbonsight_core.planning.utility import (
+    calc_utility,
     carbon_rate_kg_per_hr,
+    deadline_pressure,
     estimate_window_carbon_kg,
     parse_forecast_utc,
     progress_value,
-    calc_utility,
-    deadline_pressure,
 )
 
 
@@ -348,6 +357,344 @@ def _run_ondemand_to_completion(
     )
 
 
+class DynamicJob:
+    """
+    Step-wise executor for the dynamic scheduling loop.
+
+    Holds the loop-carried bookkeeping (``events``, per-region trackers, checkpoint
+    region, spot lifetime budget, first launch) so a driver loop only needs to
+    thread ``JobRuntimeState`` through the branch methods:
+
+    - ``advance_work``: work in progress (spot or on-demand)
+    - ``fallback_to_ondemand``: Safety Net forces on-demand to completion
+    - ``wait_tick``: no improving action, wait one tick
+    - ``launch_instance``: launch the chosen (region, mode)
+    - ``finalize``: after-loop processing into a ``DynamicPlanResult``
+
+    ``decide`` runs one scheduling decision for the idle state.
+
+    By default the instance simulates spot lifetimes (``simulate_preemption=True``).
+    A driver that observes a real cluster sets it to False and reports preemption /
+    completion through ``advance_work(..., preempted=..., completed=...)``.
+    """
+
+    def __init__(
+        self,
+        job: JobSpec,
+        constraints: PlanConstraints,
+        regions: list[RegionPlanInput],
+        events: list[DynamicPlanEvent],
+        *,
+        checkpoint_region: str | None = None,
+        simulate_preemption: bool = True,
+        observations: Mapping[str, Sequence[SpotObservation]] | None = None,
+        on_observation: Callable[[str, SpotObservation], None] | None = None,
+        lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
+        advisor_bands: Mapping[str, int] | None = None,
+    ) -> None:
+        self.simulate_preemption = simulate_preemption
+        # Spot Advisor band index per region (relative weights only). None = no advisor data:
+        # the legacy flat assumed prior is used.
+        self.advisor_bands = advisor_bands
+        self.job = job
+        self.constraints = constraints
+        self.regions = regions
+        self.events = events
+        self.region_map = {r.cloud_region: r for r in regions}
+        # No blanket "available at t0" seed: an untouched tracker has no observations and
+        # predicts from the labeled assumed prior until real observations arrive.
+        self.trackers = {
+            r.cloud_region: VirtualInstanceTracker(
+                region=r.cloud_region,
+                model=NelsonAalenModel(bucket_hours=lifetime_bucket_hours),
+            )
+            for r in regions
+        }
+        history = observations or {}
+        for region, tracker in self.trackers.items():
+            replay_observations(tracker, history.get(region, ()))
+        # Attach the callback only after replay so stored history is never re-persisted.
+        # The advisory simulation leaves it unset and so never writes anything.
+        if on_observation is not None:
+            for region, tracker in self.trackers.items():
+                tracker.on_observation = partial(on_observation, region)
+        self.c_od_min = _cheapest_ondemand_rate(regions, job)
+        self.checkpoint = checkpoint_region or ""
+        self.initial_launch: SchedulerCandidate | None = None
+        self.spot_run_start: datetime | None = None
+        self.spot_lifetime_budget: float = 0.0
+        self._refresh_priors()
+
+    def _refresh_priors(self) -> None:
+        """Recompute hybrid regional priors from the observations seen so far (cheap)."""
+        if self.advisor_bands is not None:
+            refresh_hybrid_priors(self.trackers, self.advisor_bands)
+
+    def prior_sources(self) -> dict[str, str]:
+        """Per-region label of where the spot lifetime estimate comes from."""
+        return {region: t.prior_source() for region, t in self.trackers.items()}
+
+    def make_initial_state(self) -> JobRuntimeState:
+        """Idle starting state at ``constraints.now_utc``."""
+        return make_runtime_state(self.job, self.constraints)
+
+    def decide(self, state: JobRuntimeState) -> SchedulerDecision:
+        """One scheduling decision over all (region, mode) candidates."""
+        self._refresh_priors()
+        candidates = _build_scheduler_candidates(
+            self.job,
+            self.constraints,
+            self.regions,
+            self.trackers,
+            state.now_utc,
+            self.checkpoint,
+        )
+        return pick_next_state(state, self.constraints, candidates, c_od_min=self.c_od_min)
+
+    def _preempt(self, state: JobRuntimeState, notes: str) -> JobRuntimeState:
+        """Record a preemption and fall back to idle at the checkpoint region."""
+        self.trackers[state.region].record_probe(
+            state.now_utc, available=False, source="preemption"
+        )
+        self.events.append(
+            DynamicPlanEvent(
+                time_utc=state.now_utc,
+                event_type=DynamicEventType.PREEMPT,
+                region=state.region,
+                mode=state.mode,
+                progress_hours=state.progress_hours,
+                cost_usd_delta=0.0,
+                carbon_kg_delta=0.0,
+                notes=notes,
+            )
+        )
+        self.spot_run_start = None
+        return replace(state, mode=JobMode.IDLE, region=self.checkpoint or state.region)
+
+    def advance_work(
+        self,
+        state: JobRuntimeState,
+        tick_hours: float,
+        *,
+        preempted: bool = False,
+        completed: bool = False,
+    ) -> JobRuntimeState:
+        """
+        Branch A: work is in progress (spot or on-demand); run up to one tick.
+
+        ``preempted``: the instance was observed to be gone (real cluster); take the
+        PREEMPT path. ``completed``: the job was observed to finish; clamp progress to
+        the full duration after accounting for this tick, so COMPLETE fires.
+        """
+        job = self.job
+        if preempted:
+            return self._preempt(state, "spot preempted (observed)")
+        self._refresh_priors()
+        remaining = job.duration_hours - state.progress_hours
+        region_input = self.region_map[state.region]
+        candidate = _scheduler_candidate_for_region(
+            job,
+            self.constraints,
+            region_input,
+            self.trackers,
+            state.now_utc,
+            self.checkpoint,
+            state.region,
+            state.mode,
+        )
+        if candidate is None:
+            return replace(state, mode=JobMode.IDLE)
+
+        run_hours = min(tick_hours, remaining)
+        spot_lifetime_exceeded = False
+        if (
+            self.simulate_preemption
+            and state.mode == JobMode.SPOT
+            and self.spot_run_start is not None
+        ):
+            # if spot, check the (deterministic, model-predicted) lifetime budget
+            elapsed_spot = (state.now_utc - self.spot_run_start).total_seconds() / 3600.0
+            run_hours = min(run_hours, max(self.spot_lifetime_budget - elapsed_spot, 0.0))
+            spot_lifetime_exceeded = run_hours <= 1e-9
+        if spot_lifetime_exceeded:
+            # spot instance is gone: preempt, fall back to idle at the checkpoint region
+            prior = self.trackers[state.region].prior_source()
+            return self._preempt(
+                state,
+                f"simulated preemption (modeled lifetime, not an AWS measurement; prior: {prior})",
+            )
+
+        run_end = state.now_utc + timedelta(hours=run_hours)
+        run_cost = candidate.cost_rate_usd_per_hr * run_hours
+        run_carbon, _ = estimate_window_carbon_kg(
+            job, region_input.forecast_points, state.now_utc, run_end,
+        )
+        state = JobRuntimeState(
+            region=state.region,
+            mode=state.mode,
+            progress_hours=state.progress_hours + run_hours,
+            now_utc=run_end,
+            cumulative_cost_usd=state.cumulative_cost_usd + run_cost,
+            cumulative_carbon_kg=state.cumulative_carbon_kg + run_carbon,
+            total_work_hours=state.total_work_hours,
+        )
+        if completed and state.progress_hours < job.duration_hours:
+            state = replace(state, progress_hours=job.duration_hours)
+        if state.progress_hours >= job.duration_hours:
+            self.events.append(
+                DynamicPlanEvent(
+                    time_utc=state.now_utc,
+                    event_type=DynamicEventType.COMPLETE,
+                    region=state.region,
+                    mode=state.mode,
+                    progress_hours=state.progress_hours,
+                    cost_usd_delta=run_cost,
+                    carbon_kg_delta=run_carbon,
+                    notes="work complete",
+                )
+            )
+            state = replace(state, mode=JobMode.IDLE)
+        return state
+
+    def fallback_to_ondemand(
+        self,
+        state: JobRuntimeState,
+        decision: SchedulerDecision,
+        *,
+        run_to_completion: bool = True,
+    ) -> JobRuntimeState:
+        """
+        Branch B: Safety Net fired; launch on-demand.
+
+        ``run_to_completion=True`` (simulation) also runs the remaining work in one go.
+        ``run_to_completion=False`` (real cluster) only records the SAFETY_NET launch and
+        returns an ON_DEMAND state; the driver observes the job until it finishes.
+        """
+        chosen = decision.chosen
+        if chosen is None:
+            raise ValueError("fallback_to_ondemand requires decision.chosen")
+        if not run_to_completion:
+            return self._launch(state, decision, event_type=DynamicEventType.SAFETY_NET)
+        if self.initial_launch is None:
+            self.initial_launch = chosen
+        region_input = self.region_map[chosen.region]
+        return _run_ondemand_to_completion(
+            state, self.constraints, chosen, region_input, self.job, self.events,
+        )
+
+    def wait_tick(
+        self,
+        state: JobRuntimeState,
+        decision: SchedulerDecision,
+        tick_hours: float,
+    ) -> JobRuntimeState:
+        """Branch C: no candidate improves utility; wait one tick for greener or cheaper."""
+        next_time = state.now_utc + timedelta(hours=tick_hours)
+        self.events.append(
+            DynamicPlanEvent(
+                time_utc=next_time,
+                event_type=DynamicEventType.IDLE,
+                region=state.region,
+                mode=JobMode.IDLE,
+                progress_hours=state.progress_hours,
+                cost_usd_delta=0.0,
+                carbon_kg_delta=0.0,
+                notes=decision.reason,
+            )
+        )
+        return replace(state, now_utc=next_time)
+
+    def launch_instance(
+        self,
+        state: JobRuntimeState,
+        decision: SchedulerDecision,
+    ) -> JobRuntimeState:
+        """Branch D: launch the chosen (region, mode); state resumes after cold start."""
+        return self._launch(state, decision, event_type=DynamicEventType.LAUNCH)
+
+    def _launch(
+        self,
+        state: JobRuntimeState,
+        decision: SchedulerDecision,
+        *,
+        event_type: DynamicEventType,
+    ) -> JobRuntimeState:
+        chosen = decision.chosen
+        if chosen is None:
+            raise ValueError("launch requires decision.chosen")
+        constraints = self.constraints
+        if self.initial_launch is None:
+            self.initial_launch = chosen
+        region_input = self.region_map[chosen.region]
+        launch_cost = chosen.migration_usd + chosen.cost_rate_usd_per_hr * constraints.cold_start_hours
+        cold_end = state.now_utc + timedelta(hours=constraints.cold_start_hours)
+        cold_carbon, _ = estimate_window_carbon_kg(
+            self.job, region_input.forecast_points, state.now_utc, cold_end,
+        )
+        self.events.append(
+            DynamicPlanEvent(
+                time_utc=cold_end,
+                event_type=event_type,
+                region=chosen.region,
+                mode=chosen.mode,
+                progress_hours=state.progress_hours,
+                cost_usd_delta=launch_cost,
+                carbon_kg_delta=cold_carbon,
+                notes=decision.reason,
+            )
+        )
+        self.checkpoint = chosen.region
+        is_spot = chosen.mode == JobMode.SPOT
+        if is_spot:
+            # Only a spot launch says anything about spot availability.
+            self.trackers[chosen.region].record_probe(cold_end, available=True, source="launch")
+        self.spot_run_start = cold_end if is_spot else None
+        self.spot_lifetime_budget = chosen.expected_lifetime_hours if is_spot else 0.0
+        return JobRuntimeState(
+            region=chosen.region,
+            mode=chosen.mode,
+            progress_hours=state.progress_hours,
+            now_utc=cold_end,
+            cumulative_cost_usd=state.cumulative_cost_usd + launch_cost,
+            cumulative_carbon_kg=state.cumulative_carbon_kg + cold_carbon,
+            total_work_hours=state.total_work_hours,
+        )
+
+    def finalize(self, state: JobRuntimeState) -> DynamicPlanResult:
+        """After-loop processing: missed-deadline event, carbon-budget check, result.
+
+        ``deadline_met`` is only about finishing the work in time; the carbon budget is reported
+        separately in ``carbon_budget_met``.
+        """
+        deadline_met = state.progress_hours >= self.job.duration_hours
+        if not deadline_met:
+            self.events.append(
+                DynamicPlanEvent(
+                    time_utc=state.now_utc,
+                    event_type=DynamicEventType.MISSED_DEADLINE,
+                    region=state.region,
+                    mode=state.mode,
+                    progress_hours=state.progress_hours,
+                    cost_usd_delta=0.0,
+                    carbon_kg_delta=0.0,
+                    notes="deadline missed before work complete",
+                )
+            )
+
+        budget = self.constraints.carbon_budget_kg
+        carbon_budget_met = budget is None or state.cumulative_carbon_kg <= budget
+
+        return DynamicPlanResult(
+            deadline_met=deadline_met,
+            carbon_budget_met=carbon_budget_met,
+            events=self.events,
+            initial_launch=self.initial_launch,
+            final_state=state,
+            total_cost_usd=state.cumulative_cost_usd,
+            total_carbon_kg=state.cumulative_carbon_kg,
+        )
+
+
 def plan_dynamic_job(
     job: JobSpec,
     constraints: PlanConstraints,
@@ -355,11 +702,17 @@ def plan_dynamic_job(
     *,
     tick_hours: float = 1.0,
     checkpoint_region: str | None = None,
+    observations: Mapping[str, Sequence[SpotObservation]] | None = None,
+    lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
+    advisor_bands: Mapping[str, int] | None = None,
 ) -> DynamicPlanResult:
     """
     Simulate greedy spot + wait + Safety Net until work completes or deadline missed.
 
     Returns advisory trajectory and first launch decision for CLI integration.
+    Thin driver over ``DynamicJob``; a real executor loop can drive the same methods.
+    Spot lifetimes come from ``observations`` (read-only history) or the labeled assumed
+    prior; simulated preemptions are model output, never recorded or persisted.
     """
     if not regions:
         empty = make_runtime_state(job, constraints)
@@ -372,18 +725,17 @@ def plan_dynamic_job(
             total_carbon_kg=0.0,
         )
 
-    region_map = {r.cloud_region: r for r in regions}
-    trackers = {r.cloud_region: VirtualInstanceTracker(region=r.cloud_region) for r in regions}
-    for tracker in trackers.values():
-        tracker.record_probe(constraints.now_utc, available=True)
-
-    c_od_min = _cheapest_ondemand_rate(regions, job)
-    checkpoint = checkpoint_region or ""
-    state = make_runtime_state(job, constraints)
-    events: list[DynamicPlanEvent] = []
-    initial_launch: SchedulerCandidate | None = None
-    spot_run_start: datetime | None = None
-    spot_lifetime_budget: float = 0.0
+    dyn = DynamicJob(
+        job,
+        constraints,
+        regions,
+        [],
+        checkpoint_region=checkpoint_region,
+        observations=observations,
+        lifetime_bucket_hours=lifetime_bucket_hours,
+        advisor_bands=advisor_bands,
+    )
+    state = dyn.make_initial_state()
 
     max_iters = int(
         (constraints.deadline_utc - constraints.now_utc).total_seconds() / 3600.0 / tick_hours
@@ -396,174 +748,24 @@ def plan_dynamic_job(
         and iters < max_iters
     ):
         iters += 1
-        remaining = job.duration_hours - state.progress_hours
-        work_in_progress = state.mode != JobMode.IDLE
 
-        if work_in_progress:
-            region_input = region_map[state.region]
-            candidate = _scheduler_candidate_for_region(
-                job,
-                constraints,
-                region_input,
-                trackers,
-                state.now_utc,
-                checkpoint,
-                state.region,
-                state.mode,
-            )
-            if candidate is None:
-                state = replace(state, mode=JobMode.IDLE)
-                continue
-
-            run_hours = min(tick_hours, remaining)
-            spot_lifetime_exceeded = False
-            if state.mode == JobMode.SPOT and spot_run_start is not None:
-                elapsed_spot = (state.now_utc - spot_run_start).total_seconds() / 3600.0
-                run_hours = min(run_hours, max(spot_lifetime_budget - elapsed_spot, 0.0))
-                spot_lifetime_exceeded = run_hours <= 1e-9
-            if spot_lifetime_exceeded:
-                trackers[state.region].record_probe(state.now_utc, available=False)
-                events.append(
-                    DynamicPlanEvent(
-                        time_utc=state.now_utc,
-                        event_type=DynamicEventType.PREEMPT,
-                        region=state.region,
-                        mode=JobMode.SPOT,
-                        progress_hours=state.progress_hours,
-                        cost_usd_delta=0.0,
-                        carbon_kg_delta=0.0,
-                        notes="spot lifetime exceeded",
-                    )
-                )
-                state = replace(state, mode=JobMode.IDLE, region=checkpoint or state.region)
-                spot_run_start = None
-                continue
-
-            run_end = state.now_utc + timedelta(hours=run_hours)
-            run_cost = candidate.cost_rate_usd_per_hr * run_hours
-            run_carbon, _ = estimate_window_carbon_kg(
-                job, region_input.forecast_points, state.now_utc, run_end,
-            )
-            state = JobRuntimeState(
-                region=state.region,
-                mode=state.mode,
-                progress_hours=state.progress_hours + run_hours,
-                now_utc=run_end,
-                cumulative_cost_usd=state.cumulative_cost_usd + run_cost,
-                cumulative_carbon_kg=state.cumulative_carbon_kg + run_carbon,
-                total_work_hours=state.total_work_hours,
-            )
-            if state.progress_hours >= job.duration_hours:
-                events.append(
-                    DynamicPlanEvent(
-                        time_utc=state.now_utc,
-                        event_type=DynamicEventType.COMPLETE,
-                        region=state.region,
-                        mode=state.mode,
-                        progress_hours=state.progress_hours,
-                        cost_usd_delta=run_cost,
-                        carbon_kg_delta=run_carbon,
-                        notes="work complete",
-                    )
-                )
-                state = replace(state, mode=JobMode.IDLE)
-                break
+        if state.mode != JobMode.IDLE:
+            state = dyn.advance_work(state, tick_hours)
             continue
 
-        candidates = _build_scheduler_candidates(
-            job, constraints, regions, trackers, state.now_utc, checkpoint,
-        )
-        decision = pick_next_state(state, constraints, candidates, c_od_min=c_od_min)
+        decision = dyn.decide(state)
 
-        safety_net_fallback = decision.safety_net and decision.chosen is not None
-        if safety_net_fallback:
-            if initial_launch is None:
-                initial_launch = decision.chosen
-            region_input = region_map[decision.chosen.region]
-            state = _run_ondemand_to_completion(
-                state, constraints, decision.chosen, region_input, job, events,
-            )
+        if decision.safety_net and decision.chosen is not None:
+            state = dyn.fallback_to_ondemand(state, decision)
             break
 
-        no_improving_action = decision.chosen is None
-        if no_improving_action:
-            next_time = state.now_utc + timedelta(hours=tick_hours)
-            events.append(
-                DynamicPlanEvent(
-                    time_utc=next_time,
-                    event_type=DynamicEventType.IDLE,
-                    region=state.region,
-                    mode=JobMode.IDLE,
-                    progress_hours=state.progress_hours,
-                    cost_usd_delta=0.0,
-                    carbon_kg_delta=0.0,
-                    notes=decision.reason,
-                )
-            )
-            state = replace(state, now_utc=next_time)
+        if decision.chosen is None:
+            state = dyn.wait_tick(state, decision, tick_hours)
             continue
 
-        chosen = decision.chosen
-        if initial_launch is None:
-            initial_launch = chosen
-        region_input = region_map[chosen.region]
-        launch_cost = chosen.migration_usd + chosen.cost_rate_usd_per_hr * constraints.cold_start_hours
-        cold_end = state.now_utc + timedelta(hours=constraints.cold_start_hours)
-        cold_carbon, _ = estimate_window_carbon_kg(
-            job, region_input.forecast_points, state.now_utc, cold_end,
-        )
-        events.append(
-            DynamicPlanEvent(
-                time_utc=cold_end,
-                event_type=DynamicEventType.LAUNCH,
-                region=chosen.region,
-                mode=chosen.mode,
-                progress_hours=state.progress_hours,
-                cost_usd_delta=launch_cost,
-                carbon_kg_delta=cold_carbon,
-                notes=decision.reason,
-            )
-        )
-        checkpoint = chosen.region
-        trackers[chosen.region].record_probe(cold_end, available=True)
-        spot_run_start = cold_end if chosen.mode == JobMode.SPOT else None
-        spot_lifetime_budget = chosen.expected_lifetime_hours if chosen.mode == JobMode.SPOT else 0.0
-        state = JobRuntimeState(
-            region=chosen.region,
-            mode=chosen.mode,
-            progress_hours=state.progress_hours,
-            now_utc=cold_end,
-            cumulative_cost_usd=state.cumulative_cost_usd + launch_cost,
-            cumulative_carbon_kg=state.cumulative_carbon_kg + cold_carbon,
-            total_work_hours=state.total_work_hours,
-        )
+        state = dyn.launch_instance(state, decision)
 
-    deadline_met = state.progress_hours >= job.duration_hours
-    if not deadline_met:
-        events.append(
-            DynamicPlanEvent(
-                time_utc=state.now_utc,
-                event_type=DynamicEventType.MISSED_DEADLINE,
-                region=state.region,
-                mode=state.mode,
-                progress_hours=state.progress_hours,
-                cost_usd_delta=0.0,
-                carbon_kg_delta=0.0,
-                notes="deadline missed before work complete",
-            )
-        )
-
-    if constraints.carbon_budget_kg is not None and state.cumulative_carbon_kg > constraints.carbon_budget_kg:
-        deadline_met = False
-
-    return DynamicPlanResult(
-        deadline_met=deadline_met,
-        events=events,
-        initial_launch=initial_launch,
-        final_state=state,
-        total_cost_usd=state.cumulative_cost_usd,
-        total_carbon_kg=state.cumulative_carbon_kg,
-    )
+    return dyn.finalize(state)
 
 
 def make_runtime_state(

@@ -93,15 +93,15 @@ In each phase below, **Testing** describes only **E2E scenarios** and how they u
 
 ## Phase 3: Carbon Estimator (Weeks 2–4)
 
-**Goal:** Power model + PUE + MOER integration + Monte Carlo uncertainty; outputs point estimate and band (e.g. p10/p90).
+**Goal:** IT-power model + MOER integration + Monte Carlo uncertainty; outputs point estimate and band (e.g. p10/p90). Cooling and other facility overhead are explicitly excluded.
 
 | Task | Details |
 |------|--------|
 | **3.1** Power model | Additive: P_IT = P_base + P_gpu + P_cpu + P_mem + P_net. GPU: utilization-based (e.g. P_gpu_idle + u*(P_cap - P_idle)); defaults for T4, A100, H100. CPU: sockets × (idle + u*(TDP - idle)). Mem: mem_gib × W_per_GiB. P_base 150–300W per node. Configurable defaults. |
-| **3.2** PUE | Default 1.20; overrides by cloud/region. For uncertainty: PUE ~ Normal(μ=1.20, σ=0.05) truncated [1.05, 1.60]. |
-| **3.3** Time-window and MOER | Nowcast (latest MOER), forecast-integrated (over job window), or historical backfill. E_facility_MWh = (P_IT_W/1000)*duration_hours*PUE/1000. CO2_lb = Σ_t (E_facility_MWh_t × MOER_lb_per_MWh(t)). CO2_kg = CO2_lb × 0.45359237. |
+| **3.2** Facility boundary | Report IT operational carbon only. Do not assume PUE without facility measurements; cooling, electrical losses, and other facility overhead are excluded. |
+| **3.3** Time-window and MOER | Nowcast (latest MOER), forecast-integrated (over job window), or historical backfill. E_IT_MWh = P_IT_W × duration_hours / 1,000,000. CO2_lb = Σ_t (E_IT_MWh_t × MOER_lb_per_MWh(t)). CO2_kg = CO2_lb × 0.45359237. |
 | **3.4** Mixture mapping in estimator | For (wt_region, weight), fetch MOER per region; weighted sum for MOER at each time step. |
-| **3.5** Monte Carlo uncertainty | N=1000 samples: sample u_gpu, PUE, P_base, and if mixture sample region by weights. Return mean, p10, p90 (or p05/p95). |
+| **3.5** Monte Carlo uncertainty | N=1000 samples: sample IT-power utilization inputs; use weighted MOER for mixture mappings. Return mean, p10, p90 (or p05/p95). Dynamic planning uses deterministic expected IT power and labels its result separately. |
 | **3.6** Unit gate | Refuse to compute kg CO₂ unless WattTime returns `units=lbs_co2_per_mwh` (or another explicitly supported unit); fail closed with clear error. |
 
 **Testing (Phase 3)** — E2E with replayer. (1) **E2E: advise returns CO₂ and band:** Run `carbonsight advise --yaml tests/fixtures/train_minimal.yaml --json`. Replay WattTime cassettes. Assert each recommendation has expected_co2_kg_mean, expected_co2_kg_p10, expected_co2_kg_p90, and p10 &lt; mean &lt; p90 (or narrow band when inputs are fixed). (2) **E2E: unit gate:** Use a cassette that contains a response with wrong or missing `units` (or a small E2E that injects that response once); assert the CLI or API returns a clear error and does not output kg. **How to run:** `pytest tests/e2e/test_advise_carbon_band.py tests/e2e/test_estimator_units_gate.py -v`. **Done when:** E2E advise shows CO₂ mean and band; unit-gate E2E fails closed on bad units.
@@ -116,6 +116,7 @@ In each phase below, **Testing** describes only **E2E scenarios** and how they u
 |------|--------|
 | **4.1** Parse job from YAML + args | Parse SkyPilot-style YAML; extract or override GPU type/count, duration, CPU, memory. Build `JobSpec`. |
 | **4.2** `carbonsight advise --yaml train.yaml [--explain] [--json]` | For each candidate region: resolve mapping, get MOER, run estimator, get cost (next phase). Rank by score (carbon + cost weights). Output: ranked table (region, expected CO2 kg, cost, confidence, notes); with `--explain` show top drivers; with `--json` machine-readable. |
+| **4.2a** `carbonsight plan-static --yaml train.yaml [--finish-by ...]` | Experimental one-shot region × start × mode planner. Advisory output only; it does not patch YAML, wait, or control the `run` launch path. |
 | **4.3** Cost model | Use SkyPilot pricing (or cached prices) + optional AWS spot. Integrate into scoring: score = w_carbon * normalized(co2) + w_cost * normalized(cost). |
 | **4.4** `carbonsight run train.yaml [--dry-run] [--no-exec]` | Run advise → preflight (Phase 5) → patch YAML with chosen region → if not dry-run/no-exec, call SkyPilot to launch. Emit patched YAML when dry-run. |
 | **4.5** `carbonsight mappings validate` | Run drift checks (region-from-loc vs stored); print diff and confidence drops. |
@@ -160,7 +161,7 @@ In each phase below, **Testing** describes only **E2E scenarios** and how they u
 
 | Task | Details |
 |------|--------|
-| **7.1** Postgres schema | Create tables: cloud_region, cloud_site, grid_mapping, run, grid_signal_cache (optional). Add `infra/migrations` (e.g. raw SQL or Alembic). |
+| **7.1** Postgres schema | Create tables: cloud_region, cloud_site, grid_mapping, run, grid_signal_cache (optional). Add `infra/migrations` (e.g. raw SQL or Alembic). *Note:* spot observation history (`spot_observations`) is intentionally local SQLite (`carbonsight_core/spot_history.py`), not part of this Postgres schema (it also stores the Spot Advisor band seen at observation time). |
 | **7.2** API endpoints | POST /v1/recommendations (body: job spec or YAML ref) → ranked list. POST /v1/runs → record run, return run_id. GET /v1/runs/{id} → status + estimates. GET /v1/regions → cloud regions + mapping confidence. POST /v1/mappings/revalidate → trigger drift job (async or sync). |
 | **7.3** Docker | docker-compose: api (FastAPI + Uvicorn), db (Postgres). Optional worker for revalidation. CLI can run on host with env/secrets. |
 
@@ -222,7 +223,7 @@ Phase 9 (polish/CI) ← ongoing
 2. Add `packages/core/carbonsight_core/models.py` with `JobSpec` and `EstimateResult`.
 3. Implement WattTime client in `packages/core` or a dedicated `packages/watttime` (login, token cache, `/v3/region-from-loc`, `/v3/my-access`, and one of forecast/historical/signal-index).
 4. Add a minimal mapping registry (in-memory or JSON-backed) with 2–3 AWS regions and seed coordinates, then wire `region-from-loc` to fill WattTime region codes.
-5. Implement power model + PUE + single-region MOER integration and one Monte Carlo pass to get mean + p10/p90.
+5. Implement the IT-power model + single-region MOER integration and one Monte Carlo pass to get mean + p10/p90; exclude unmeasured facility overhead.
 6. Add `carbonsight advise` that: loads YAML → builds JobSpec → for each region gets mapping + MOER → runs estimator → ranks and prints table.
 
 From there, add `run` (with preflight and SkyPilot patch), then Postgres + API, then backtest and CI.

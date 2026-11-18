@@ -285,8 +285,8 @@ def run_advise(
     premium_pct = int(max_cost_premium * 100)
     table = Table(title=f"Greenest regions within {premium_pct}% of cheapest (${min_cost:.2f})")
     table.add_column("Region", style="cyan")
-    table.add_column("CO2 (kg)", justify="right")
-    table.add_column("CO2 p10-p90", justify="right")
+    table.add_column("IT CO2 mean (kg)", justify="right")
+    table.add_column("IT CO2 p10-p90", justify="right")
     table.add_column("Cost (USD)", justify="right")
     table.add_column("vs cheapest", justify="right")
     table.add_column("Confidence", justify="right")
@@ -309,7 +309,7 @@ def run_advise(
         )
     if explain:
         typer.echo(
-            f"  Green rank: CO2 emissions (live WattTime data). "
+            f"  Green rank: IT operational CO2 (live WattTime data; facility overhead excluded). "
             f"Cost ceiling: ${cost_ceiling:.2f} (+{premium_pct}% above cheapest)."
         )
 

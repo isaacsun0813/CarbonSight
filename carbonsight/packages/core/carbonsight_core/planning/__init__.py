@@ -1,4 +1,4 @@
-"""Job planning: static pre-launch and dynamic scheduling."""
+"""Job planning: experimental static advice and dynamic launch scheduling."""
 
 from carbonsight_core.planning.constraints import (
     filter_by_priority,
@@ -8,6 +8,7 @@ from carbonsight_core.planning.constraints import (
     pick_best_candidate,
 )
 from carbonsight_core.planning.dynamic import (
+    DynamicJob,
     make_runtime_state,
     pick_next_state,
     plan_dynamic_job,
@@ -16,11 +17,16 @@ from carbonsight_core.planning.dynamic import (
 from carbonsight_core.planning.inputs import build_region_plan_inputs
 from carbonsight_core.planning.static import enumerate_candidates, plan_static_job
 from carbonsight_core.planning.survival import (
+    ADVISOR_BAND_LABELS,
+    ASSUMED_SPOT_MEAN_LIFETIME_HOURS,
     MEAN_SPOT_LIFETIME_HOURS,
     NelsonAalenModel,
     SpotObservation,
     VirtualInstanceTracker,
+    advisor_band_weights,
     conservative_volatility,
+    refresh_hybrid_priors,
+    replay_observations,
     volatility_ratio,
 )
 from carbonsight_core.planning.types import (
@@ -41,12 +47,15 @@ from carbonsight_core.planning.utility import (
     carbon_rate_kg_per_hr,
     deadline_pressure,
     estimate_window_carbon_kg,
-    facility_mwh_for_duration,
+    it_mwh_for_duration,
     progress_value,
 )
 
 __all__ = [
+    "ADVISOR_BAND_LABELS",
+    "ASSUMED_SPOT_MEAN_LIFETIME_HOURS",
     "DynamicEventType",
+    "DynamicJob",
     "DynamicPlanEvent",
     "DynamicPlanResult",
     "JobMode",
@@ -61,6 +70,7 @@ __all__ = [
     "SchedulerDecision",
     "SpotObservation",
     "VirtualInstanceTracker",
+    "advisor_band_weights",
     "build_region_plan_inputs",
     "calc_utility",
     "carbon_rate_kg_per_hr",
@@ -68,9 +78,9 @@ __all__ = [
     "deadline_pressure",
     "enumerate_candidates",
     "estimate_window_carbon_kg",
-    "facility_mwh_for_duration",
     "filter_by_priority",
     "finish_time",
+    "it_mwh_for_duration",
     "is_deadline_feasible",
     "latest_feasible_start",
     "make_runtime_state",
@@ -79,6 +89,8 @@ __all__ = [
     "plan_dynamic_job",
     "plan_static_job",
     "progress_value",
+    "refresh_hybrid_priors",
+    "replay_observations",
     "safety_net_triggered",
     "volatility_ratio",
 ]

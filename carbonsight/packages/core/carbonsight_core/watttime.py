@@ -189,6 +189,6 @@ class WattTimeClient:
             )
 
     @staticmethod
-    def moer_lb_per_mwh_to_kg_co2(lb_per_mwh: float, facility_mwh: float) -> float:
-        """CO2_kg = (MOER_lb_per_MWh * E_facility_MWh) * 0.45359237."""
-        return lb_per_mwh * facility_mwh * LB_TO_KG
+    def moer_lb_per_mwh_to_kg_co2(lb_per_mwh: float, energy_mwh: float) -> float:
+        """CO2_kg = (MOER_lb_per_MWh * energy_MWh) * 0.45359237."""
+        return lb_per_mwh * energy_mwh * LB_TO_KG

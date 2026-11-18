@@ -157,3 +157,5 @@ class DynamicPlanResult:
     final_state: JobRuntimeState
     total_cost_usd: float
     total_carbon_kg: float
+    # Separate from deadline_met: work can finish in time and still exceed carbon_budget_kg.
+    carbon_budget_met: bool = True
