@@ -22,6 +22,7 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+.cursor/
 
 # pytest verification suite + Makefile CLI smoke artifacts (DBs, logs)
 carbonsight/misc/
@@ -36,4 +37,3 @@ nsdi24-wu-zhanghao.pdf
 
 # local runs
 Makefile
-

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 
-class JobMode(str, Enum):
+class JobMode(StrEnum):
     """Instance execution mode."""
 
     SPOT = "spot"
@@ -15,7 +15,7 @@ class JobMode(str, Enum):
     IDLE = "idle"
 
 
-class DynamicEventType(str, Enum):
+class DynamicEventType(StrEnum):
     """Events recorded during dynamic plan simulation."""
 
     IDLE = "idle"

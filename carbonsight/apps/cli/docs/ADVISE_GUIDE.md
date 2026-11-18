@@ -35,7 +35,7 @@ Table or JSON
 - **`yaml.safe_load`**: Never use `yaml.load` without a Loader; `safe_load` avoids arbitrary code execution from untrusted YAML. **Best practice**: always `safe_load` for untrusted or external YAML.
 - **Typer**: CLI framework; options are declared with types and help text. **Best practice**: type hints on CLI options give validation and better help.
 
-### 3.2 `job_spec_from_sky_yaml(path)`
+### 3.2 `job_spec_from_sky_yaml(path)` (in `job_setup.py`, shared by `advise`/`plan-static`/`run`)
 
 **Purpose**: Turn a SkyPilot YAML into a single `JobSpec` object.
 

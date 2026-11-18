@@ -3,8 +3,7 @@
 from pathlib import Path
 
 import yaml
-
-from carbonsight_cli.commands.advise import strip_carbonsight_only_yaml_keys
+from carbonsight_cli.commands.job_setup import strip_carbonsight_only_yaml_keys
 from carbonsight_cli.commands.run import patch_sky_yaml_with_cloud_region
 
 

@@ -65,6 +65,11 @@ class TestPlanDynamicJob:
         result = plan_dynamic_job(job, _constraints(t0, 2.0), regions, tick_hours=1.0)
         assert not result.deadline_met
         assert any(e.event_type == DynamicEventType.MISSED_DEADLINE for e in result.events)
+        # Nothing may be simulated past the deadline, even via the Safety Net.
+        deadline = t0 + timedelta(hours=2.0)
+        assert result.final_state.now_utc <= deadline
+        assert result.final_state.progress_hours < job.duration_hours
+        assert all(e.time_utc <= deadline for e in result.events)
 
     def test_initial_launch_spot_by_default(self) -> None:
         t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
