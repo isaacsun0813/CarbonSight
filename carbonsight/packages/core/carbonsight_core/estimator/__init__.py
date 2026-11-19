@@ -1,4 +1,4 @@
-"""Carbon estimator: power model, PUE, MOER integration, Monte Carlo uncertainty."""
+"""IT operational carbon estimator: power model, MOER integration, Monte Carlo uncertainty."""
 
 from carbonsight_core.estimator.carbon_model import (
     JobCarbonEstimator,

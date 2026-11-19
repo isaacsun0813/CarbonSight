@@ -12,15 +12,22 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
-
-from carbonsight_core.estimator.carbon_model import LB_TO_KG, compute_actual_co2, estimate_job_carbon_in_region
+from carbonsight_core.estimator.carbon_model import (
+    LB_TO_KG,
+    MONTE_CARLO_SAMPLES,
+    JobCarbonEstimator,
+    compute_actual_co2,
+    estimate_job_carbon_in_region,
+)
+from carbonsight_core.estimator.power_model import expected_it_power_w, sample_power_params
 from carbonsight_core.estimator.pricing import estimate_cost_usd
+from carbonsight_core.mapping.registry import CloudRegionEntry
 from carbonsight_core.models import JobSpec
+from carbonsight_core.region_ranking import AwsRegionRankingService
 from carbonsight_core.watttime import WattTimeError
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -141,9 +148,8 @@ class TestEstimateJobCarbonInRegion:
     def test_co2_math_is_correct(self) -> None:
         """With a fixed seed and known MOER, verify the CO2 formula end-to-end."""
         # At moer=400 lb/MWh and a deterministic seed we can't easily predict the
-        # exact value due to Monte Carlo variance, but we can bound it:
-        # min A100 power ~250W, max ~400W, PUE ~1.1-1.5 → facility ~275-600W
-        # For 1 hour: 0.000275-0.0006 MWh × 400 lb/MWh × 0.453 kg/lb → 0.05-0.11 kg
+        # exact value due to IT-power Monte Carlo variance, but we can bound it.
+        # Facility overhead is intentionally excluded.
         job = _make_job()
         result = estimate_job_carbon_in_region(job, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0)
         assert 0.01 < result.expected_co2_kg_mean < 2.0  # sanity bounds
@@ -258,6 +264,8 @@ class TestComputeActualCo2:
         assert result.actual_co2_kg > 0
         assert result.actual_duration_hours == pytest.approx(1.0)
         assert result.watttime_regions == _ACT_REGIONS
+        expected_kg = expected_it_power_w(self._JOB) / 1_000_000.0 * 400.0 * LB_TO_KG
+        assert result.actual_co2_kg == pytest.approx(expected_kg)
         wt.get_historical.assert_called_once()
 
     # M7-2: empty historical list → ValueError
@@ -384,3 +392,43 @@ class TestComputeActualCo2:
                 _ACT_START, _ACT_END, MagicMock(), estimated_co2_kg=0.1,
                 historical_moer_override=[],
             )
+
+
+def test_unknown_runtime_estimates_are_labeled_one_hour_comparisons() -> None:
+    job = JobSpec(gpu_type="T4")
+    result = estimate_job_carbon_in_region(
+        job, "aws", "us-east-1", [("PJM", 1.0)], 1.0,
+        watt_time=_mock_wt(), moer_override=400.0,
+    )
+    assert any("one_hour_comparison" in note for note in result.notes)
+    assert result.expected_cost_usd == estimate_cost_usd("T4", 1, 1.0, "us-east-1")
+
+
+def test_ranking_reuses_job_energy_samples_across_regions_but_not_requests() -> None:
+    registry, wt = MagicMock(), MagicMock()
+    registry.iter_plannable_aws_regions.return_value = [
+        CloudRegionEntry(provider="aws", region_code=region, display_name=region, wt_regions=[(grid, 1.0)])
+        for region, grid in [("us-east-1", "clean"), ("eu-north-1", "dirty")]
+    ]
+    wt.get_forecast.side_effect = lambda grid, **kwargs: {
+        "data": [{"value": 100.0 if grid == "clean" else 200.0}],
+    }
+    ranking = AwsRegionRankingService(registry, wt)
+    with patch(
+        "carbonsight_core.estimator.carbon_model.sample_power_params", wraps=sample_power_params,
+    ) as sample:
+        clean, dirty = ranking.collect_estimates(_make_job())
+        assert sample.call_count == MONTE_CARLO_SAMPLES
+        for field in ("expected_co2_kg_mean", "expected_co2_kg_p10", "expected_co2_kg_p90"):
+            assert getattr(dirty, field) == pytest.approx(2 * getattr(clean, field))
+        ranking.collect_estimates(_make_job(gpu_type="T4"))
+        assert sample.call_count == 2 * MONTE_CARLO_SAMPLES
+    assert wt.get_forecast.call_count == 4
+
+
+def test_precomputed_energy_samples_must_not_be_empty() -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        JobCarbonEstimator(_mock_wt()).estimate_region(
+            _make_job(), "aws", "us-east-1", [("PJM", 1.0)], 1.0,
+            moer_override=400.0, energy_samples_mwh=[],
+        )

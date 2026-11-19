@@ -11,7 +11,11 @@ class JobSpec(BaseModel):
 
     gpu_type: str = Field(..., description="e.g. T4, A100, H100")
     gpu_count: int = Field(1, ge=0)
-    duration_hours: float = Field(..., gt=0)
+    duration_hours: float = Field(1.0, gt=0, allow_inf_nan=False, description="Estimated runtime; omission uses a one-hour comparison")
+    gpu_power_limit_w: float | None = Field(
+        None, gt=0, allow_inf_nan=False,
+        description="Optional maximum board power per GPU in watts; overrides the sourced catalog",
+    )
     cpu_count: int | None = None
     mem_gib: float | None = None
     data_in_gb: float = Field(0.0, ge=0)
@@ -26,6 +30,15 @@ class JobSpec(BaseModel):
         ),
     )
 
+    @property
+    def has_duration_estimate(self) -> bool:
+        return "duration_hours" in self.model_fields_set
+
+    def require_duration_estimate(self) -> float:
+        if not self.has_duration_estimate:
+            raise ValueError("Deadline planning requires an explicit estimated duration (e.g. duration: 2h).")
+        return self.duration_hours
+
     @field_validator("gpu_utilization")
     @classmethod
     def _clamp_gpu_utilization(cls, v: float | None) -> float | None:
@@ -35,7 +48,7 @@ class JobSpec(BaseModel):
 
 
 class EstimateResult(BaseModel):
-    """Result of estimating carbon and cost for one region option."""
+    """IT operational carbon and cost estimate for one region option."""
 
     cloud: str
     cloud_region: str
@@ -43,15 +56,21 @@ class EstimateResult(BaseModel):
         ..., description="(region_code, weight); weights sum to 1.0"
     )
     expected_cost_usd: float = 0.0
-    expected_co2_kg_mean: float = 0.0
-    expected_co2_kg_p10: float = 0.0
-    expected_co2_kg_p90: float = 0.0
+    expected_co2_kg_mean: float = Field(
+        0.0, description="Mean IT operational CO2 estimate; facility overhead excluded",
+    )
+    expected_co2_kg_p10: float = Field(
+        0.0, description="P10 IT operational CO2 estimate; facility overhead excluded",
+    )
+    expected_co2_kg_p90: float = Field(
+        0.0, description="P90 IT operational CO2 estimate; facility overhead excluded",
+    )
     mapping_confidence: float = Field(..., ge=0, le=1)
     notes: list[str] = Field(default_factory=list)
 
 
 class ActualRunResult(BaseModel):
-    """Actual CO₂, cost, and duration measured after a job completes."""
+    """Post-run IT operational CO₂ estimate, cost, and observed duration."""
 
     cloud: str
     cloud_region: str

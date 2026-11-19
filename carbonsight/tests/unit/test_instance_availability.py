@@ -1,31 +1,7 @@
-"""Unit tests for InstanceAvailabilityChecker and ranking skip hook."""
-
 from unittest.mock import MagicMock, patch
 
 from botocore.exceptions import ClientError
 from carbonsight_core.cloud.aws.availability import InstanceAvailabilityChecker
-from carbonsight_core.mapping.registry import CloudRegionEntry, Registry
-from carbonsight_core.models import EstimateResult, JobSpec
-from carbonsight_core.region_ranking import AwsRegionRankingService
-
-
-def _two_region_registry() -> Registry:
-    reg = Registry()
-    reg._regions = {
-        ("aws", "us-east-1"): CloudRegionEntry(
-            provider="aws",
-            region_code="us-east-1",
-            display_name="US East",
-            wt_regions=[("PJM", 1.0)],
-        ),
-        ("aws", "ap-south-1"): CloudRegionEntry(
-            provider="aws",
-            region_code="ap-south-1",
-            display_name="Mumbai",
-            wt_regions=[("INDIA", 1.0)],
-        ),
-    }
-    return reg
 
 
 def _mock_ec2_clients(us_offerings: list, ap_offerings: list) -> MagicMock:
@@ -97,43 +73,3 @@ class TestInstanceAvailabilityChecker:
 
         ec2_us = session.client("ec2", region_name="us-east-1")
         assert ec2_us.describe_instance_type_offerings.call_count == 1
-
-
-class TestRankingAvailabilitySkip:
-    @patch("carbonsight_core.estimator.carbon_model.JobCarbonEstimator.estimate_region")
-    @patch("carbonsight_core.cloud.aws.base.boto3")
-    def test_collect_estimates_skips_unavailable_regions(
-        self, mock_boto3: MagicMock, mock_estimate: MagicMock,
-    ) -> None:
-        mock_boto3.Session.return_value = _mock_ec2_clients(
-            [{"InstanceType": "p4d.24xlarge"}],
-            [],
-        )
-        mock_estimate.return_value = EstimateResult(
-            cloud="aws",
-            cloud_region="us-east-1",
-            watttime_regions=[("PJM", 1.0)],
-            mapping_confidence=0.9,
-        )
-
-        watt_time = MagicMock()
-        ranking = AwsRegionRankingService(
-            _two_region_registry(),
-            watt_time,
-            availability_checker=InstanceAvailabilityChecker(),
-        )
-
-        skips: list[tuple[str, str]] = []
-        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
-
-        estimates = ranking.collect_estimates(
-            job,
-            on_availability_skip=lambda region, reason: skips.append((region, reason)),
-        )
-
-        assert len(estimates) == 1
-        assert estimates[0].cloud_region == "us-east-1"
-        assert len(skips) == 1
-        assert skips[0][0] == "ap-south-1"
-        assert "p4d.24xlarge" in skips[0][1]
-        mock_estimate.assert_called_once()

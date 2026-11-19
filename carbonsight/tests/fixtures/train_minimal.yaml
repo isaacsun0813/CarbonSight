@@ -2,7 +2,7 @@
 name: train-minimal
 resources:
   cloud: aws
-  accelerators: A100:1
-  cpus: 8
-  memory: 32
+  accelerators: T4:1
+  cpus: 4
+  memory: 16
 duration: 1h

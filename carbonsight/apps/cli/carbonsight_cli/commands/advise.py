@@ -2,126 +2,20 @@
 
 import json
 from pathlib import Path
-from typing import Any
 
 import typer
-import yaml
-from carbonsight_core.config import Config
-from carbonsight_core.estimator.pricing import configure_pricing
-from carbonsight_core.mapping.registry import Registry
-from carbonsight_core.models import JobSpec
-from carbonsight_core.paths import (
-    carbonsight_package_root_from_cli_command_file,
-    resolve_registry_json_file,
-)
 from carbonsight_core.region_ranking import AwsRegionRankingService
-from carbonsight_core.telemetry.nvidia_smi import sample_mean_gpu_utilization_from_nvidia_smi
 from carbonsight_core.watttime import WattTimeClient
 from rich.console import Console
 from rich.table import Table
 
-
-def parse_sky_accelerators_string(acc: str) -> tuple[str, int]:
-    """SkyPilot accelerators → (gpu_type, gpu_count). Supports 'A100:1' and '1x A100'."""
-    gpu_count, gpu_type = 1, "A100"
-    if not acc:
-        return gpu_type, gpu_count
-    acc = acc.strip()
-    if "x" in acc or "X" in acc:
-        parts = acc.replace("x", " ").replace("X", " ").split()
-        if len(parts) >= 2:
-            try:
-                gpu_count = int(parts[0])
-                gpu_type = parts[1].split(":")[0] if ":" in parts[1] else parts[1]
-            except ValueError:
-                gpu_type = parts[0]
-    elif ":" in acc:
-        left, right = acc.split(":", 1)
-        gpu_type = left.strip()
-        try:
-            gpu_count = int(right.strip().split(":")[-1])
-        except ValueError:
-            pass
-    return gpu_type, gpu_count
-
-
-def parse_duration_hours(raw: Any) -> float:
-    """YAML duration '1h' / '30m' → hours. Default 1.0."""
-    if raw is None:
-        return 1.0
-    s = str(raw).strip().lower()
-    if not s:
-        return 1.0
-    num = float(s.replace("h", "").replace("m", "").strip() or "1")
-    if "m" in s:
-        num /= 60.0
-    return num if num > 0 else 1.0
-
-
-def job_spec_from_sky_yaml(path: Path) -> JobSpec:
-    """SkyPilot-style YAML → JobSpec.
-
-    Optional ``carbonsight: { gpu_utilization: 0.75 }`` fixes GPU utilization for the power model
-    (same effect as ``--gpu-util`` / ``--nvidia-smi`` on the CLI).
-    """
-    data: dict = yaml.safe_load(path.read_text()) or {}
-    resources = data.get("resources") or {}
-    acc = resources.get("accelerators") or ""
-    gpu_type, gpu_count = parse_sky_accelerators_string(acc if isinstance(acc, str) else "")
-    duration = parse_duration_hours(data.get("duration"))
-    gpu_utilization: float | None = None
-    cs = data.get("carbonsight")
-    if isinstance(cs, dict) and cs.get("gpu_utilization") is not None:
-        try:
-            gpu_utilization = float(cs["gpu_utilization"])
-        except (TypeError, ValueError):
-            gpu_utilization = None
-    return JobSpec(
-        gpu_type=gpu_type,
-        gpu_count=gpu_count,
-        duration_hours=duration,
-        cpu_count=resources.get("cpus"),
-        mem_gib=resources.get("memory"),
-        gpu_utilization=gpu_utilization,
-    )
-
-
-def apply_gpu_telemetry_cli(
-    job: JobSpec,
-    *,
-    gpu_util: float | None,
-    nvidia_smi: bool,
-) -> tuple[JobSpec, bool]:
-    """Apply CLI GPU telemetry. Returns ``(job, nvidia_smi_failed)``.
-
-    Precedence: ``--gpu-util`` overrides everything; else ``--nvidia-smi`` samples this host;
-    else YAML ``carbonsight.gpu_utilization`` on ``job`` is kept.
-    """
-    if gpu_util is not None:
-        return job.model_copy(update={"gpu_utilization": gpu_util}), False
-    if nvidia_smi:
-        u = sample_mean_gpu_utilization_from_nvidia_smi()
-        if u is None:
-            return job, True
-        return job.model_copy(update={"gpu_utilization": u}), False
-    return job, False
-
-
-def resolve_live_aws_pricing(
-    config: Config,
-    *,
-    live_pricing: bool,
-    static_pricing: bool,
-) -> bool:
-    """CLI/env precedence: --static-pricing > --live-pricing > CARBONSIGHT_LIVE_AWS_PRICING."""
-    if static_pricing and live_pricing:
-        typer.echo("Error: use only one of --live-pricing and --static-pricing.", err=True)
-        raise typer.Exit(1)
-    if static_pricing:
-        return False
-    if live_pricing:
-        return True
-    return config.live_aws_pricing
+from carbonsight_cli.commands.job_setup import (
+    ensure_job_inputs,
+    load_config,
+    load_job_spec,
+    load_registry,
+    resolve_registry_file,
+)
 
 
 def run_advise(
@@ -138,38 +32,12 @@ def run_advise(
     use_spot: bool = False,
 ) -> None:
     """Shared implementation for ``advise`` and ``train``."""
-    if not yaml_path.exists():
-        typer.echo(f"Error: file not found: {yaml_path}", err=True)
-        raise typer.Exit(1)
+    ensure_job_inputs(yaml_path, gpu_util)
 
-    if gpu_util is not None and not (0.0 <= gpu_util <= 1.0):
-        typer.echo("Error: --gpu-util must be between 0 and 1.", err=True)
-        raise typer.Exit(1)
+    job = load_job_spec(yaml_path, gpu_util=gpu_util, nvidia_smi=nvidia_smi)
+    reg = load_registry(resolve_registry_file(registry_path))
 
-    job = job_spec_from_sky_yaml(yaml_path)
-    job, nvidia_failed = apply_gpu_telemetry_cli(job, gpu_util=gpu_util, nvidia_smi=nvidia_smi)
-    if nvidia_failed:
-        typer.echo(
-            "Warning: --nvidia-smi could not read utilization (no GPU driver here?). "
-            "Using default sampled GPU power.",
-            err=True,
-        )
-    package_root = carbonsight_package_root_from_cli_command_file(Path(__file__))
-    rpath = resolve_registry_json_file(registry_path, carbonsight_package_root=package_root, cwd=Path.cwd())
-    if not rpath.exists():
-        typer.echo("No registry found. Use --registry or add seed_registry.json.", err=True)
-        raise typer.Exit(1)
-
-    reg = Registry()
-    reg.load_json(rpath)
-
-    config = Config.from_env()
-    configure_pricing(
-        config,
-        live_aws_pricing=resolve_live_aws_pricing(
-            config, live_pricing=live_pricing, static_pricing=static_pricing,
-        ),
-    )
+    config = load_config(live_pricing=live_pricing, static_pricing=static_pricing)
     if not config.watttime_username or not config.watttime_password:
         if json_out:
             typer.echo("[]")
@@ -203,9 +71,9 @@ def run_advise(
     premium_pct = int(max_cost_premium * 100)
     table = Table(title=f"Greenest regions within {premium_pct}% of cheapest (${min_cost:.2f})")
     table.add_column("Region", style="cyan")
-    table.add_column("CO2 (kg)", justify="right")
-    table.add_column("CO2 p10-p90", justify="right")
-    table.add_column("Cost (USD)", justify="right")
+    table.add_column("IT CO2 mean (kg)" if job.has_duration_estimate else "IT CO2 (kg/h)", justify="right")
+    table.add_column("IT CO2 p10-p90" if job.has_duration_estimate else "IT CO2 p10-p90 (kg/h)", justify="right")
+    table.add_column("Cost (USD)" if job.has_duration_estimate else "Cost (USD/h)", justify="right")
     table.add_column("vs cheapest", justify="right")
     table.add_column("Confidence", justify="right")
     for row in visible:
@@ -227,7 +95,7 @@ def run_advise(
         )
     if explain:
         typer.echo(
-            f"  Green rank: CO2 emissions (live WattTime data). "
+            f"  Green rank: IT operational CO2 (live WattTime data; facility overhead excluded). "
             f"Cost ceiling: ${cost_ceiling:.2f} (+{premium_pct}% above cheapest)."
         )
 
@@ -248,7 +116,7 @@ def advise(
     gpu_util: float | None = typer.Option(
         None,
         "--gpu-util",
-        help="Observed GPU utilization in [0, 1] (overrides YAML carbonsight.gpu_utilization).",
+        help="Observed GPU utilization in [0, 1] for the power model.",
     ),
     nvidia_smi: bool = typer.Option(
         False,
