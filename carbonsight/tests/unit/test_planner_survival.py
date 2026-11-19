@@ -1,9 +1,9 @@
 """Unit tests for spot survival model."""
 
-from datetime import datetime, timedelta, timezone
+import math
+from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from carbonsight_core.planning.survival import (
     ASSUMED_SPOT_MEAN_LIFETIME_HOURS,
     MEAN_SPOT_LIFETIME_HOURS,
@@ -18,7 +18,7 @@ from carbonsight_core.planning.survival import (
     replay_observations,
 )
 
-UTC = timezone.utc
+UTC = UTC
 
 
 class TestNelsonAalenModel:
@@ -27,12 +27,37 @@ class TestNelsonAalenModel:
         remaining = model.expected_remaining_lifetime(0.0)
         assert remaining == pytest.approx(MEAN_SPOT_LIFETIME_HOURS, rel=0.01)
 
-    def test_complete_lifetime_lowers_remaining(self) -> None:
+    def test_remaining_lifetime_integrates_intervals_and_tail(self) -> None:
         model = NelsonAalenModel()
         model.record_complete(2.0)
-        model.record_complete(2.0)
-        remaining = model.expected_remaining_lifetime(2.0)
-        assert remaining < MEAN_SPOT_LIFETIME_HOURS
+        assert model.expected_remaining_lifetime(0) == pytest.approx(2 + 4 * math.exp(-1))
+        assert model.expected_remaining_lifetime(1.5) == pytest.approx(0.5 + 4 * math.exp(-1))
+        assert model.expected_remaining_lifetime(2) == pytest.approx(4)
+
+    def test_stretched_history_has_longer_expected_lifetime(self) -> None:
+        short = NelsonAalenModel()
+        long = NelsonAalenModel()
+        for hours in [1, 2, 2, 3, 4]:
+            short.record_complete(hours)
+            long.record_complete(hours * 10)
+        assert long.expected_remaining_lifetime(0) > 5 * short.expected_remaining_lifetime(0)
+
+    def test_censored_history_preserves_survival_until_tail(self) -> None:
+        model = NelsonAalenModel()
+        model.record_censored(10)
+        assert model.expected_remaining_lifetime(0) == pytest.approx(14)
+        assert model.survival(14) == pytest.approx(math.exp(-1))
+
+    def test_exponential_tail_is_memoryless_and_respects_volatility(self) -> None:
+        model = NelsonAalenModel()
+        for age in (0, 2, 1000):
+            assert model.expected_remaining_lifetime(age, gamma_star=2) == pytest.approx(2)
+
+    @pytest.mark.parametrize("age,gamma", [(-1, 1), (math.nan, 1), (math.inf, 1),
+                                          (0, 0), (0, -1), (0, math.nan), (0, math.inf)])
+    def test_invalid_lifetime_inputs(self, age, gamma) -> None:
+        with pytest.raises(ValueError):
+            NelsonAalenModel().expected_remaining_lifetime(age, gamma_star=gamma)
 
     def test_survival_decreases_with_age(self) -> None:
         model = NelsonAalenModel()

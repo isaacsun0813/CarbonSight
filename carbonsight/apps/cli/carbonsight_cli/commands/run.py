@@ -1,7 +1,9 @@
 """carbonsight run train.yaml [--dry-run] [--no-exec] [--managed] [--max-cost-premium N]"""
 
+import codecs
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -28,9 +30,10 @@ from carbonsight_core.checkpoint import (
 from carbonsight_core.cloud.aws.availability import InstanceAvailabilityChecker
 from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.cloud.aws.gpu_catalog import aws_instance_type_for_gpu
-from carbonsight_core.cloud.aws.probe import ProbeResult, SpotLaunchProbe
+from carbonsight_core.cloud.aws.probe import CAPACITY_ERROR_CODES, ProbeResult, SpotLaunchProbe
 from carbonsight_core.cloud.aws.quota import QuotaChecker
 from carbonsight_core.cloud.aws.spot_advisor import SpotAdvisorError, fetch_advisor_bands
+from carbonsight_core.cloud.aws.spot_placement import get_spot_placement_scores
 from carbonsight_core.config import Config
 from carbonsight_core.estimator.carbon_model import JobCarbonEstimator
 from carbonsight_core.estimator.pricing import estimate_cost_usd
@@ -79,6 +82,7 @@ from carbonsight_cli.commands.job_setup import (
 )
 
 BASELINE_REGION = "us-east-1"
+MAX_ORDINARY_SPOT_REGIONS = 5
 
 
 def _echo_dynamic_plan(dyn, *, title: str = "Dynamic plan (advisory simulation)") -> None:
@@ -170,6 +174,7 @@ def launch_skypilot_with_patched_yaml(
     detach: bool = False,
     cluster_name: str | None = None,
     idle_minutes_to_autostop: int | None = None,
+    output_chunks: list[str] | None = None,
 ) -> int:
     """
     Write YAML to temp file, run sky launch or sky jobs launch. Returns process exit code.
@@ -199,7 +204,19 @@ def launch_skypilot_with_patched_yaml(
         cmd.append(str(tmp_path))
 
         typer.echo(f"Running: {' '.join(cmd)}")
-        return subprocess.run(cmd, cwd=cwd).returncode
+        if output_chunks is None:
+            return subprocess.run(cmd, cwd=cwd).returncode
+        with subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+            assert process.stdout is not None
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            while chunk := process.stdout.read1(4096):
+                text = decoder.decode(chunk)
+                output_chunks.append(text)
+                typer.echo(text, nl=False)
+            tail = decoder.decode(b"", final=True)
+            output_chunks.append(tail)
+            typer.echo(tail, nl=False)
+            return process.wait()
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -292,6 +309,11 @@ def parse_sky_cluster_status(text: str, cluster_name: str) -> str | None:
     return None
 
 
+def _sky_cluster_absent(text: str, cluster_name: str) -> bool:
+    absent_messages = {f"Cluster {cluster_name!r} not found.", "No existing clusters."}
+    return bool(absent_messages.intersection(text.splitlines()))
+
+
 @dataclass(frozen=True, slots=True)
 class SkyHandle:
     """One launched SkyPilot cluster."""
@@ -299,6 +321,12 @@ class SkyHandle:
     cluster_name: str
     region: str
     mode: JobMode
+
+
+class SkyLaunchUncertainError(Exception):
+    def __init__(self, handle: SkyHandle) -> None:
+        self.handle = handle
+        super().__init__(f"launch failed for {handle.region}; check cluster {handle.cluster_name}")
 
 
 class SkyRunner:
@@ -325,13 +353,14 @@ class SkyRunner:
         self._launches = 0
 
     def launch(self, region: str, mode: JobMode) -> SkyHandle | None:
-        """Submit the job detached on a fresh cluster. None when SkyPilot reports failure."""
+        """Submit detached. Return None for a confirmed Spot provisioning capacity failure."""
         self._launches += 1
         handle = SkyHandle(
             cluster_name=f"cs-{self._run_id}-{self._launches}", region=region, mode=mode,
         )
         patched = self._yaml_for_launch(region, mode == JobMode.SPOT)
         # Autodown after idle is the safety net if this process dies; teardown() is the normal path.
+        output: list[str] = []
         code = self._launch_fn(
             patched,
             managed=False,
@@ -341,10 +370,26 @@ class SkyRunner:
             detach=True,
             cluster_name=handle.cluster_name,
             idle_minutes_to_autostop=self._idle_minutes,
+            output_chunks=output,
         )
         if code != 0:
-            self.teardown(handle)
-            return None
+            diagnostic = "".join(output)
+            aws_codes = set(re.findall(r"An error occurred \(([^)]+)\) when calling", diagnostic))
+            if (
+                mode is JobMode.SPOT
+                and "Failed to provision all possible launchable resources." in diagnostic
+                and aws_codes
+                and aws_codes <= CAPACITY_ERROR_CODES
+            ):
+                status = self._run_fn(
+                    ["sky", "status", "--refresh", handle.cluster_name],
+                    capture_output=True,
+                    text=True,
+                )
+                if status.returncode == 0 and _sky_cluster_absent(status.stdout, handle.cluster_name):
+                    self._yes = True
+                    return None
+            raise SkyLaunchUncertainError(handle)
         # The user confirmed the first launch; do not re-prompt on relaunches in an unattended loop.
         self._yes = True
         return handle
@@ -364,9 +409,12 @@ class SkyRunner:
         )
         if status.returncode != 0:
             return SkyStatus.UNKNOWN
-        if parse_sky_cluster_status(status.stdout, handle.cluster_name) == "UP":
-            return SkyStatus.UNKNOWN  # reachable per status; the queue call was a transient error
-        return SkyStatus.PREEMPTED
+        if (
+            _sky_cluster_absent(status.stdout, handle.cluster_name)
+            or parse_sky_cluster_status(status.stdout, handle.cluster_name) == "STOPPED"
+        ):
+            return SkyStatus.PREEMPTED
+        return SkyStatus.UNKNOWN
 
     def teardown(self, handle: SkyHandle) -> None:
         """Best-effort ``sky down``; never raises."""
@@ -481,6 +529,7 @@ def _run_dynamic_loop(
     idle_tick_hours: float,
     max_launch_failures: int = 5,
     max_unknown_polls: int = 10,
+    spot_regions: Sequence[str] | None = None,
 ) -> DynamicLoopOutcome:
     """
     Time-constrained loop that routes each iteration to the matching ``DynamicJob`` method.
@@ -488,16 +537,16 @@ def _run_dynamic_loop(
     All scheduling decisions stay in ``DynamicJob``; this function only observes the clock and
     the cluster (via ``runner``) and performs the launch/teardown side effects.
     """
-    job = dyn.job
     deadline = dyn.constraints.deadline_utc
     out = DynamicLoopOutcome(state=state)
     handle: SkyHandle | None = None
     seg_start: datetime | None = None
     launch_failures = 0
     unknown_polls = 0
+    failed_spot_regions: set[str] = set()
 
     try:
-        while state.progress_hours < job.duration_hours:
+        while not dyn.completed:
             now = clock()
             if now >= deadline:
                 break
@@ -538,7 +587,11 @@ def _run_dynamic_loop(
                 continue
 
             state = replace(state, now_utc=now)
-            decision = dyn.decide(state)
+            if spot_regions is None:
+                decision = dyn.decide(state)
+            else:
+                remaining_regions = [r for r in spot_regions if r not in failed_spot_regions]
+                decision = dyn.decide(state, spot_regions=remaining_regions)
             chosen = decision.chosen
 
             if chosen is None:
@@ -546,10 +599,15 @@ def _run_dynamic_loop(
                 sleep(idle_tick_hours * 3600.0)
                 continue
 
-            new_handle = runner.launch(chosen.region, chosen.mode)
+            try:
+                new_handle = runner.launch(chosen.region, chosen.mode)
+            except SkyLaunchUncertainError as exc:
+                out.failed = str(exc)
+                break
             if new_handle is None:
                 launch_failures += 1
                 if chosen.mode == JobMode.SPOT:
+                    failed_spot_regions.add(chosen.region)
                     dyn.trackers[chosen.region].record_probe(
                         now, available=False, source="launch"
                     )
@@ -572,6 +630,7 @@ def _run_dynamic_loop(
                 continue
 
             launch_failures = 0
+            failed_spot_regions.clear()
             handle = new_handle
             if decision.safety_net:
                 state = dyn.fallback_to_ondemand(state, decision, run_to_completion=False)
@@ -640,6 +699,7 @@ def _execute_dynamic_run(
     idle_tick_hours: float,
     clock: Clock,
     sleep: Sleep,
+    spot_regions: Sequence[str] | None = None,
     observations: Mapping[str, Sequence[SpotObservation]] | None = None,
     on_observation: Callable[[str, SpotObservation], None] | None = None,
     advisor_bands: Mapping[str, int] | None = None,
@@ -675,6 +735,7 @@ def _execute_dynamic_run(
         sleep=sleep,
         poll_seconds=poll_seconds,
         idle_tick_hours=idle_tick_hours,
+        spot_regions=spot_regions,
     )
     result = dyn.finalize(outcome.state)
     _echo_dynamic_plan(result, title="Dynamic run (events; planner IT carbon is deterministic)")
@@ -692,7 +753,7 @@ def _execute_dynamic_run(
     if outcome.failed:
         typer.echo(f"Error: {outcome.failed}", err=True)
         return 1
-    if outcome.state.progress_hours < job.duration_hours:
+    if not result.deadline_met:
         typer.echo("Error: finish-by deadline reached before the job finished.", err=True)
         return 1
     if (
@@ -886,8 +947,12 @@ def _pick_region_with_dynamic_plan(
 def _pick_static_region(
     estimates: list[EstimateResult],
     max_cost_premium: float,
+    *,
+    preferred_region: str | None = None,
 ) -> tuple[str, str, EstimateResult]:
-    best = AwsRegionRankingService.pick_best_region_for_launch(estimates, max_cost_premium)
+    best = next((row for row in estimates if row.cloud_region == preferred_region), None)
+    if best is None:
+        best = AwsRegionRankingService.pick_best_region_for_launch(estimates, max_cost_premium)
     if best is None:
         typer.echo("No region selected.", err=True)
         raise typer.Exit(1)
@@ -970,7 +1035,7 @@ class LaunchOptions:
     idle_tick_hours: float = 1.0
     clock: Clock | None = None
     sleep: Sleep | None = None
-    probe_before_plan: bool = True
+    probe_before_plan: bool = False
 
 
 @dataclass
@@ -1002,6 +1067,7 @@ class _LaunchContext:
     plan_constraints: PlanConstraints | None = None
     region_inputs: list[RegionPlanInput] | None = None
     spot_instance_type: str = ""
+    ordinary_spot_regions: list[str] = field(default_factory=list)
     rec: RunRecord | None = None
     ckpt_patch: CheckpointYamlPatch | None = None
     patched: str = ""
@@ -1019,6 +1085,39 @@ class _LaunchContext:
         )
 
 
+def _explicit_aws_region(yaml_path: Path) -> str | None:
+    resources = (yaml.safe_load(yaml_path.read_text()) or {}).get("resources") or {}
+    if not isinstance(resources, dict) or {"ordered", "any_of"} & resources.keys():
+        typer.echo("Error: CarbonSight requires one SkyPilot resources mapping without ordered or any_of.", err=True)
+        raise typer.Exit(1)
+
+    infra = resources.get("infra")
+    parts = infra.split("/") if isinstance(infra, str) else []
+    cloud = resources.get("cloud")
+    if (
+        cloud not in (None, "", "aws", "*")
+        or (infra is not None and (not parts or parts[0] not in ("aws", "*")))
+        or len(parts) > 3
+    ):
+        typer.echo("Error: CarbonSight launch supports AWS infrastructure only.", err=True)
+        raise typer.Exit(1)
+    if resources.get("zone") not in (None, "", "*") or (
+        len(parts) == 3 and parts[2] not in ("", "*")
+    ):
+        typer.echo("Error: CarbonSight launch supports region pins only. Remove the availability-zone pin.", err=True)
+        raise typer.Exit(1)
+
+    legacy_region = resources.get("region")
+    infra_region = parts[1] if len(parts) > 1 else None
+    regions = [region for region in (legacy_region, infra_region) if region not in (None, "", "*")]
+    if any(not isinstance(region, str) or "*" in region for region in regions) or (
+        len(regions) == 2 and regions[0] != regions[1]
+    ):
+        typer.echo("Error: Specify one exact, consistent AWS region in the SkyPilot resources.", err=True)
+        raise typer.Exit(1)
+    return next(iter(regions), None)
+
+
 def _prepare_launch_context(yaml_path: Path, options: LaunchOptions) -> _LaunchContext:
     """Validate inputs, load the job and registry, and collect region estimates."""
     if options.poll_seconds <= 0 or options.idle_tick_hours <= 0:
@@ -1026,10 +1125,18 @@ def _prepare_launch_context(yaml_path: Path, options: LaunchOptions) -> _LaunchC
         raise typer.Exit(1)
 
     ensure_job_inputs(yaml_path, options.gpu_util)
+    explicit_region = _explicit_aws_region(yaml_path)
 
     job = load_job_spec(
         yaml_path, gpu_util=options.gpu_util, nvidia_smi=options.nvidia_smi
     )
+    carbonsight_block = carbonsight_block_from_yaml(yaml_path)
+    effective_finish_by = resolve_finish_by(
+        options.finish_by, yaml_path, carbonsight_block=carbonsight_block,
+    )
+    if not job.has_duration_estimate and (effective_finish_by is not None or parse_duration_hours(options.max_delay) > 0):
+        typer.echo("Error: deadline or delayed-start planning requires an explicit estimated duration.", err=True)
+        raise typer.Exit(1)
     reg = load_registry(resolve_registry_file(options.registry_path))
 
     config = load_config(
@@ -1060,11 +1167,14 @@ def _prepare_launch_context(yaml_path: Path, options: LaunchOptions) -> _LaunchC
     estimates = ranking.collect_estimates(
         job,
         use_spot=options.use_spot,
-        on_enabled_region_skip=_skip,
-        on_quota_skip=_skip,
-        on_availability_skip=_skip,
+        on_region_skip=_skip,
         on_estimate_error=_estimate_warn,
     )
+    if explicit_region is not None:
+        estimates = [row for row in estimates if row.cloud_region == explicit_region]
+        if not estimates:
+            typer.echo(f"No eligible estimate for the pinned AWS region {explicit_region}.", err=True)
+            raise typer.Exit(1)
 
     if not estimates:
         typer.echo(
@@ -1073,10 +1183,6 @@ def _prepare_launch_context(yaml_path: Path, options: LaunchOptions) -> _LaunchC
         )
         raise typer.Exit(1)
 
-    carbonsight_block = carbonsight_block_from_yaml(yaml_path)
-    effective_finish_by = resolve_finish_by(
-        options.finish_by, yaml_path, carbonsight_block=carbonsight_block,
-    )
     effective_carbon_budget = resolve_carbon_budget_kg(
         options.carbon_budget_kg, yaml_path, carbonsight_block=carbonsight_block,
     )
@@ -1118,6 +1224,7 @@ def _select_region(ctx: _LaunchContext) -> None:
             effective_carbon_price=ctx.effective_carbon_price,
             max_cost_premium=options.max_cost_premium,
         )
+        plan_constraints = replace(plan_constraints, allow_spot=options.use_spot)
         ctx.plan_constraints = plan_constraints
         ctx.region_inputs = region_inputs
         candidate_regions = [r.cloud_region for r in region_inputs]
@@ -1130,7 +1237,7 @@ def _select_region(ctx: _LaunchContext) -> None:
             options.dry_run or options.no_exec or options.validate_sky or options.sky_smoke
         )
         prober: Prober | None = None
-        if launching and options.probe_before_plan:
+        if launching and options.use_spot and options.probe_before_plan:
             prober = _make_prober(ctx.config, ctx.job.gpu_type, ctx.spot_instance_type)
         if prober is not None:
             _probe_before_plan(
@@ -1156,7 +1263,16 @@ def _select_region(ctx: _LaunchContext) -> None:
         ctx.use_spot = use_spot
         ctx.best = best
     else:
-        cloud, region, best = _pick_static_region(ctx.estimates, options.max_cost_premium)
+        if ctx.use_spot and not options.sky_smoke and len(ctx.estimates) > 1:
+            preview = options.dry_run or options.no_exec or options.validate_sky
+            ctx.ordinary_spot_regions = _ordered_spot_regions(ctx, fetch_scores=not preview)[
+                :MAX_ORDINARY_SPOT_REGIONS
+            ]
+        cloud, region, best = _pick_static_region(
+            ctx.estimates,
+            options.max_cost_premium,
+            preferred_region=next(iter(ctx.ordinary_spot_regions), None),
+        )
         ctx.cloud = cloud
         ctx.region = region
         ctx.best = best
@@ -1167,6 +1283,9 @@ def _select_region(ctx: _LaunchContext) -> None:
 
 def _record_run(ctx: _LaunchContext) -> None:
     """Record the pre-launch estimate in the run ledger (before any launch mode)."""
+    if not ctx.job.has_duration_estimate:
+        typer.echo("Runtime unknown: skipping job-total ledger estimates.", err=True)
+        return
     best = ctx.best
     assert best is not None  # set by _select_region
     job = ctx.job
@@ -1238,6 +1357,26 @@ def _build_checkpoint_patch(ctx: _LaunchContext) -> None:
     )
 
 
+def _ordered_spot_regions(
+    ctx: _LaunchContext, eligible_regions: set[str] | None = None, *, fetch_scores: bool = True
+) -> list[str]:
+    visible, _, _ = AwsRegionRankingService.rank_greenest_first_then_cost_ceiling(
+        ctx.estimates, ctx.options.max_cost_premium
+    )
+    if eligible_regions is not None:
+        visible = [row for row in visible if row.cloud_region in eligible_regions]
+    if fetch_scores and len(visible) > 1:
+        spec = yaml.safe_load(ctx.yaml_path.read_text())
+        resources = spec.get("resources") or {}
+        instance_type = resources.get("instance_type") if isinstance(resources, dict) else None
+        if isinstance(instance_type, str) and instance_type:
+            scores = get_spot_placement_scores(
+                instance_type, spec.get("num_nodes", 1), [row.cloud_region for row in visible]
+            )
+            visible.sort(key=lambda row: (row.expected_co2_kg_mean, -scores.get(row.cloud_region, 0)))
+    return [row.cloud_region for row in visible]
+
+
 def _execute_deadline_launch(ctx: _LaunchContext) -> None:
     """Deadline path: monitored event loop (launch, poll, relaunch after preemption)."""
     options = ctx.options
@@ -1278,6 +1417,10 @@ def _execute_deadline_launch(ctx: _LaunchContext) -> None:
             except sqlite3.Error as err:
                 typer.echo(f"Warning: could not persist spot observation ({err}).", err=True)
 
+        spot_regions = (
+            _ordered_spot_regions(ctx, {region.cloud_region for region in ctx.region_inputs})
+            if options.use_spot else None
+        )
         loop_exit_code = _execute_dynamic_run(
             ctx.job,
             ctx.plan_constraints,
@@ -1290,6 +1433,7 @@ def _execute_deadline_launch(ctx: _LaunchContext) -> None:
             sleep=options.sleep or time.sleep,
             observations=ctx.spot_history,
             on_observation=_persist_observation,
+            spot_regions=spot_regions,
             advisor_bands=ctx.advisor_bands,
         )
     finally:
@@ -1306,7 +1450,16 @@ def _dispatch_launch(ctx: _LaunchContext) -> None:
     assert best is not None  # set by _select_region
     patched = build_patched_yaml_text(
         ctx.yaml_path, ctx.cloud, ctx.region, use_spot=ctx.use_spot, ckpt_patch=ctx.ckpt_patch,
+        force_on_demand=not options.use_spot,
     )
+    ordered_regions = ctx.ordinary_spot_regions
+    if len(ordered_regions) > 1:
+        data = yaml.safe_load(patched)
+        data["resources"].pop("infra")
+        data["resources"]["ordered"] = [
+            {"infra": f"{ctx.cloud}/{region}"} for region in ordered_regions
+        ]
+        patched = yaml.safe_dump(data, sort_keys=False)
     ctx.patched = patched
     sky_cwd = ctx.yaml_path.parent.resolve()
     ctx.sky_cwd = sky_cwd
@@ -1361,6 +1514,10 @@ def _dispatch_launch(ctx: _LaunchContext) -> None:
     if exit_code != 0:
         raise typer.Exit(exit_code)
 
+    if len(ordered_regions) > 1:
+        typer.echo("Actual IT CO₂ estimate unavailable: SkyPilot launch region is unknown.")
+        return
+
     end_time = datetime.now(UTC)
     try:
         actual = JobCarbonEstimator(ctx.watt_time).compute_actual_run(
@@ -1370,15 +1527,16 @@ def _dispatch_launch(ctx: _LaunchContext) -> None:
             watttime_regions=best.watttime_regions,
             actual_start=start_time,
             actual_end=end_time,
-            estimated_co2_kg=best.expected_co2_kg_mean,
+            estimated_co2_kg=best.expected_co2_kg_mean if ctx.job.has_duration_estimate else 0.0,
         )
-        pct = actual.co2_savings_vs_estimate_pct
-        sign = "+" if pct >= 0 else ""
+        comparison = (
+            f" | vs estimate: {actual.co2_savings_vs_estimate_pct:+.1f}%"
+            if ctx.job.has_duration_estimate else ""
+        )
         typer.echo(
             f"\nActual IT CO₂ estimate: {actual.actual_co2_kg:.3f}kg | "
             f"Duration: {actual.actual_duration_hours:.1f}h | "
-            f"Cost: ${actual.actual_cost_usd:.2f} | "
-            f"vs estimate: {sign}{pct:.1f}%"
+            f"Cost: ${actual.actual_cost_usd:.2f}{comparison}"
         )
     except (ValueError, WattTimeError) as e:
         typer.echo(f"\nWarning: could not compute actual CO₂: {e}", err=True)
@@ -1496,11 +1654,11 @@ def run_cmd(
         help="With a finish-by deadline: hours to wait between decisions while waiting for a better launch window.",
     ),
     probe_before_plan: bool = typer.Option(
-        True,
+        False,
         "--probe/--no-probe",
         help=(
-            "With a finish-by deadline: once, just before planning, launch one spot instance per "
-            "candidate region and terminate it immediately; results feed the lifetime prior. "
+            "Opt in before a Spot-enabled deadline launch: launch one spot instance per "
+            "candidate region and terminate it immediately. Results feed the lifetime prior. "
             "COST: successful probes bill real GPU instances and need vCPU quota."
         ),
     ),

@@ -14,6 +14,7 @@ from typing import Any
 import typer
 import yaml
 from carbonsight_core.config import Config
+from carbonsight_core.estimator.power_model import gpu_power_limit_w
 from carbonsight_core.estimator.pricing import configure_pricing
 from carbonsight_core.mapping.registry import Registry
 from carbonsight_core.models import JobSpec
@@ -53,12 +54,10 @@ def parse_duration_hours(raw: Any) -> float:
     if raw is None:
         return 1.0
     s = str(raw).strip().lower()
-    if not s:
-        return 1.0
-    num = float(s.replace("h", "").replace("m", "").strip() or "1")
+    num = float(s.replace("h", "").replace("m", "").strip())
     if "m" in s:
         num /= 60.0
-    return num if num > 0 else 1.0
+    return num
 
 
 def parse_finish_by(raw: Any) -> datetime:
@@ -169,11 +168,12 @@ def job_spec_from_sky_yaml(path: Path) -> JobSpec:
     resources = data.get("resources") or {}
     acc = resources.get("accelerators") or ""
     gpu_type, gpu_count = parse_sky_accelerators_string(acc if isinstance(acc, str) else "")
-    duration = parse_duration_hours(data.get("duration"))
+    duration = data.get("duration")
     return JobSpec(
         gpu_type=gpu_type,
         gpu_count=gpu_count,
-        duration_hours=duration,
+        **({"duration_hours": parse_duration_hours(duration)} if duration is not None else {}),
+        gpu_power_limit_w=carbonsight_block_from_yaml(path).get("gpu_power_limit_w"),
         cpu_count=resources.get("cpus"),
         mem_gib=resources.get("memory"),
     )
@@ -232,11 +232,22 @@ def load_job_spec(yaml_path: Path, *, gpu_util: float | None, nvidia_smi: bool) 
     Assumes ``ensure_job_inputs`` has already run.
     """
     job = job_spec_from_sky_yaml(yaml_path)
+    try:
+        gpu_power_limit_w(job)
+    except ValueError as err:
+        typer.echo(f"Error: {err}", err=True)
+        raise typer.Exit(1) from err
     job, nvidia_failed = apply_gpu_telemetry_cli(job, gpu_util=gpu_util, nvidia_smi=nvidia_smi)
     if nvidia_failed:
         typer.echo(
             "Warning: --nvidia-smi could not read utilization (no GPU driver here?). "
             "Using default sampled GPU power.",
+            err=True,
+        )
+    if not job.has_duration_estimate:
+        typer.echo(
+            "Runtime unknown: carbon and cost estimates compare one hour of execution, "
+            "not the whole job. Completion is determined by SkyPilot job status.",
             err=True,
         )
     return job

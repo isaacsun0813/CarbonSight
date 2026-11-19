@@ -34,6 +34,7 @@ aws.sh
 # Local reference material (not for the public repo)
 nsdi24-wu-zhanghao.pdf
 *.pdf
+!/papers/*.pdf
 
 # local runs
 Makefile

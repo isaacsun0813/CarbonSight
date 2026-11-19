@@ -47,7 +47,32 @@ run: |
   python train.py
 ```
 
+`duration` is optional estimated runtime, not a deadline or execution limit. Omit it
+for a clearly labeled one-hour carbon/cost comparison; `train --duration` is also
+optional. JSON results mark these comparisons in `notes`. A run with unknown runtime
+launches normally through SkyPilot but skips job-total ledger estimates. Deadline
+planning (`finish_by`, including `plan-static`) and delayed-start advice require an
+explicit positive runtime estimate. Actual job success comes from SkyPilot status,
+even when the job runs longer than estimated. Deadline outcomes remain best effort;
+the monitor exits at the deadline and leaves an unfinished cluster running with a warning.
+
 CarbonSight reads `duration` and `carbonsight.*` for estimates/planning, then **strips** those keys before SkyPilot launch. GPU power: pass `--gpu-util 0.75` or `--nvidia-smi` on the CLI (not stored in YAML).
+
+GPU power limits come from the source-linked
+[hardware catalog](packages/core/carbonsight_core/estimator/gpu_power_specs.json).
+For an uncataloged GPU, or a verified deployment-specific limit, supply watts **per GPU**:
+
+```yaml
+carbonsight:
+  gpu_power_limit_w: 72
+```
+
+The API accepts the same `gpu_power_limit_w` field. Limits must be positive and finite;
+unknown GPU names without a limit are rejected. Estimates still use an assumed idle
+floor of 10% of maximum power and a linear utilization curve; they are not measurements.
+A supplied limit overrides the catalog and is labeled as user-provided in result notes.
+Power-model coverage does not imply AWS instance, pricing, or launch support for that GPU.
+Catalog sources are reviewed manually; see [maintenance details](../ARCHITECTURE.md).
 
 1. **Advise** — ranked regions (greenest first, optional cost ceiling):
 
@@ -85,7 +110,7 @@ carbonsight train path/to/train.py --launch --dry-run   # show patched YAML
 carbonsight train path/to/train.py --launch --yes       # launch with SkyPilot
 ```
 
-Defaults: `A100:1`, `1h`, 8 CPUs, 32 GiB. Override with `--accelerators`, `--duration`, `--cpus`, `--memory`, `--name`.
+Defaults: `A100:1`, unknown runtime, 8 CPUs, 32 GiB. Override with `--accelerators`, `--duration`, `--cpus`, `--memory`, `--name`.
 
 Optional: `--gpu-util 0.72` or `--nvidia-smi` to anchor GPU power (see `examples/skypilot/train.yaml` comments).
 
@@ -97,10 +122,13 @@ Optional: `--gpu-util 0.72` or `--nvidia-smi` to anchor GPU power (see `examples
 | `carbonsight advise --yaml FILE [--json] [--max-cost-premium P]` | Rank regions by CO₂ (and cost), filter expensive outliers |
 | `carbonsight run FILE [--dry-run] [--no-exec] [--skip-preflight]` | Advise + optional AWS preflight + patch YAML + `sky launch` / `sky jobs launch` |
 | | `--finish-by`, `--carbon-budget`, `--carbon-price` override YAML only when set; else use `carbonsight.*` in the file |
+| | `--probe` opts in to billable Spot capacity probes before a Spot-enabled deadline launch with `run` or `train --launch` |
 | | `--validate-sky` (`sky launch --dryrun`), `--sky-smoke` (minimal job + `--down`) |
 | `carbonsight mappings validate [--json]` | Compare stored `wt_regions` to live `region-from-loc` (mixture-aware); exit `1` on drift; skipped without creds |
 | `carbonsight mappings refresh [--write]` | Re-resolve WattTime regions from site coords; dry-run by default |
 | `carbonsight backtest run [--json]` | Synthetic MOER/price policy experiment |
+
+For an ordinary Spot job with flexible placement, CarbonSight gives SkyPilot up to five affordable AWS regions in estimated emissions order. An explicit AWS region limits placement to that region. CarbonSight rejects zone pins and user-supplied `ordered` or `any_of` alternatives before launching. For an explicit EC2 instance type, fresh placement scores can break emissions ties. A multi-region launch reports the planned estimate and omits the post-run estimate when the actual region is unknown. Deadline runs monitor attempts individually so the scheduler can reconsider the remaining time after a capacity rejection.
 
 ## API (optional)
 

@@ -153,16 +153,17 @@ def _build_scheduler_candidates(
             job.gpu_type, job.gpu_count, 1.0, region.cloud_region, use_spot=False,
         ).usd
         lifetime = trackers[region.cloud_region].predict_lifetime_hours(now_utc)
-        candidates.append(
-            SchedulerCandidate(
-                region=region.cloud_region,
-                mode=JobMode.SPOT,
-                cost_rate_usd_per_hr=spot_cost,
-                carbon_rate_kg_per_hr=carb_rate,
-                migration_usd=migration,
-                expected_lifetime_hours=lifetime,
+        if constraints.allow_spot:
+            candidates.append(
+                SchedulerCandidate(
+                    region=region.cloud_region,
+                    mode=JobMode.SPOT,
+                    cost_rate_usd_per_hr=spot_cost,
+                    carbon_rate_kg_per_hr=carb_rate,
+                    migration_usd=migration,
+                    expected_lifetime_hours=lifetime,
+                )
             )
-        )
         candidates.append(
             SchedulerCandidate(
                 region=region.cloud_region,
@@ -218,6 +219,7 @@ def pick_next_state(
     candidates: list[SchedulerCandidate],
     *,
     c_od_min: float,
+    spot_regions: Sequence[str] | None = None,
 ) -> SchedulerDecision:
     """One scheduling step: Safety Net forces on-demand fallback, else pick best utility > current."""
     remaining_work = max(0.0, state.total_work_hours - state.progress_hours)
@@ -270,8 +272,13 @@ def pick_next_state(
 
     best_cand: SchedulerCandidate | None = None
     best_u = u_current
+    eligible_spot: dict[str, tuple[SchedulerCandidate, float]] = {}
     for c in candidates:
+        if c.mode is JobMode.SPOT and spot_regions is not None and c.region not in spot_regions:
+            continue
         u = _scheduler_utility(c, v_t, constraints)
+        if c.mode is JobMode.SPOT and u > u_current:
+            eligible_spot[c.region] = (c, u)
         improves_utility = u > best_u
         if improves_utility:
             best_u = u
@@ -279,6 +286,8 @@ def pick_next_state(
 
     has_better_candidate = best_cand is not None
     if has_better_candidate:
+        if best_cand.mode is JobMode.SPOT and spot_regions is not None:
+            best_cand, best_u = next(eligible_spot[r] for r in spot_regions if r in eligible_spot)
         return SchedulerDecision(
             chosen=best_cand,
             safety_net=False,
@@ -404,6 +413,8 @@ class DynamicJob:
         lifetime_bucket_hours: float = DEFAULT_BUCKET_HOURS,
         advisor_bands: Mapping[str, int] | None = None,
     ) -> None:
+        job.require_duration_estimate()
+        self.completed = False
         self.simulate_preemption = simulate_preemption
         # Spot Advisor band index per region (relative weights only). None = no advisor data:
         # the legacy flat assumed prior is used.
@@ -450,7 +461,9 @@ class DynamicJob:
         """Idle starting state at ``constraints.now_utc``."""
         return make_runtime_state(self.job, self.constraints)
 
-    def decide(self, state: JobRuntimeState) -> SchedulerDecision:
+    def decide(
+        self, state: JobRuntimeState, *, spot_regions: Sequence[str] | None = None,
+    ) -> SchedulerDecision:
         """One scheduling decision over all (region, mode) candidates."""
         self._refresh_priors()
         candidates = _build_scheduler_candidates(
@@ -461,7 +474,9 @@ class DynamicJob:
             state.now_utc,
             self.checkpoint,
         )
-        return pick_next_state(state, self.constraints, candidates, c_od_min=self.c_od_min)
+        return pick_next_state(
+            state, self.constraints, candidates, c_od_min=self.c_od_min, spot_regions=spot_regions,
+        )
 
     def _preempt(self, state: JobRuntimeState, notes: str) -> JobRuntimeState:
         """Record a preemption and fall back to idle at the checkpoint region."""
@@ -517,7 +532,7 @@ class DynamicJob:
         if candidate is None:
             return replace(state, mode=JobMode.IDLE)
 
-        run_hours = min(tick_hours, remaining)
+        run_hours = min(tick_hours, remaining) if self.simulate_preemption else tick_hours
         spot_lifetime_exceeded = False
         if (
             self.simulate_preemption
@@ -552,7 +567,8 @@ class DynamicJob:
         )
         if completed and state.progress_hours < job.duration_hours:
             state = replace(state, progress_hours=job.duration_hours)
-        if state.progress_hours >= job.duration_hours:
+        if completed or (self.simulate_preemption and state.progress_hours >= job.duration_hours):
+            self.completed = True
             self.events.append(
                 DynamicPlanEvent(
                     time_utc=state.now_utc,
@@ -678,10 +694,11 @@ class DynamicJob:
         ``deadline_met`` is only about finishing the work in time; the carbon budget is reported
         separately in ``carbon_budget_met``.
         """
-        deadline_met = (
+        completed = (
             state.progress_hours >= self.job.duration_hours
-            and state.now_utc <= self.constraints.deadline_utc
+            if self.simulate_preemption else self.completed
         )
+        deadline_met = completed and state.now_utc <= self.constraints.deadline_utc
         if not deadline_met:
             self.events.append(
                 DynamicPlanEvent(
@@ -729,6 +746,7 @@ def plan_dynamic_job(
     Spot lifetimes come from ``observations`` (read-only history) or the labeled assumed
     prior; simulated preemptions are model output, never recorded or persisted.
     """
+    job.require_duration_estimate()
     if not regions:
         empty = make_runtime_state(job, constraints)
         return DynamicPlanResult(

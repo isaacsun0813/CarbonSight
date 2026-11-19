@@ -1,31 +1,14 @@
 """Unit tests for EnabledRegionsProvider and ranking skip hook."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from botocore.exceptions import ClientError
 from carbonsight_core.cloud.aws.enabled_regions import EnabledRegionsProvider
 from carbonsight_core.mapping.registry import CloudRegionEntry, Registry
 from carbonsight_core.models import EstimateResult, JobSpec
 from carbonsight_core.region_ranking import AwsRegionRankingService
-
-
-def _two_region_registry() -> Registry:
-    reg = Registry()
-    reg._regions = {
-        ("aws", "us-east-1"): CloudRegionEntry(
-            provider="aws",
-            region_code="us-east-1",
-            display_name="US East",
-            wt_regions=[("PJM", 1.0)],
-        ),
-        ("aws", "eu-north-1"): CloudRegionEntry(
-            provider="aws",
-            region_code="eu-north-1",
-            display_name="Stockholm",
-            wt_regions=[("SE", 1.0)],
-        ),
-    }
-    return reg
 
 
 class TestEnabledRegionsProvider:
@@ -88,39 +71,51 @@ class TestEnabledRegionsProvider:
         assert ec2.describe_regions.call_count == 1
 
 
-class TestRankingEnabledRegionSkip:
-    @patch("carbonsight_core.estimator.carbon_model.JobCarbonEstimator.estimate_region")
-    def test_collect_estimates_skips_disabled_regions(
-        self, mock_estimate: MagicMock,
-    ) -> None:
-        mock_estimate.return_value = EstimateResult(
-            cloud="aws",
-            cloud_region="us-east-1",
-            watttime_regions=[("PJM", 1.0)],
-            mapping_confidence=0.9,
+@pytest.mark.parametrize("rejected_by", ["account", "quota", "offering", "estimate"])
+@patch("carbonsight_core.estimator.carbon_model.JobCarbonEstimator.estimate_region")
+def test_ranking_reports_rejected_region_and_keeps_valid_region(mock_estimate, rejected_by):
+    registry = Registry()
+    registry._regions = {
+        ("aws", code): CloudRegionEntry(
+            provider="aws", region_code=code, display_name=code, wt_regions=[("GRID", 1.0)],
         )
-
-        provider = MagicMock(spec=EnabledRegionsProvider)
-        provider.enabled_region_codes.return_value = frozenset({"us-east-1"})
-
-        watt_time = MagicMock()
-        ranking = AwsRegionRankingService(
-            _two_region_registry(),
-            watt_time,
-            enabled_regions_provider=provider,
-        )
-
-        skips: list[tuple[str, str]] = []
-        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
-        estimates = ranking.collect_estimates(
-            job,
-            on_enabled_region_skip=lambda region, reason: skips.append((region, reason)),
-        )
-
-        assert len(estimates) == 1
-        assert estimates[0].cloud_region == "us-east-1"
-        assert len(skips) == 1
-        assert skips[0][0] == "eu-north-1"
-        assert "not enabled" in skips[0][1]
-        mock_estimate.assert_called_once()
-        provider.enabled_region_codes.assert_called_once()
+        for code in ("us-east-1", "eu-north-1")
+    }
+    result = EstimateResult(
+        cloud="aws", cloud_region="eu-north-1", watttime_regions=[("GRID", 1.0)],
+        mapping_confidence=0.9,
+    )
+    mock_estimate.return_value = result
+    if rejected_by == "estimate":
+        mock_estimate.side_effect = [RuntimeError("forecast unavailable"), result]
+    provider, quota, offering = MagicMock(), MagicMock(), MagicMock()
+    provider.enabled_region_codes.return_value = frozenset(
+        ["eu-north-1"] if rejected_by == "account" else ["us-east-1", "eu-north-1"]
+    )
+    quota.check_gpu_quota.side_effect = lambda region, *args, **kwargs: SimpleNamespace(
+        allowed=not (rejected_by == "quota" and region == "us-east-1"), reason="quota exceeded",
+    )
+    offering.check_instance_offering.side_effect = lambda region, gpu: SimpleNamespace(
+        available=not (rejected_by == "offering" and region == "us-east-1"), reason="not offered",
+    )
+    ranking = AwsRegionRankingService(
+        registry, MagicMock(), enabled_regions_provider=provider,
+        quota_checker=quota, availability_checker=offering,
+    )
+    skips, errors = [], []
+    assert ranking.collect_estimates(
+        JobSpec(gpu_type="A100"), use_spot=True,
+        on_region_skip=lambda region, reason: skips.append((region, reason)),
+        on_estimate_error=lambda region, err: errors.append((region, str(err))),
+    ) == [result]
+    reason = {
+        "account": "region not enabled for this AWS account", "quota": "quota exceeded",
+        "offering": "not offered", "estimate": "forecast unavailable",
+    }[rejected_by]
+    assert (errors if rejected_by == "estimate" else skips) == [("us-east-1", reason)]
+    assert (skips if rejected_by == "estimate" else errors) == []
+    provider.enabled_region_codes.assert_called_once()
+    assert quota.check_gpu_quota.call_count == (1 if rejected_by == "account" else 2)
+    assert offering.check_instance_offering.call_count == (1 if rejected_by in {"account", "quota"} else 2)
+    assert mock_estimate.call_count == (2 if rejected_by == "estimate" else 1)
+    assert quota.check_gpu_quota.call_args.kwargs["use_spot"] is True

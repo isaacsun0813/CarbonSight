@@ -21,6 +21,7 @@ def build_region_plan_inputs(
     Combines mixture mappings using the same weighted-MOER calculation as
     ``JobCarbonEstimator``. Skips regions without mapping or on WattTime errors.
     """
+    job.require_duration_estimate()
     horizon_hours = math.ceil(
         (constraints.deadline_utc - constraints.now_utc).total_seconds() / 3600.0
         + job.duration_hours
@@ -40,22 +41,24 @@ def build_region_plan_inputs(
             ]
         except WattTimeError:
             continue
-        point_times = {
-            point["point_time"]
-            for _, points in forecasts
-            for point in points
-        }
-        if not point_times:
-            continue
         values_by_region = [
-            (weight, {point["point_time"]: float(point.get("value", 0)) for point in points})
+            (weight, {
+                point["point_time"]: float(point["value"])
+                for point in points
+                if point.get("value") is not None and math.isfinite(float(point["value"]))
+            })
             for weight, points in forecasts
         ]
+        if not values_by_region:
+            continue
+        point_times = set.intersection(*(set(values) for _, values in values_by_region))
+        if not point_times:
+            continue
         points = [
             {
                 "point_time": point_time,
                 "value": sum(
-                    weight * values.get(point_time, 400.0)
+                    weight * values[point_time]
                     for weight, values in values_by_region
                 ),
             }

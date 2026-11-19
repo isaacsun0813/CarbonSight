@@ -1,11 +1,17 @@
 """GPU utilization telemetry: nvidia-smi parsing and power model integration."""
 
+import math
 import random
 
+import pytest
 from carbonsight_core.estimator.carbon_model import estimate_job_carbon_in_region
 from carbonsight_core.estimator.power_model import (
+    GPU_POWER_CATALOG,
+    _gpu_power,
     _sample_u_gpu,
     expected_it_power_w,
+    gpu_power_limit_w,
+    gpu_power_notes,
     power_it_w,
     sample_power_params,
 )
@@ -88,3 +94,67 @@ class TestEstimateWithGpuUtilization:
             high, "aws", "us-east-1", [("PJM_DC", 1.0)], 0.9, _mock_wt(), moer_override=400.0, rng=rng
         )
         assert r_high.expected_co2_kg_mean > r_low.expected_co2_kg_mean
+
+
+@pytest.mark.parametrize("gpu,watts", [
+    ("L4", 72), ("L40", 300), ("L40S", 350), ("A10", 150), ("A10G", 300),
+    ("A100-PCIE-40GB", 250), ("A100-PCIE-80GB", 300), ("NVIDIA A100-SXM4-80GB", 400),
+    ("H100-PCIE", 350), ("H100-SXM5", 700), ("H200-NVL", 600), ("B200", 1000),
+])
+def test_gpu_power_uses_sourced_hardware_spec(gpu: str, watts: float) -> None:
+    job = JobSpec(gpu_type=gpu, gpu_count=2)
+    assert gpu_power_limit_w(job) == watts
+    assert _gpu_power(job, 1.0) == 2 * watts
+    assert _gpu_power(job, 0.0) == pytest.approx(0.2 * watts)
+    assert "source=https://" in gpu_power_notes(job)[0]
+
+
+def test_unknown_gpu_requires_explicit_limit_and_can_be_modeled() -> None:
+    with pytest.raises(ValueError, match="No sourced GPU power specification"):
+        expected_it_power_w(JobSpec(gpu_type="future-gpu"))
+    job = JobSpec(gpu_type="future-gpu", gpu_power_limit_w=120)
+    assert _gpu_power(job, 1.0) == 120
+    assert "user-provided" in gpu_power_notes(job)[0]
+    assert expected_it_power_w(JobSpec(gpu_type="none", gpu_count=0)) > 0
+
+
+@pytest.mark.parametrize("limit", [0, -1, float("inf"), float("nan")])
+def test_explicit_power_limit_must_be_positive_and_finite(limit: float) -> None:
+    with pytest.raises(ValueError):
+        JobSpec(gpu_type="L4", gpu_power_limit_w=limit)
+
+
+def test_gpu_catalog_has_unique_aliases_and_covers_aws_gpus() -> None:
+    from carbonsight_core.cloud.aws.gpu_catalog import _AWS_GPU_CATALOG
+    from carbonsight_core.estimator.power_model import _gpu_key
+
+    aliases = []
+    for spec in GPU_POWER_CATALOG["gpus"]:
+        assert math.isfinite(spec["max_power_w"]) and spec["max_power_w"] > 0
+        assert spec["source_url"].startswith("https://")
+        aliases.extend(_gpu_key(name) for name in (spec["name"], *spec["aliases"]))
+    assert len(aliases) == len(set(aliases))
+    for gpu in _AWS_GPU_CATALOG:
+        assert gpu_power_limit_w(JobSpec(gpu_type=gpu)) > 0
+
+
+def test_default_deterministic_power_matches_sampling_mean() -> None:
+    job = JobSpec(gpu_type="L4")
+    rng = random.Random(42)
+    sampled = [sample_power_params(job, rng).p_it_w for _ in range(1000)]
+    assert sum(sampled) / len(sampled) == pytest.approx(expected_it_power_w(job), rel=0.01)
+
+
+def test_api_requires_power_limit_for_unknown_gpu(monkeypatch) -> None:
+    from carbonsight_api.main import app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(app.state, "registry_path", None, raising=False)
+    client = TestClient(app)
+    response = client.post("/v1/recommendations", json={"gpu_type": "unknown"})
+    assert response.status_code == 422
+    assert "gpu_power_limit_w" in response.json()["detail"]
+    response = client.post(
+        "/v1/recommendations", json={"gpu_type": "unknown", "gpu_power_limit_w": 72},
+    )
+    assert response.status_code == 200

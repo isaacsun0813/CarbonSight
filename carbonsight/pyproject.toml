@@ -50,6 +50,9 @@ carbonsight = "carbonsight_cli.main:app"
 where = ["packages/core", "apps/cli", "apps/api"]
 include = ["carbonsight_*"]
 
+[tool.setuptools.package-data]
+carbonsight_core = ["estimator/gpu_power_specs.json"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

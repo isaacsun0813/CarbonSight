@@ -71,9 +71,9 @@ def run_advise(
     premium_pct = int(max_cost_premium * 100)
     table = Table(title=f"Greenest regions within {premium_pct}% of cheapest (${min_cost:.2f})")
     table.add_column("Region", style="cyan")
-    table.add_column("IT CO2 mean (kg)", justify="right")
-    table.add_column("IT CO2 p10-p90", justify="right")
-    table.add_column("Cost (USD)", justify="right")
+    table.add_column("IT CO2 mean (kg)" if job.has_duration_estimate else "IT CO2 (kg/h)", justify="right")
+    table.add_column("IT CO2 p10-p90" if job.has_duration_estimate else "IT CO2 p10-p90 (kg/h)", justify="right")
+    table.add_column("Cost (USD)" if job.has_duration_estimate else "Cost (USD/h)", justify="right")
     table.add_column("vs cheapest", justify="right")
     table.add_column("Confidence", justify="right")
     for row in visible:

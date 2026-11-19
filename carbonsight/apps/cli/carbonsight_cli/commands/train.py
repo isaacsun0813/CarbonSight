@@ -30,7 +30,7 @@ def build_train_yaml_dict(
     *,
     name: str | None,
     accelerators: str,
-    duration: str,
+    duration: str | None,
     cpus: int,
     memory: int,
     cloud: str,
@@ -45,7 +45,7 @@ def build_train_yaml_dict(
             "cpus": cpus,
             "memory": memory,
         },
-        "duration": duration,
+        **({"duration": duration} if duration is not None else {}),
         "run": _run_line_for_script(script) + "\n",
     }
 
@@ -77,11 +77,11 @@ def train_cmd(
         "-a",
         help="SkyPilot accelerators string, e.g. A100:1 or T4:2.",
     ),
-    duration: str = typer.Option(
-        "1h",
+    duration: str | None = typer.Option(
+        None,
         "--duration",
         "-d",
-        help="Expected job length (e.g. 1h, 30m) for carbon/cost estimate.",
+        help="Optional estimated runtime (e.g. 1h, 30m); omit for a one-hour comparison.",
     ),
     cpus: int = typer.Option(8, "--cpus", help="CPU count in resources."),
     memory: int = typer.Option(32, "--memory", "-m", help="Memory (GiB) in resources."),
@@ -152,6 +152,11 @@ def train_cmd(
         "--finish-by",
         help="ISO-8601 finish-by deadline for dynamic planning when launching.",
     ),
+    probe_before_plan: bool = typer.Option(
+        False,
+        "--probe/--no-probe",
+        help="[launch] Opt in to billable Spot probes before a Spot-enabled deadline launch.",
+    ),
     carbon_budget: float | None = typer.Option(
         None,
         "--carbon-budget",
@@ -165,7 +170,7 @@ def train_cmd(
 ) -> None:
     """Estimate carbon/cost for training ``script`` without writing a YAML by hand.
 
-    Defaults: ``A100:1``, ``1h``, 8 CPUs, 32 GiB. Use ``--launch`` to pick a region and run SkyPilot.
+    Use ``--launch`` to pick a region and run SkyPilot.
     Run from your project root so the generated ``python path/to/script.py`` matches what Sky uploads.
     """
     if not script.is_file():
@@ -208,6 +213,7 @@ def train_cmd(
                     finish_by=parse_finish_by(finish_by) if finish_by else None,
                     carbon_budget_kg=carbon_budget,
                     carbon_price=carbon_price,
+                    probe_before_plan=probe_before_plan,
                 ),
             )
         else:

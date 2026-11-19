@@ -39,6 +39,8 @@ class PlanConstraints:
     cold_start_hours: float = 0.5
     migration_cost_usd: dict[tuple[str, str], float] = field(default_factory=dict)
 
+    allow_spot: bool = True
+
     @classmethod
     def from_finish_by(
         cls,

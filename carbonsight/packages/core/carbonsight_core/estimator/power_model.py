@@ -1,32 +1,40 @@
 """
 Power model per design doc: P_IT = P_base + P_gpu + P_cpu + P_mem + P_net.
-GPU: P_gpu = gpu_count * (P_idle + u * (P_cap - P_idle)); T4 70W, A100 250-400W, H100 700W.
 
 This module models IT equipment only. Cooling and other facility overhead are
 excluded because CarbonSight does not have facility-level measurements.
 """
 
+import json
 import random
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from carbonsight_core.models import JobSpec
 
-# GPU defaults (W): (idle, cap) per design
-GPU_DEFAULTS: dict[str, tuple[float, float]] = {
-    "t4": (25.0, 70.0),
-    "a100": (80.0, 400.0),
-    "a100-40": (80.0, 400.0),
-    "a100-80": (80.0, 400.0),
-    "h100": (150.0, 700.0),
-    "h100-80": (150.0, 700.0),
+ASSUMED_GPU_IDLE_FRACTION = 0.1
+GPU_POWER_CATALOG = json.loads(Path(__file__).with_name("gpu_power_specs.json").read_text())
+
+
+def _gpu_key(name: str) -> str:
+    key = re.sub(r"[^a-z0-9]", "", name.lower())
+    return key.removeprefix("nvidia").removeprefix("tesla")
+
+
+_GPU_POWER_SPECS = {
+    _gpu_key(alias): spec
+    for spec in GPU_POWER_CATALOG["gpus"]
+    for alias in (spec["name"], *spec["aliases"])
 }
-DEFAULT_GPU = (80.0, 350.0)
+
+
 P_BASE_W = 200.0
 W_PER_GIB = 0.4
 CPU_TDP_W = 150.0
 CPU_IDLE_W = 30.0
 NET_OVERHEAD_W = 20.0
-DEFAULT_GPU_UTIL = 0.7
+DEFAULT_GPU_UTIL = 0.75
 DEFAULT_CPU_UTIL = 0.5
 
 
@@ -37,9 +45,37 @@ class PowerParams:
     p_it_w: float
 
 
+def gpu_power_limit_w(job: JobSpec) -> float:
+    if job.gpu_count == 0:
+        return 0.0
+    if job.gpu_power_limit_w is not None:
+        return job.gpu_power_limit_w
+    spec = _GPU_POWER_SPECS.get(_gpu_key(job.gpu_type))
+    if spec is None:
+        raise ValueError(
+            f"No sourced GPU power specification for {job.gpu_type!r}. "
+            "Set carbonsight.gpu_power_limit_w in YAML or gpu_power_limit_w in the API request."
+        )
+    return float(spec["max_power_w"])
+
+
+def gpu_power_notes(job: JobSpec) -> list[str]:
+    limit = gpu_power_limit_w(job)
+    if job.gpu_count == 0:
+        return []
+    source = (
+        "user-provided" if job.gpu_power_limit_w is not None
+        else _GPU_POWER_SPECS[_gpu_key(job.gpu_type)]["source_url"]
+    )
+    return [
+        f"power:gpu_max={limit:g}W_per_gpu; source={source}",
+        "power:modeled; assumed idle=10% of maximum; linear utilization curve; not measured",
+    ]
+
+
 def _gpu_power(job: JobSpec, u_gpu: float) -> float:
-    key = job.gpu_type.lower().replace(" ", "-")
-    idle, cap = GPU_DEFAULTS.get(key, DEFAULT_GPU)
+    cap = gpu_power_limit_w(job)
+    idle = ASSUMED_GPU_IDLE_FRACTION * cap
     return job.gpu_count * (idle + u_gpu * (cap - idle))
 
 

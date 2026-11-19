@@ -71,6 +71,10 @@ def run_static_plan(
 
     job = load_job_spec(yaml_path, gpu_util=gpu_util, nvidia_smi=nvidia_smi)
 
+    if not job.has_duration_estimate:
+        typer.echo("Error: plan-static requires an explicit estimated duration.", err=True)
+        raise typer.Exit(1)
+
     rpath = resolve_registry_file(registry_path)
 
     config = load_config(live_pricing=live_pricing, static_pricing=static_pricing)

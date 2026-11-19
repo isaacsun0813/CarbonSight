@@ -1,11 +1,21 @@
 """Dynamic event loop in ``run.py``: fake clock + fake SkyPilot runner (no real sky calls)."""
 
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 import typer
+from carbonsight_cli.commands import run as run_mod
+from carbonsight_cli.commands.run import (
+    SkyHandle,
+    SkyLaunchUncertainError,
+    SkyRunner,
+    SkyStatus,
+    _run_dynamic_loop,
+    parse_sky_cluster_status,
+    parse_sky_queue_job_state,
+)
 from carbonsight_core.cloud.aws.probe import ProbeResult
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning import (
@@ -18,17 +28,6 @@ from carbonsight_core.planning import (
     SchedulerDecision,
 )
 
-from carbonsight_cli.commands import run as run_mod
-from carbonsight_cli.commands.run import (
-    SkyHandle,
-    SkyRunner,
-    SkyStatus,
-    _run_dynamic_loop,
-    parse_sky_cluster_status,
-    parse_sky_queue_job_state,
-)
-
-UTC = timezone.utc
 T0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
 REGION = "us-west-2"
 
@@ -203,6 +202,47 @@ class TestDynamicLoop:
 
         assert out.failed is not None and "launch failed" in out.failed
         assert runner.launched == []
+
+    @pytest.mark.parametrize("failure_limit", [1, 5])
+    def test_spot_failover_uses_ranked_eligible_regions_and_tracks_actual_region(
+        self, failure_limit,
+    ) -> None:
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
+        region = _regions()[0]
+        alternate = "us-east-1"
+        dyn = DynamicJob(
+            job, _constraints(10.0), [region, replace(region, cloud_region=alternate)], [],
+            simulate_preemption=False,
+        )
+        runner = FakeRunner([False, True], [[SkyStatus.SUCCEEDED]])
+        out = _loop(
+            dyn, runner, FakeClock(T0),
+            spot_regions=[alternate, REGION], max_launch_failures=failure_limit,
+            poll_seconds=1,
+        )
+
+        assert runner.launch_requests[0] == (alternate, JobMode.SPOT)
+        if failure_limit == 1:
+            assert len(runner.launch_requests) == 1
+            assert out.failed
+        else:
+            assert runner.launch_requests == [(alternate, JobMode.SPOT), (REGION, JobMode.SPOT)]
+            assert out.failed is None
+            assert [segment[0] for segment in out.segments] == [REGION]
+            assert dyn.initial_launch is not None and dyn.initial_launch.region == REGION
+
+    def test_ambiguous_launch_stops_without_marking_capacity_failure(self) -> None:
+        job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1.0)
+        dyn = ScriptedJob(job, _constraints(10.0), _regions(), [], simulate_preemption=False)
+        runner = SkyRunner(
+            lambda region, spot: "", cwd=None, run_id="abc",
+            launch_fn=lambda *a, **k: 1,
+        )
+        out = _loop(dyn, runner, FakeClock(T0))
+
+        assert out.failed and "cs-abc-1" in out.failed
+        assert dyn.trackers[REGION].observations == []
+        assert not out.segments
 
     def test_deadline_with_job_still_running(self) -> None:
         job = JobSpec(gpu_type="A100", gpu_count=1, duration_hours=10.0)
@@ -403,6 +443,11 @@ class TestSkyRunner:
 
         assert self._runner(queue_blip).poll(self.HANDLE) is SkyStatus.UNKNOWN
         assert self._runner(lambda cmd, **k: _cp(1)).poll(self.HANDLE) is SkyStatus.UNKNOWN
+        for response in ("", "cs-abc-1 AWS INIT"):
+            def unclear(cmd, **k):
+                return _cp(1) if cmd[1] == "queue" else _cp(0, response)
+
+            assert self._runner(unclear).poll(self.HANDLE) is SkyStatus.UNKNOWN
 
     def test_launch_success_names_cluster_and_stops_reprompting(self) -> None:
         calls: list[dict] = []
@@ -422,16 +467,39 @@ class TestSkyRunner:
         assert calls[0]["detach"] and calls[0]["down"] and not calls[0]["managed"]
         assert calls[0]["yes"] is False and calls[1]["yes"] is True
 
-    def test_launch_failure_tears_down_and_returns_none(self) -> None:
+    @pytest.mark.parametrize(
+        "aws_code, status, retryable",
+        [
+            ("InsufficientInstanceCapacity", _cp(0, "Cluster 'cs-abc-1' not found.\n"), True),
+            ("InsufficientInstanceCapacity", _cp(0, "cs-abc-1 AWS UP\n"), False),
+            ("InsufficientInstanceCapacity", _cp(1), False),
+            ("UnauthorizedOperation", _cp(0, "Cluster 'cs-abc-1' not found.\n"), False),
+        ],
+    )
+    def test_launch_failure_requires_capacity_error_and_absence(
+        self, aws_code, status, retryable,
+    ) -> None:
         commands: list[list[str]] = []
 
         def run_fn(cmd, **k):
             commands.append(cmd)
-            return _cp(0)
+            return status
 
-        runner = self._runner(run_fn, lambda *a, **k: 1)
-        assert runner.launch("us-west-2", JobMode.SPOT) is None
-        assert commands == [["sky", "down", "--yes", "cs-abc-1"]]
+        def launch_fn(patched, *, output_chunks, **kwargs):
+            output_chunks.append(f"An error occurred ({aws_code}) when calling RunInstances.\n")
+            output_chunks.append("Failed to provision all possible launchable resources.\n")
+            return 1
+
+        runner = self._runner(run_fn, launch_fn)
+        if retryable:
+            assert runner.launch(REGION, JobMode.SPOT) is None
+        else:
+            with pytest.raises(SkyLaunchUncertainError, match="cs-abc-1"):
+                runner.launch(REGION, JobMode.SPOT)
+        if aws_code == "InsufficientInstanceCapacity":
+            assert commands == [["sky", "status", "--refresh", "cs-abc-1"]]
+        else:
+            assert commands == []
 
 
 def test_execute_dynamic_run_exit_codes(monkeypatch) -> None:
@@ -488,3 +556,27 @@ class TestBudgetVsDeadlineMessages:
         err = capsys.readouterr().err
         assert "exceeds the budget" in err
         assert "no feasible launch" not in err
+
+
+def test_runtime_estimate_exhausted_does_not_complete_running_job() -> None:
+    job = JobSpec(gpu_type="A100", duration_hours=0.25)
+    dyn = ScriptedJob(job, _constraints(4.0), _regions(), [], simulate_preemption=False)
+    runner = FakeRunner([True], [[SkyStatus.RUNNING, SkyStatus.RUNNING, SkyStatus.SUCCEEDED]])
+    out = _loop(dyn, runner, FakeClock(T0))
+    assert dyn.completed
+    assert out.state.progress_hours > job.duration_hours
+    assert out.handle is None
+    assert runner.torn_down == runner.launched
+    assert dyn.finalize(out.state).deadline_met
+
+
+def test_running_job_past_estimate_reaches_deadline_without_false_success() -> None:
+    job = JobSpec(gpu_type="A100", duration_hours=0.25)
+    dyn = ScriptedJob(job, _constraints(1.0), _regions(), [], simulate_preemption=False)
+    runner = FakeRunner([True], [[SkyStatus.RUNNING]])
+    out = _loop(dyn, runner, FakeClock(T0))
+    assert out.state.progress_hours >= job.duration_hours
+    assert not dyn.completed
+    assert not dyn.finalize(out.state).deadline_met
+    assert out.handle is not None
+    assert DynamicEventType.COMPLETE not in _types(dyn)

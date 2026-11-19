@@ -11,7 +11,11 @@ class JobSpec(BaseModel):
 
     gpu_type: str = Field(..., description="e.g. T4, A100, H100")
     gpu_count: int = Field(1, ge=0)
-    duration_hours: float = Field(..., gt=0)
+    duration_hours: float = Field(1.0, gt=0, allow_inf_nan=False, description="Estimated runtime; omission uses a one-hour comparison")
+    gpu_power_limit_w: float | None = Field(
+        None, gt=0, allow_inf_nan=False,
+        description="Optional maximum board power per GPU in watts; overrides the sourced catalog",
+    )
     cpu_count: int | None = None
     mem_gib: float | None = None
     data_in_gb: float = Field(0.0, ge=0)
@@ -25,6 +29,15 @@ class JobSpec(BaseModel):
             "When set, GPU draw uses this value instead of sampling utilization."
         ),
     )
+
+    @property
+    def has_duration_estimate(self) -> bool:
+        return "duration_hours" in self.model_fields_set
+
+    def require_duration_estimate(self) -> float:
+        if not self.has_duration_estimate:
+            raise ValueError("Deadline planning requires an explicit estimated duration (e.g. duration: 2h).")
+        return self.duration_hours
 
     @field_validator("gpu_utilization")
     @classmethod

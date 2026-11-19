@@ -1,9 +1,10 @@
 """Unit tests for static job planner."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from carbonsight_core.models import JobSpec
 from carbonsight_core.planning import (
     PlanConstraints,
@@ -13,7 +14,7 @@ from carbonsight_core.planning import (
     plan_static_job,
 )
 
-UTC = timezone.utc
+UTC = UTC
 
 
 def _forecast(t0: datetime, values: list[float], step_min: int = 60) -> list[dict]:
@@ -197,6 +198,34 @@ class TestBuildRegionPlanInputs:
         assert inputs[0].watttime_regions == entry.wt_regions
         assert [point["value"] for point in inputs[0].forecast_points] == [400.0, 500.0]
         assert [call.args[0] for call in watt_time.get_forecast.call_args_list] == ["PACW", "NWPP"]
+
+    @pytest.mark.parametrize("second_points,expected_values", [
+        ([{"point_time": "2026-01-01T09:00:00+00:00", "value": 600}], [500.0]),
+        ([], []),
+        ([{"point_time": "2026-01-01T10:00:00+00:00", "value": 600}], []),
+        ([{"point_time": "2026-01-01T08:00:00+00:00"}], []),
+        ([{"point_time": "2026-01-01T08:00:00+00:00", "value": float("nan")}], []),
+    ])
+    def test_mixture_requires_complete_grid_data(self, second_points, expected_values) -> None:
+        t0 = datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+        entry = SimpleNamespace(
+            region_code="us-west-2", wt_regions=[("PACW", 0.25), ("NWPP", 0.75)],
+            s_source=0.9,
+        )
+        registry = MagicMock()
+        registry.iter_plannable_aws_regions.return_value = [entry]
+        watt_time = MagicMock()
+        watt_time.get_forecast.side_effect = [
+            {"data": _forecast(t0, [100.0, 200.0])},
+            {"data": second_points},
+        ]
+        inputs = build_region_plan_inputs(
+            registry, watt_time,
+            JobSpec(gpu_type="A100", gpu_count=1, duration_hours=1),
+            _constraints(t0, deadline_hours=2),
+        )
+        actual = [point["value"] for region in inputs for point in region.forecast_points]
+        assert actual == expected_values
 
 
 class TestPlanningItEnergy:

@@ -56,6 +56,7 @@ def enumerate_candidates(
     checkpoint_region: str | None = None,
 ) -> list[PlanCandidate]:
     """Build all (region, start_slot, mode) candidates with scores."""
+    job.require_duration_estimate()
     c_od_min = _cheapest_ondemand_rate(regions, job)
     candidates: list[PlanCandidate] = []
 

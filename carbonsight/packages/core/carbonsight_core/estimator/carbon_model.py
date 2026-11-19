@@ -8,7 +8,11 @@ import random
 from datetime import UTC, datetime
 from typing import Any
 
-from carbonsight_core.estimator.power_model import expected_it_power_w, sample_power_params
+from carbonsight_core.estimator.power_model import (
+    expected_it_power_w,
+    gpu_power_notes,
+    sample_power_params,
+)
 from carbonsight_core.estimator.pricing import estimate_cost_usd, estimate_job_cost
 from carbonsight_core.models import ActualRunResult, EstimateResult, JobSpec
 from carbonsight_core.watttime import SUPPORTED_MOER_UNIT, WattTimeClient, WattTimeError
@@ -76,6 +80,14 @@ class JobCarbonEstimator:
     def __init__(self, watt_time: WattTimeClient) -> None:
         self._watt_time = watt_time
 
+    @staticmethod
+    def sample_energy_mwh(job: JobSpec, rng: random.Random | None = None) -> list[float]:
+        rng = rng or random.Random()
+        return [
+            _it_mwh(sample_power_params(job, rng).p_it_w, job.duration_hours)
+            for _ in range(MONTE_CARLO_SAMPLES)
+        ]
+
     def _weighted_forecast_moer_lb_per_mwh(
         self,
         watttime_regions: list[tuple[str, float]],
@@ -111,15 +123,13 @@ class JobCarbonEstimator:
         moer_override: float | None = None,
         rng: random.Random | None = None,
         use_spot: bool = False,
+        energy_samples_mwh: list[float] | None = None,
     ) -> EstimateResult:
         """
         Monte Carlo carbon + cost estimate for one cloud region (forecast MOER, sampled power).
 
         Refuses to compute kg if WattTime units are not lbs_co2_per_mwh (unit gate).
         """
-        rng = rng or random.Random()
-        samples_kg: list[float] = []
-
         if moer_override is not None:
             moer_lb = moer_override
         else:
@@ -130,18 +140,15 @@ class JobCarbonEstimator:
                     raise
                 moer_lb = 400.0
 
-        for _ in range(MONTE_CARLO_SAMPLES):
-            params = sample_power_params(job, rng)
-            it_mwh_total = _it_mwh(params.p_it_w, job.duration_hours)
-            co2_lb = it_mwh_total * moer_lb
-            co2_kg = co2_lb * LB_TO_KG
-            samples_kg.append(co2_kg)
-
-        samples_kg.sort()
+        if energy_samples_mwh is None:
+            energy_samples_mwh = self.sample_energy_mwh(job, rng)
+        if not energy_samples_mwh:
+            raise ValueError("energy_samples_mwh must not be empty")
+        samples_kg = sorted(energy * moer_lb * LB_TO_KG for energy in energy_samples_mwh)
         n = len(samples_kg)
         mean_kg = sum(samples_kg) / n
-        p10 = samples_kg[int(0.10 * n)] if n else 0.0
-        p90 = samples_kg[int(0.90 * n)] if n else 0.0
+        p10 = samples_kg[int(0.10 * n)]
+        p90 = samples_kg[int(0.90 * n)]
 
         cost = estimate_job_cost(
             job.gpu_type, job.gpu_count, job.duration_hours, cloud_region, use_spot=use_spot,
@@ -156,7 +163,7 @@ class JobCarbonEstimator:
             expected_co2_kg_p10=p10,
             expected_co2_kg_p90=p90,
             mapping_confidence=mapping_confidence,
-            notes=list(cost.notes),
+            notes=list(cost.notes) + gpu_power_notes(job) + ([] if job.has_duration_estimate else ["estimate:one_hour_comparison; runtime unknown"]),
         )
 
     def compute_actual_run(

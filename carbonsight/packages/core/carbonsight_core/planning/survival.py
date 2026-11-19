@@ -105,15 +105,13 @@ class NelsonAalenModel:
         return e_l / n_l
 
     def cumulative_hazard(self, lifetime_hours: float) -> float:
-        """H(l) = sum of h(l_i) for l_i <= l."""
+        """Sum observed hazard increments, then extend with the assumed exponential tail."""
         lifetimes = self._sorted_lifetimes()
         if not lifetimes:
             return lifetime_hours / ASSUMED_SPOT_MEAN_LIFETIME_HOURS
-        total = 0.0
-        for l_i in lifetimes:
-            if l_i <= lifetime_hours:
-                total += self.hazard(l_i)
-        return total
+        measured = sum(self.hazard(point) for point in lifetimes if point <= lifetime_hours)
+        tail_hours = max(0.0, lifetime_hours - lifetimes[-1])
+        return measured + tail_hours / ASSUMED_SPOT_MEAN_LIFETIME_HOURS
 
     def survival(self, lifetime_hours: float, *, gamma_star: float = 1.0) -> float:
         """S(l) = exp(-H(l)); volatility-adjusted when gamma_star > 1."""
@@ -121,23 +119,29 @@ class NelsonAalenModel:
         return math.exp(-gamma_star * h)
 
     def expected_remaining_lifetime(self, age_hours: float, *, gamma_star: float = 1.0) -> float:
-        """
-        E[L - a | L > a] ≈ sum_{l_i > a} S(l_i) / S(a) on discrete grid.
-
-        Falls back to the assumed exponential prior when there are no samples.
-        """
+        """Integrate conditional survival over time, using an assumed exponential tail."""
+        if not math.isfinite(age_hours) or age_hours < 0:
+            raise ValueError("age_hours must be finite and nonnegative")
+        if not math.isfinite(gamma_star) or gamma_star <= 0:
+            raise ValueError("gamma_star must be finite and positive")
         lifetimes = self._sorted_lifetimes()
-        if not lifetimes:
-            return max(ASSUMED_SPOT_MEAN_LIFETIME_HOURS - age_hours, 0.25)
-        age = self._bucket(age_hours)
-        s_a = self.survival(age, gamma_star=gamma_star)
-        if s_a <= 1e-12:
-            return 0.25
-        tail = [one_time for one_time in lifetimes if one_time > age]
-        if not tail:
-            return 0.25
-        weighted = sum(self.survival(point, gamma_star=gamma_star) for point in tail)
-        return max(weighted / s_a, 0.25)
+        tail_mean = ASSUMED_SPOT_MEAN_LIFETIME_HOURS / gamma_star
+        if not lifetimes or age_hours >= lifetimes[-1]:
+            return tail_mean
+        baseline = self.cumulative_hazard(age_hours)
+        start = age_hours
+        area = 0.0
+        for boundary in lifetimes:
+            if boundary > age_hours:
+                probability = math.exp(
+                    -gamma_star * (self.cumulative_hazard(start) - baseline)
+                )
+                area += (boundary - start) * probability
+                start = boundary
+        tail_probability = math.exp(
+            -gamma_star * (self.cumulative_hazard(start) - baseline)
+        )
+        return area + tail_probability * tail_mean
 
 
 def _bucket(hours: float, bucket_hours: float = DEFAULT_BUCKET_HOURS) -> float:
